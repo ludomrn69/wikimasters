@@ -1,0 +1,20 @@
+# Contiennent le jeton de session : ne jamais committer.
+# Si vous changez session_file ou cache_file dans config.yaml, gardez un nom couvert ici.
+session*.json
+secrets*.yaml
+.session.*
+prix_cache*.json
+ventes*.json
+journal*.csv
+*.tmp
+auth.json
+*.har
+enregistrement.py
+.env
+
+.venv/
+__pycache__/
+
+# Réglages locaux de Claude Code (chemins personnels)
+.claude/settings.local.json
+.wikimasters.lock

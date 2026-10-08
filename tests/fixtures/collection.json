@@ -1,0 +1,99 @@
+{
+ "collection": [
+  {
+   "id": "00000000-0000-4000-8000-000000000101",
+   "count": 1,
+   "card_id": "5c7df689-bbae-45bf-8d26-9d126ad01be2",
+   "starred": false,
+   "is_shiny": false,
+   "user_id": "00000000-0000-4000-8000-000000000001",
+   "tags": [
+    {
+     "id": "00000000-0000-4000-8000-000000000201",
+     "name": "lyon",
+     "color": "#fb923c"
+    }
+   ],
+   "card": {
+    "id": "5c7df689-bbae-45bf-8d26-9d126ad01be2",
+    "rarity": "R",
+    "wikipedia_title": "Forest Hills (Queens)",
+    "q_score": 16.08,
+    "atk": 4116,
+    "def": 3340
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000102",
+   "count": 1,
+   "card_id": "04db76d8-a49c-403e-a248-4f00d7594b4d",
+   "starred": false,
+   "is_shiny": false,
+   "user_id": "00000000-0000-4000-8000-000000000001",
+   "tags": [],
+   "card": {
+    "id": "04db76d8-a49c-403e-a248-4f00d7594b4d",
+    "rarity": "R",
+    "wikipedia_title": "Chacana",
+    "q_score": 5.16,
+    "atk": 4017,
+    "def": 1689
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000103",
+   "count": 1,
+   "card_id": "dd1bca63-409e-4f4c-baa5-f09398edd4cd",
+   "starred": false,
+   "is_shiny": false,
+   "user_id": "00000000-0000-4000-8000-000000000001",
+   "tags": [],
+   "card": {
+    "id": "dd1bca63-409e-4f4c-baa5-f09398edd4cd",
+    "rarity": "R",
+    "wikipedia_title": "Face visible de la Lune",
+    "q_score": 10,
+    "atk": 4498,
+    "def": 2511
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000104",
+   "count": 1,
+   "card_id": "51be5cb1-66d8-4d2d-b83e-5c66fa5955f8",
+   "starred": false,
+   "is_shiny": false,
+   "user_id": "00000000-0000-4000-8000-000000000001",
+   "tags": [],
+   "card": {
+    "id": "51be5cb1-66d8-4d2d-b83e-5c66fa5955f8",
+    "rarity": "R",
+    "wikipedia_title": "Amphibia (série télévisée d'animation)",
+    "q_score": 24.78,
+    "atk": 5087,
+    "def": 4329
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000105",
+   "count": 1,
+   "card_id": "041905b9-417e-49f4-bf03-a13ed3c678e5",
+   "starred": false,
+   "is_shiny": false,
+   "user_id": "00000000-0000-4000-8000-000000000001",
+   "tags": [],
+   "card": {
+    "id": "041905b9-417e-49f4-bf03-a13ed3c678e5",
+    "rarity": "R",
+    "wikipedia_title": "Hotel California (album des Eagles)",
+    "q_score": 8.63,
+    "atk": 4581,
+    "def": 2300
+   }
+  }
+ ],
+ "total": null,
+ "rarityCounts": {},
+ "tagOptions": [],
+ "pendingTradeCardIds": []
+}
