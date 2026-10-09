@@ -16,6 +16,7 @@ import argparse
 import base64
 import binascii
 import csv
+import difflib
 import html
 import json
 import math
@@ -154,7 +155,16 @@ def load_config(path):
     if not isinstance(perso, dict):
         sys.exit(f"{perso_path} est mal écrit : il doit contenir des sections comme dans config.yaml "
                  "(voir perso.exemple.yaml).")
-    return merge(cfg, perso)
+    merged = merge(cfg, perso)
+    # Les listes de protection de perso.yaml s'ajoutent à celles de config.yaml : oublier d'y recopier « garder »
+    # ne doit jamais retirer une protection (une défausse est définitive).
+    base, extra = cfg.get("protection"), perso.get("protection")
+    if isinstance(base, dict) and isinstance(extra, dict):
+        for key in ("tags", "rarities", "name_contains"):
+            if isinstance(base.get(key), list) and isinstance(extra.get(key), list):
+                have = {norm(x) for x in base[key]}
+                merged["protection"][key] = base[key] + [x for x in extra[key] if norm(x) not in have]
+    return merged
 
 
 def config_path(cfg_file, value):
@@ -182,11 +192,19 @@ def check_config(cfg):
     errors = []
     err = errors.append
 
-    def section(name):
+    def unknown_keys(sec, where, allowed, hint=""):
+        # Une clé mal orthographiée serait ignorée sans bruit, et la protection qu'elle devait poser avec.
+        for key in sorted(set(sec) - set(allowed), key=str):
+            close = difflib.get_close_matches(str(key), allowed, n=1)
+            err(f"{where}{'.' if where else ''}{key} : clé inconnue"
+                + (f" (vouliez-vous dire « {close[0]} » ?)" if close else hint))
+
+    def section(name, keys):
         value = cfg.get(name) if isinstance(cfg, dict) else None
         if not isinstance(value, dict):
             err(f"{name} : section manquante ou mal écrite")
             return {}
+        unknown_keys(value, name, keys)
         return value
 
     def number(sec, path, key, minimum=None, integer=False, allow_none=False, strict=False):
@@ -220,9 +238,7 @@ def check_config(cfg):
         if not isinstance(cond, dict):
             err(f"{where} doit être un dictionnaire")
             return
-        unknown = set(cond) - CONDITION_KEYS
-        if unknown:
-            err(f"{where} : condition(s) inconnue(s) {sorted(unknown)}")
+        unknown_keys(cond, where, CONDITION_KEYS)
         if "rarity_in" in cond:
             str_list(cond, where, "rarity_in", allow_empty=False)
         if "name_contains" in cond and not isinstance(cond["name_contains"], str):
@@ -233,24 +249,29 @@ def check_config(cfg):
             if key in cond and not _is_number(cond[key]):
                 err(f"{where}.{key} doit être un nombre")
 
-    site = section("site")
-    for key in ("base_url", "supabase_url", "supabase_anon_key"):
+    if isinstance(cfg, dict):
+        unknown_keys(cfg, "", ("site", "protection", "price", "price_tags", "auto_tags", "discard", "sell", "safety",
+                               "journal", "display", "telegram"))
+
+    site_keys = ("base_url", "supabase_url", "supabase_anon_key")
+    site = section("site", site_keys)
+    for key in site_keys:
         if not isinstance(site.get(key), str) or not site.get(key):
             err(f"site.{key} doit être un texte")
 
-    prot = section("protection")
+    prot = section("protection", ("tags", "starred", "shiny", "rarities", "name_contains"))
     prot_tags = str_list(prot, "protection", "tags")
     boolean(prot, "protection", "starred")
     boolean(prot, "protection", "shiny")
     str_list(prot, "protection", "rarities")
     str_list(prot, "protection", "name_contains")
 
-    price = section("price")
+    price = section("price", ("cache_hours", "cache_file"))
     number(price, "price", "cache_hours", 0)
     if not isinstance(price.get("cache_file"), str) or not price.get("cache_file"):
         err("price.cache_file doit être un nom de fichier")
 
-    pt = section("price_tags")
+    pt = section("price_tags", ("bands", "unknown_tag", "remove_outdated", "tag_protected"))
     boolean(pt, "price_tags", "remove_outdated")
     boolean(pt, "price_tags", "tag_protected")
     if pt.get("unknown_tag") is not None and not isinstance(pt.get("unknown_tag"), str):
@@ -265,9 +286,7 @@ def check_config(cfg):
         if not isinstance(band, dict) or not isinstance(band.get("tag"), str) or not band["tag"].strip():
             err(f"{where}.tag doit être un texte non vide")
             continue
-        unknown = set(band) - {"tag", "from", "below", "color"}
-        if unknown:
-            err(f"{where} : clé(s) inconnue(s) {sorted(unknown)}")
+        unknown_keys(band, where, ("tag", "from", "below", "color"))
         if band.get("color") is not None and not isinstance(band.get("color"), str):
             err(f"{where}.color doit être un texte, ex. \"#22c55e\"")
         if any(_is_number(band.get(k)) and band[k] < 0 for k in ("from", "below")):
@@ -300,9 +319,7 @@ def check_config(cfg):
         if not isinstance(rule, dict) or not isinstance(rule.get("tag"), str) or not rule["tag"].strip():
             err(f"{where}.tag doit être un texte non vide")
             continue
-        unknown = set(rule) - {"tag", "when", "color"}
-        if unknown:
-            err(f"{where} : clé(s) inconnue(s) {sorted(unknown)} (les conditions vont sous « when: »)")
+        unknown_keys(rule, where, ("tag", "when", "color"), " (les conditions vont sous « when: »)")
         if not isinstance(rule.get("when"), dict) or not rule.get("when"):
             err(f"{where}.when doit contenir au moins une condition (sinon l'étiquette irait sur toutes les cartes)")
         else:
@@ -312,7 +329,8 @@ def check_config(cfg):
         if rule.get("color") is not None and not isinstance(rule.get("color"), str):
             err(f"{where}.color doit être un texte, ex. \"#22c55e\"")
 
-    disc = section("discard")
+    disc = section("discard", ("tags", "max_value", "unknown_rarities", "max_per_run", "fresh_price",
+                               "require_existing_tag"))
     disc_tags = str_list(disc, "discard", "tags", allow_empty=False)
     number(disc, "discard", "max_value", 0, allow_none=True)
     unknown_rarities = str_list(disc, "discard", "unknown_rarities")
@@ -328,7 +346,9 @@ def check_config(cfg):
     boolean(disc, "discard", "fresh_price")
     boolean(disc, "discard", "require_existing_tag")
 
-    sell = section("sell")
+    sell = section("sell", ("tags", "order", "price_factor", "rounding", "min_start_price", "max_start_price",
+                            "duration_minutes", "max_auctions", "min_value", "fresh_price", "require_existing_tag",
+                            "relist"))
     sell_tags = str_list(sell, "sell", "tags", allow_empty=False)
     number(sell, "sell", "price_factor", 0, strict=True)
     choice(sell, "sell", "rounding", ["floor", "round", "ceil"])
@@ -349,6 +369,7 @@ def check_config(cfg):
     if not isinstance(relist, dict):
         err("sell.relist : section manquante ou mal écrite")
     else:
+        unknown_keys(relist, "sell.relist", ("enabled", "factor", "min_start_price", "max_attempts", "first"))
         boolean(relist, "sell.relist", "enabled")
         boolean(relist, "sell.relist", "first")
         number(relist, "sell.relist", "factor", 0, strict=True)
@@ -357,7 +378,7 @@ def check_config(cfg):
         number(relist, "sell.relist", "min_start_price", 1, integer=True)
         number(relist, "sell.relist", "max_attempts", 1, integer=True)
 
-    journal = section("journal")
+    journal = section("journal", ("enabled", "file", "delimiter"))
     boolean(journal, "journal", "enabled")
     if not isinstance(journal.get("file"), str) or not journal.get("file"):
         err("journal.file doit être un nom de fichier")
@@ -393,7 +414,8 @@ def check_config(cfg):
         if common:
             err(f"{name_a} et {name_b} ont des étiquettes en commun : {sorted(common)}")
 
-    safety = section("safety")
+    safety = section("safety", ("max_actions_per_run", "delay_seconds", "read_delay_seconds", "max_consecutive_errors",
+                                "max_consecutive_read_failures"))
     number(safety, "safety", "max_actions_per_run", 0, integer=True)
     number(safety, "safety", "delay_seconds", 0)
     number(safety, "safety", "read_delay_seconds", 0)
@@ -401,6 +423,8 @@ def check_config(cfg):
     number(safety, "safety", "max_consecutive_read_failures", 1, integer=True)
 
     display = cfg.get("display", {})
+    if isinstance(display, dict):
+        unknown_keys(display, "display", ("verbose", "waiting_shown"))
     if not isinstance(display, dict) or not isinstance(display.get("verbose", False), bool):
         err("display.verbose doit valoir true ou false")
     elif not _is_int(display.get("waiting_shown", 5)) or display.get("waiting_shown", 5) < 0:
@@ -410,9 +434,7 @@ def check_config(cfg):
     if not isinstance(telegram, dict):
         err("telegram : section mal écrite")
     else:
-        unknown = set(telegram) - {"notify_on_dry_run", "bot_token", "chat_id"}
-        if unknown:
-            err(f"telegram : clé(s) inconnue(s) {sorted(unknown)}")
+        unknown_keys(telegram, "telegram", ("notify_on_dry_run", "bot_token", "chat_id"))
         if "notify_on_dry_run" in telegram:
             boolean(telegram, "telegram", "notify_on_dry_run")
         if telegram.get("bot_token") is not None and not isinstance(telegram["bot_token"], str):

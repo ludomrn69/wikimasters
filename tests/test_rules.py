@@ -374,7 +374,8 @@ class ConfigTest(unittest.TestCase):
                 "telegram:\n  bot_token: '123:abc'\n  chat_id: 42\nprotection:\n  tags: [lyon]\n", encoding="utf-8")
             merged = w.load_config(path)
             w.check_config(merged)
-            self.assertEqual((merged["telegram"]["bot_token"], merged["protection"]["tags"]), ("123:abc", ["lyon"]))
+            self.assertEqual((merged["telegram"]["bot_token"], merged["protection"]["tags"]),
+                             ("123:abc", ["favori", "garder", "lyon"]))  # lyon y était déjà : pas en double
             self.assertTrue(merged["protection"]["starred"])  # le reste de la section vient de config.yaml
             (pathlib.Path(tmp) / "perso.yaml").write_text("- a\n", encoding="utf-8")
             with self.assertRaises(SystemExit) as ctx:
@@ -382,6 +383,28 @@ class ConfigTest(unittest.TestCase):
             self.assertIn("perso.exemple.yaml", str(ctx.exception.code))
         self.assert_rejected(lambda c: c["telegram"].update(chat="42"), "inconnue")
         self.assert_rejected(lambda c: c["telegram"].update(bot_token=123), "bot_token")
+
+    def test_perso_yaml_adds_protections_but_never_removes_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "config.yaml"
+            path.write_text(yaml.safe_dump(load_cfg()), encoding="utf-8")
+            (pathlib.Path(tmp) / "perso.yaml").write_text(
+                "protection:\n  tags: [Garder, paris]\n  rarities: []\nsell:\n  tags: ['+1000']\n", encoding="utf-8")
+            merged = w.load_config(path)
+            w.check_config(merged)
+        self.assertEqual(merged["protection"]["tags"], ["favori", "garder", "lyon", "paris"])
+        self.assertEqual(merged["protection"]["rarities"], ["SR", "L"])  # une liste vide ne retire rien
+        self.assertEqual(merged["sell"]["tags"], ["+1000"])  # hors protection, une liste remplace
+
+    def test_misspelled_setting_is_rejected_with_a_suggestion(self):
+        # Ignorée sans bruit, une faute de frappe dans perso.yaml ferait perdre la protection qu'elle devait poser.
+        self.assert_rejected(lambda c: c["protection"].update(tag=["paris"]), "protection.tag : clé inconnue "
+                                                                               "(vouliez-vous dire « tags » ?)")
+        self.assert_rejected(lambda c: c.update(protections={"tags": ["paris"]}), "vouliez-vous dire « protection »")
+        self.assert_rejected(lambda c: c["discard"].update(max_valeur=50), "discard.max_valeur")
+        self.assert_rejected(lambda c: c["sell"]["relist"].update(max_attempt=5), "sell.relist.max_attempt")
+        self.assert_rejected(lambda c: c["display"].update(verbeux=True), "display.verbeux")
+        self.assert_rejected(lambda c: c["safety"].update(pause=2), "safety.pause : clé inconnue")
 
     def test_unknown_rarities_need_the_unknown_tag_and_unprotected_rarities(self):
         self.assert_rejected(lambda c: c["discard"].update(unknown_rarities=["C"]), "unknown_tag")

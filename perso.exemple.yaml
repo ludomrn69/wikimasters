@@ -2,11 +2,13 @@
 #   1. Copiez ce fichier sous le nom perso.yaml (au même endroit).
 #   2. Décommentez (retirez le « # ») et modifiez seulement ce que vous voulez changer.
 # perso.yaml n'est jamais envoyé sur GitHub. Tout ce qui n'y est pas vient de config.yaml.
-# Une liste écrite ici REMPLACE celle de config.yaml : recopiez les valeurs que vous voulez garder.
+# Une liste écrite ici REMPLACE celle de config.yaml (recopiez les valeurs que vous voulez garder),
+# sauf dans « protection » : là, elle s'AJOUTE à celle de config.yaml, pour ne jamais retirer une protection.
+# Un réglage mal orthographié est refusé au démarrage, avec le nom correct.
 
-# Étiquettes qui protègent une carte (jamais vendue ni défaussée) :
+# Étiquettes qui protègent une carte (jamais vendue ni défaussée), en plus de garder et favori :
 # protection:
-#   tags: ["garder", "favori", "lyon"]
+#   tags: ["lyon"]
 
 # Cartes jamais vendues (« inconnu ») à défausser : [] pour n'en défausser aucune.
 # discard:

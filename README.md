@@ -121,12 +121,14 @@ Par exemple, pour protéger aussi les cartes étiquetées `lyon` et ne défausse
 
 ```yaml
 protection:
-  tags: ["garder", "favori", "lyon"]   # une liste remplace celle de config.yaml : recopiez garder et favori
+  tags: ["lyon"]        # s'ajoute à garder et favori
 discard:
-  unknown_rarities: []
+  unknown_rarities: []  # remplace la liste de config.yaml
 ```
 
-Chaque réglage possible est expliqué en commentaire dans `config.yaml`. Le script refuse de démarrer si un réglage est incohérent, et il explique pourquoi.
+Une liste écrite dans `perso.yaml` remplace celle de `config.yaml`, sauf dans `protection` : là, elle s'y ajoute. Une protection de `config.yaml` ne peut donc pas être retirée par un oubli dans `perso.yaml`.
+
+Chaque réglage possible est expliqué en commentaire dans `config.yaml`. Le script refuse de démarrer si un réglage est mal orthographié ou incohérent, et il explique pourquoi.
 
 ## Notifications Telegram (facultatif)
 

@@ -28,6 +28,7 @@ site:
 
 # ----------------------------------------------------------------------------
 # Protections : ces cartes ne sont JAMAIS défaussées ni vendues, quelles que soient leurs étiquettes.
+# Les listes de perso.yaml (tags, rarities, name_contains) s'ajoutent à celles-ci, sans jamais en retirer.
 # ----------------------------------------------------------------------------
 protection:
   tags: ["garder", "favori"]   # étiquettes qui protègent une carte (ajoutez les vôtres dans perso.yaml)
