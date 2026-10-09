@@ -1,0 +1,20 @@
+# Vos réglages personnels.
+#   1. Copiez ce fichier sous le nom perso.yaml (au même endroit).
+#   2. Décommentez (retirez le « # ») et modifiez seulement ce que vous voulez changer.
+# perso.yaml n'est jamais envoyé sur GitHub. Tout ce qui n'y est pas vient de config.yaml.
+# Une liste écrite ici REMPLACE celle de config.yaml : recopiez les valeurs que vous voulez garder.
+
+# Étiquettes qui protègent une carte (jamais vendue ni défaussée) :
+# protection:
+#   tags: ["garder", "favori", "lyon"]
+
+# Cartes jamais vendues (« inconnu ») à défausser : [] pour n'en défausser aucune.
+# discard:
+#   unknown_rarities: ["C", "PC"]
+
+# Notifications Telegram à la fin de chaque passage :
+#   jeton du bot : @BotFather sur Telegram ; votre chat_id : @userinfobot.
+# telegram:
+#   bot_token: "123456789:AAH..."
+#   chat_id: "123456789"
+#   notify_on_dry_run: false   # true = aussi pour les simulations

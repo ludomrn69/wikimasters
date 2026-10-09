@@ -335,7 +335,7 @@ class ConfigTest(unittest.TestCase):
         self.assert_rejected(lambda c: c["sell"].update(price_factor=0))
         self.assert_rejected(lambda c: c["sell"].update(rounding="bas"))
         self.assert_rejected(lambda c: c["sell"].update(min_start_price=0))
-        self.assert_rejected(lambda c: c["discard"].update(unknown_price="peut-être"))
+        self.assert_rejected(lambda c: c["discard"].update(unknown_rarities="C"))
         self.assert_rejected(lambda c: c.update(auto_tags=[{"tag": "x", "when": {"rarete": ["SR"]}}]), "inconnue")
         self.assert_rejected(lambda c: c.pop("safety"), "safety")
         self.assert_rejected(lambda c: c["safety"].update(max_consecutive_errors=0))
@@ -360,11 +360,33 @@ class ConfigTest(unittest.TestCase):
         self.assert_rejected(lambda c: c["sell"]["relist"].update(factor=1.2), "relance")
         self.assert_rejected(lambda c: c["journal"].update(delimiter="|"), "journal.delimiter")
 
-    def test_telegram_secrets_must_not_be_in_config(self):
-        self.assert_rejected(lambda c: c["telegram"].update(bot_token="123:abc"), "secrets.yaml")
-        self.assert_rejected(lambda c: c["telegram"].update(chat_id="42"), "secrets.yaml")
-        self.assert_rejected(lambda c: c["telegram"].update(enabled="false"), "telegram.enabled")
+    def test_perso_yaml_completes_config_and_holds_the_telegram_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, path = load_cfg(), pathlib.Path(tmp) / "config.yaml"
+            cfg["telegram"]["bot_token"] = "123:abc"
+            path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+            with self.assertRaises(SystemExit) as ctx:  # le jeton ne va jamais dans le fichier partagé
+                w.load_config(path)
+            self.assertIn("perso.yaml", str(ctx.exception.code))
+            del cfg["telegram"]["bot_token"]
+            path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+            (pathlib.Path(tmp) / "perso.yaml").write_text(
+                "telegram:\n  bot_token: '123:abc'\n  chat_id: 42\nprotection:\n  tags: [lyon]\n", encoding="utf-8")
+            merged = w.load_config(path)
+            w.check_config(merged)
+            self.assertEqual((merged["telegram"]["bot_token"], merged["protection"]["tags"]), ("123:abc", ["lyon"]))
+            self.assertTrue(merged["protection"]["starred"])  # le reste de la section vient de config.yaml
+            (pathlib.Path(tmp) / "perso.yaml").write_text("- a\n", encoding="utf-8")
+            with self.assertRaises(SystemExit) as ctx:
+                w.load_config(path)
+            self.assertIn("perso.exemple.yaml", str(ctx.exception.code))
         self.assert_rejected(lambda c: c["telegram"].update(chat="42"), "inconnue")
+        self.assert_rejected(lambda c: c["telegram"].update(bot_token=123), "bot_token")
+
+    def test_unknown_rarities_need_the_unknown_tag_and_unprotected_rarities(self):
+        self.assert_rejected(lambda c: c["discard"].update(unknown_rarities=["C"]), "unknown_tag")
+        self.assert_rejected(lambda c: (c["price_tags"].update(unknown_tag="inconnu"),
+                                        c["discard"].update(unknown_rarities=["C", "SR"])), "protégée")
 
     def test_broken_yaml_gives_friendly_message(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -455,16 +477,16 @@ class EndToEndTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = pathlib.Path(self.tmp.name)
-        self.store = w.SessionStore(self.dir / "session.json")
+        self.acc = self.dir / "comptes" / "testeur"  # dossier du compte du jeton de test
+        self.acc.mkdir(parents=True)
+        self.store = w.SessionStore(self.acc / "session.json")
 
     def run_main(self, site, command, execute=False, session=True, mutate=None, stdin=None, clock=None, sleep=None,
-                 args=(), secrets=None):
+                 args=(), perso=None):
         cfg = load_cfg()
-        cfg["site"]["session_file"] = str(self.dir / "session.json")
         cfg["price"]["cache_file"] = str(self.dir / "prix.json")
         cfg["price"]["cache_hours"] = 0
         cfg["sell"]["order"] = "value"
-        cfg["sell"]["state_file"] = str(self.dir / "ventes.json")
         cfg["journal"]["file"] = str(self.dir / "journal.csv")
         if mutate:
             mutate(cfg)
@@ -474,14 +496,15 @@ class EndToEndTest(unittest.TestCase):
             self.store.save(make_session())
         elif session:
             self.store.save(session)
-        if secrets is not None:
-            (self.dir / "secrets.yaml").write_text(yaml.safe_dump(secrets), encoding="utf-8")
+        if perso is not None:
+            (self.dir / "perso.yaml").write_text(yaml.safe_dump(perso, allow_unicode=True), encoding="utf-8")
         argv = ["wikimasters.py", command, "--config", str(cfg_path)] + (["--execute"] if execute else []) + list(args)
         out, code = io.StringIO(), 0
         patches = [
             mock.patch.object(sys, "argv", argv),
             mock.patch("requests.Session.request", side_effect=site),
             mock.patch("time.sleep", side_effect=sleep),
+            mock.patch.object(w, "keep_awake"),
             redirect_stdout(out),
         ]
         if clock:
@@ -600,13 +623,46 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn("vaut maintenant 60", output)
         self.assertIn("PROTÉGÉE  Forest Hills", output)
 
-    def test_discard_unknown_price_setting(self):
+    def test_unknown_price_discarded_only_for_chosen_rarities(self):
         site = standard_site(tags={HOTEL: ["defausse"]})
-        self.run_main(site, "defausser", execute=True)
+        output, _ = self.run_main(site, "defausser", execute=True)  # unknown_rarities : []
         self.assertEqual(site.discards(), [])
+        self.assertIn("jamais vendue, prix inconnu (discard.unknown_rarities)", output)
         site = standard_site(tags={HOTEL: ["defausse"]})
-        self.run_main(site, "defausser", execute=True, mutate=lambda c: c["discard"].update(unknown_price="discard"))
+        self.run_main(site, "defausser", execute=True, mutate=lambda c: (
+            c["price_tags"].update(unknown_tag="inconnu"), c["discard"].update(unknown_rarities=["R"])))
         self.assertEqual(site.discards(), [HOTEL])
+
+    def test_everything_discards_defausse_and_unknown_cards_in_first_pass(self):
+        def rule(rarities):
+            return lambda c: (c["price_tags"].update(unknown_tag="inconnu"),
+                              c["discard"].update(unknown_rarities=rarities, require_existing_tag=False))
+
+        site = standard_site()
+        self.run_main(site, "tout", execute=True, mutate=rule(["R"]))
+        # Chacana (5, « defausse ») et Hotel California (jamais vendue, R, « inconnu ») : dès ce passage.
+        self.assertEqual(sorted(site.discards()), sorted([CHACANA, HOTEL]))
+        self.assertNotIn(FOREST, site.discards())  # protégée (lyon)
+
+        site = standard_site(tags={HOTEL: ["inconnu"]})
+        self.run_main(site, "defausser", execute=True, mutate=rule(["C"]))
+        self.assertEqual(site.discards(), [])  # « inconnu » d'une autre rareté : ni défaussée, ni même relue
+        self.assertEqual(site.gets("041905b9"), [])
+
+    def test_discard_reads_only_the_prices_it_needs(self):
+        site = standard_site()
+        base = site.pages[0]["collection"][1]
+        for n in range(6):
+            item = copy.deepcopy(base)
+            item.update(id=f"cheap-{n}", card_id=f"cheap-card-{n}")
+            item["tags"] = [{"id": "t-defausse", "name": "defausse"}]
+            site.pages[0]["collection"].append(item)
+            site.values[f"cheap-card-{n}"] = 2
+        output, _ = self.run_main(site, "defausser", execute=True, mutate=lambda c: c["discard"].update(max_per_run=2))
+        self.assertEqual(len(site.discards()), 2)
+        self.assertEqual(len(site.gets("/sales")), 2)  # pas les 6 prix : la suite attend le prochain passage
+        self.assertIn("4 autre(s) carte(s) à défausser", output)
+        self.assertIn("4 action(s) reportée(s)", output)
 
     def test_discard_max_per_run(self):
         site = standard_site(tags={CHACANA: ["defausse"]})
@@ -624,7 +680,8 @@ class EndToEndTest(unittest.TestCase):
 
     def test_everything_execute_in_order_and_new_discard_tag_waits(self):
         site = standard_site()
-        self.run_main(site, "tout", execute=True)
+        output, _ = self.run_main(site, "tout", execute=True)
+        self.assertIn("1 carte(s) étiquetée(s) à défausser pendant ce passage : traitée(s) au prochain", output)
         kinds = []
         for m, u, b in site.mutations():
             kinds.append("tag" if "/rest/v1/" in u else "sell" if u.endswith("/api/marketplace") else "discard")
@@ -683,7 +740,7 @@ class EndToEndTest(unittest.TestCase):
     def test_finished_sales_are_settled_and_unsold_relisted_cheaper(self):
         site = standard_site(tags=SORTED)
         self.run_main(site, "vendre", execute=True)
-        state = json.loads((self.dir / "ventes.json").read_text())["auctions"]
+        state = json.loads((self.acc / "ventes.json").read_text())["auctions"]
         self.assertEqual(sorted(state), ["auction-103", "auction-104"])
         # Amphibia vendue 70, Face visible invendue (elle revient dans la collection).
         site.auctions["auction-104"] = {"status": "settled", "winner_id": "x", "final_price": 70}
@@ -697,22 +754,22 @@ class EndToEndTest(unittest.TestCase):
         rows = self.read_journal()
         self.assertEqual([(r["action"], r["prix"]) for r in rows if r["action"] in ("vendue", "invendue", "relance")],
                          [("vendue", "70"), ("invendue", "9"), ("relance", "7")])
-        state = json.loads((self.dir / "ventes.json").read_text())["auctions"]
+        state = json.loads((self.acc / "ventes.json").read_text())["auctions"]
         self.assertEqual(list(state), ["auction-103-3"])
         self.assertEqual((state["auction-103-3"]["attempt"], state["auction-103-3"]["status"]), (2, "open"))
 
     def test_relist_with_reused_auction_id_keeps_tracking(self):
         site = standard_site(tags={FACE: ["+10"]})
-        (self.dir / "ventes.json").write_text(json.dumps({"auctions": {"auction-103": {
+        (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"auction-103": {
             "copy_id": FACE, "name": "Face visible de la Lune", "rarity": "R", "price": 9, "attempt": 1,
             "status": "unsold"}}}))
         self.run_main(site, "vendre", execute=True)  # le faux site redonne « auction-103 »
-        state = json.loads((self.dir / "ventes.json").read_text())["auctions"]
+        state = json.loads((self.acc / "ventes.json").read_text())["auctions"]
         self.assertEqual((state["auction-103"]["status"], state["auction-103"]["attempt"]), ("open", 2))
 
     def test_relist_stops_after_max_attempts(self):
         site = standard_site(tags={FACE: ["+10"]})
-        (self.dir / "ventes.json").write_text(json.dumps({"auctions": {"old": {
+        (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"old": {
             "copy_id": FACE, "card_id": "x", "name": "Face visible de la Lune", "rarity": "R", "price": 5,
             "attempt": 3, "status": "unsold"}}}))
         output, _ = self.run_main(site, "vendre", execute=True)
@@ -721,7 +778,7 @@ class EndToEndTest(unittest.TestCase):
 
     def test_card_confirmed_on_sale_is_not_listed_again(self):
         site = standard_site(tags=SORTED)
-        (self.dir / "ventes.json").write_text(json.dumps({"auctions": {"auction-104": {
+        (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"auction-104": {
             "copy_id": AMPHIBIA, "name": "Amphibia", "price": 45, "attempt": 1, "status": "open"}}}))
         output, _ = self.run_main(site, "vendre", execute=True)  # le faux site répond « active »
         self.assertEqual(site.sells(), [FACE])
@@ -729,7 +786,7 @@ class EndToEndTest(unittest.TestCase):
 
     def test_unreadable_auction_with_card_back_counts_as_unsold(self):
         site = standard_site(tags={FACE: ["+10"]})
-        (self.dir / "ventes.json").write_text(json.dumps({"auctions": {"auction-103": {
+        (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"auction-103": {
             "copy_id": FACE, "name": "Face visible de la Lune", "rarity": "R", "price": 9, "attempt": 1,
             "listed_at": 0, "duration": 30, "status": "open"}}}))
         site.overrides[("GET", "/api/marketplace/auction-103")] = FakeResponse(404, {"error": "introuvable"})
@@ -741,24 +798,24 @@ class EndToEndTest(unittest.TestCase):
         for auction in ({"status": "ended", "winner_id": None, "settled_at": None}, {"status": "pending"}, [1, 2]):
             site = standard_site(tags={AMPHIBIA: ["+10"]})
             site.pages[0]["collection"] = [i for i in site.pages[0]["collection"] if i["id"] != AMPHIBIA]
-            (self.dir / "ventes.json").write_text(json.dumps({"auctions": {"auction-104": {
+            (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"auction-104": {
                 "copy_id": AMPHIBIA, "name": "Amphibia", "price": 45, "attempt": 1, "listed_at": time.time(),
                 "duration": 30, "status": "open"}}}))
             site.auctions["auction-104"] = auction
             output, _ = self.run_main(site, "vendre", execute=True)
             self.assertNotIn("INVENDUE", output, auction)
-            state = json.loads((self.dir / "ventes.json").read_text())["auctions"]
+            state = json.loads((self.acc / "ventes.json").read_text())["auctions"]
             self.assertEqual(state["auction-104"]["status"], "open", auction)
 
     def test_cancelled_auction_is_not_relisted(self):
         site = standard_site(tags={FACE: ["+10"]})
-        (self.dir / "ventes.json").write_text(json.dumps({"auctions": {"auction-103": {
+        (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"auction-103": {
             "copy_id": FACE, "name": "Face visible de la Lune", "price": 9, "attempt": 1, "status": "open"}}}))
         site.auctions["auction-103"] = {"status": "cancelled"}
         output, _ = self.run_main(site, "vendre", execute=True, mutate=lambda c: c["sell"].update(tags=["+100"]))
         self.assertIn("ANNULÉE", output)
         self.assertEqual(site.sells(), [])
-        self.assertEqual(json.loads((self.dir / "ventes.json").read_text())["auctions"], {})
+        self.assertEqual(json.loads((self.acc / "ventes.json").read_text())["auctions"], {})
 
     def test_relist_price_is_capped_and_always_lower(self):
         sell = load_cfg()["sell"]
@@ -771,9 +828,13 @@ class EndToEndTest(unittest.TestCase):
         site = standard_site(tags=SORTED)
         mutate = lambda c: c["price"].update(cache_hours=6)  # noqa: E731
         self.run_main(site, "tout", mutate=mutate)  # crée la config, la session de test et le cache des prix
-        before = {p.name: p.stat().st_mtime_ns for p in self.dir.iterdir() if p.name != "session.json"}
+        def files():
+            return {str(p.relative_to(self.dir)): p.stat().st_mtime_ns for p in self.dir.rglob("*")
+                    if p.is_file() and p.name != "session.json"}
+
+        before = files()
         self.run_main(site, "tout", mutate=mutate)
-        after = {p.name: p.stat().st_mtime_ns for p in self.dir.iterdir() if p.name != "session.json"}
+        after = files()
         self.assertEqual(sorted(after), ["config.yaml", "prix.json"])  # ni journal, ni ventes.json, ni verrou
         self.assertEqual(set(after), set(before))
 
@@ -794,10 +855,10 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(planned, sold)  # exactement les cartes montrées par le dry-run
 
     def test_second_execute_run_is_refused_while_locked(self):
-        (self.dir / ".wikimasters.lock").write_text(f"{os.getpid()} 2026-01-01 00:00:00")
+        (self.acc / ".wikimasters.lock").write_text(f"{os.getpid()} 2026-01-01 00:00:00")
         output, code = self.run_main(standard_site(tags=SORTED), "vendre", execute=True)
         self.assertIn("Un autre passage", str(code))
-        self.assertTrue((self.dir / ".wikimasters.lock").exists())  # le verrou d'un autre passage n'est pas supprimé
+        self.assertTrue((self.acc / ".wikimasters.lock").exists())  # le verrou d'un autre passage n'est pas supprimé
 
     def test_journal_neutralises_formulas_and_keeps_numbers_readable(self):
         journal = w.Journal(self.dir / "j.csv", ";", True, "=moi", "vendre")
@@ -833,7 +894,7 @@ class EndToEndTest(unittest.TestCase):
         self.assertNotIn("non écrite", output)
         self.assertNotIn("vendue", [r["action"] for r in self.read_journal()])
         # Rien n'est perdu : la vente est réglée une seule fois, la ligne attend dans le fichier de secours.
-        self.assertNotIn("auction-104", json.loads((self.dir / "ventes.json").read_text())["auctions"])
+        self.assertNotIn("auction-104", json.loads((self.acc / "ventes.json").read_text())["auctions"])
         backup = self.dir / "journal_secours.csv"
         self.assertIn("vendue", backup.read_text(encoding="utf-8-sig"))
 
@@ -847,19 +908,19 @@ class EndToEndTest(unittest.TestCase):
     def test_dry_run_does_not_touch_sales_state(self):
         site = standard_site(tags=SORTED)
         self.run_main(site, "vendre", execute=True)
-        before = (self.dir / "ventes.json").read_text()
+        before = (self.acc / "ventes.json").read_text()
         site.auctions["auction-104"] = {"status": "settled", "winner_id": "x", "final_price": 70}
         journal_before = self.read_journal()
         output, _ = self.run_main(site, "vendre")
         self.assertIn("VENDUE", output)
-        self.assertEqual((self.dir / "ventes.json").read_text(), before)
+        self.assertEqual((self.acc / "ventes.json").read_text(), before)
         self.assertEqual(self.read_journal(), journal_before)  # rien n'est journalisé en dry-run
 
     # --- boucle, verrou, --fresh et Telegram ---
 
     def test_loop_relists_card_seen_on_sale_in_a_previous_cycle(self):
         site = standard_site(tags={AMPHIBIA: ["+10"]})
-        (self.dir / "ventes.json").write_text(json.dumps({"auctions": {"auction-104": {
+        (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"auction-104": {
             "copy_id": AMPHIBIA, "card_id": "x", "name": "Amphibia", "rarity": "R", "price": 45, "attempt": 1,
             "listed_at": time.time(), "duration": 30, "status": "open"}}}))
         pauses = []
@@ -876,7 +937,7 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(site.sells(), [AMPHIBIA])  # 2e cycle : relancée, pas « déjà en vente » pour toujours
         self.assertIn("relance 2", output)
         self.assertEqual(code, 0)
-        self.assertFalse((self.dir / ".wikimasters.lock").exists())
+        self.assertFalse((self.acc / ".wikimasters.lock").exists())
 
     def test_revoked_session_stops_the_loop(self):
         site = standard_site(tags=SORTED)
@@ -895,7 +956,7 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(code, 2, bad)
 
     def test_lock_of_a_dead_or_silent_run_is_taken_over(self):
-        lock = self.dir / ".wikimasters.lock"
+        lock = self.acc / ".wikimasters.lock"
         lock.write_text("4242 2026-01-01 00:00:00")
         with mock.patch.object(w, "pid_alive", return_value=False):
             _, code = self.run_main(standard_site(tags=SORTED), "vendre", execute=True)
@@ -914,7 +975,7 @@ class EndToEndTest(unittest.TestCase):
         self.assertFalse(w.pid_alive(proc.pid))
 
     def test_held_lock_shows_signs_of_life(self):
-        lock = w.RunLock(self.dir / ".wikimasters.lock")
+        lock = w.RunLock(self.acc / ".wikimasters.lock")
         with mock.patch.object(w.RunLock, "HEARTBEAT", 0.01):
             lock.acquire()
             try:
@@ -955,17 +1016,19 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn("&lt;html&gt;", text)
         self.assertIn("a &lt; b", text)
 
-    def test_telegram_reads_secrets_file_and_reports_the_real_outcome(self):
-        enable = lambda c: c["telegram"].update(enabled=True)  # noqa: E731
+    def test_telegram_token_from_perso_yaml_and_the_real_outcome(self):
         site = standard_site()
-        output, _ = self.run_main(site, "analyser", execute=True, mutate=enable)  # pas encore de secrets.yaml
-        self.assertIn("pas de notification", output)
+        output, _ = self.run_main(site, "analyser", execute=True)  # pas de perso.yaml : pas de notification
+        self.assertEqual(site.telegram, [])
+        self.assertNotIn("Telegram", output)
+
+        output, _ = self.run_main(site, "analyser", execute=True, perso={"telegram": {"bot_token": "123:secret"}})
+        self.assertIn("pas de notification", output)  # chat_id manquant
         self.assertEqual(site.telegram, [])
 
-        secrets = {"telegram": {"bot_token": "123:secret", "chat_id": 42}}
-        self.run_main(site, "analyser", mutate=enable, secrets=secrets)
-        self.assertEqual(site.telegram, [])  # dry-run : notify_on_dry_run vaut false
-        self.run_main(site, "analyser", execute=True, mutate=enable)
+        self.run_main(site, "analyser", perso={"telegram": {"bot_token": "123:secret", "chat_id": 42}})
+        self.assertEqual(site.telegram, [])  # simulation : notify_on_dry_run vaut false
+        self.run_main(site, "analyser", execute=True)
         url, body = site.telegram[-1]
         self.assertIn("/bot123:secret/sendMessage", url)
         self.assertEqual((body["chat_id"], body["parse_mode"]), ("42", "HTML"))
@@ -977,16 +1040,109 @@ class EndToEndTest(unittest.TestCase):
             if seconds == load_cfg()["safety"]["delay_seconds"]:
                 raise KeyboardInterrupt
 
-        self.run_main(site, "analyser", execute=True, mutate=enable, sleep=interrupt)
+        self.run_main(site, "analyser", execute=True, sleep=interrupt)
         self.assertIn("Interrompu", site.telegram[-1][1]["text"])
         self.assertNotIn("✅", site.telegram[-1][1]["text"])
 
         site = standard_site(tags=SORTED)
         site.overrides[("GET", "/api/marketplace/mine")] = FakeResponse(200, {})  # réponse inattendue du site
         with self.assertRaises(KeyError):
-            self.run_main(site, "vendre", execute=True, mutate=enable)
+            self.run_main(site, "vendre", execute=True)
         self.assertIn("Plantage", site.telegram[-1][1]["text"])
         self.assertIn("KeyError", site.telegram[-1][1]["text"])
+
+    # --- comptes, perso.yaml, boucle ---
+
+    def test_accounts_are_separate_and_chosen_with_compte(self):
+        other = self.dir / "comptes" / "Autre"
+        other.mkdir()
+        w.SessionStore(other / "session.json").save(make_session())
+        output, code = self.run_main(standard_site(tags=SORTED), "vendre", execute=True)
+        self.assertIn("Plusieurs comptes", str(code))
+        self.assertIn("--compte Autre", str(code))
+        output, code = self.run_main(standard_site(tags=SORTED), "vendre", execute=True, args=["--compte", "inconnu"])
+        self.assertIn("Compte « inconnu » inconnu", str(code))
+
+        site = standard_site(tags=SORTED)
+        self.run_main(site, "vendre", execute=True, args=["--compte", "autre"])  # majuscules ignorées
+        self.assertEqual(len(site.sells()), 2)
+        self.assertTrue((other / "ventes.json").exists())
+        self.assertFalse((self.acc / "ventes.json").exists())  # le suivi des ventes est propre à chaque compte
+
+        output, code = self.run_main(site, "comptes")
+        self.assertIn("Autre", output)
+        self.assertIn("2 enchère(s) suivie(s)", output)
+
+    def test_login_creates_the_account_folder_from_the_site_name(self):
+        claims = {"sub": USER_ID, "exp": int(time.time()) + 3600, "user_metadata": {"username": "Bob/Ü 2"}}
+        session = {"access_token": f"{b64({'alg': 'HS256'})}.{b64(claims)}.sig", "refresh_token": "r0",
+                   "expires_at": claims["exp"]}
+        output, code = self.run_main(standard_site(), "login", session=None, stdin=fake_cookie(session=session) + "\n")
+        self.assertEqual(code, 0)
+        self.assertTrue((self.dir / "comptes" / "Bob_Ü_2" / "session.json").exists())
+        self.assertIn("Compte Bob/Ü 2 enregistré", output)
+
+    def test_perso_yaml_overrides_shared_settings(self):
+        site = standard_site(tags={CHACANA: ["defausse"]})
+        output, _ = self.run_main(site, "defausser", execute=True, perso={"discard": {"max_per_run": 0}})
+        self.assertEqual(site.discards(), [])
+        self.assertIn("1 action(s) reportée(s)", output)
+
+    def test_loop_defaults_to_15_minutes_and_fresh_rereads_only_once(self):
+        waits = []
+
+        def sleep(seconds):
+            if seconds == 15 * 60:
+                waits.append(seconds)
+                if len(waits) == 2:
+                    raise KeyboardInterrupt
+
+        site = standard_site()
+        output, code = self.run_main(site, "analyser", sleep=sleep, args=["--fresh", "--loop"],
+                                     mutate=lambda c: c["price"].update(cache_hours=6))
+        self.assertEqual((code, waits), (0, [900, 900]))
+        self.assertEqual(output.count("=== ["), 2)
+        self.assertEqual(len(site.gets("/sales")), 4)  # 2e cycle : prix relus au 1er cycle réutilisés
+        self.assertEqual(output.count("Option --fresh"), 1)
+
+    def test_price_cache_merges_runs_and_forgets_expired_prices(self):
+        path = self.dir / "prix.json"
+        path.write_text(json.dumps({"vieux:C": {"value": 1, "at": time.time() - 7 * 3600}}), encoding="utf-8")
+        a, b = w.PriceCache(path, 6), w.PriceCache(path, 6)
+        a.set(w.Card(copy_id="1", card_id="c1", name="A", rarity="C"), 3)
+        a.save()
+        b.set(w.Card(copy_id="2", card_id="c2", name="B", rarity="R"), None)
+        b.save()  # un autre compte en parallèle : il n'efface pas le prix lu par le premier
+        self.assertEqual(sorted(json.loads(path.read_text())), ["c1:C", "c2:R"])
+
+    def token_posts(self, site):
+        return [u for m, u, *_ in site.calls if m == "POST" and u.endswith("/auth/v1/token")]
+
+    def test_network_blip_during_refresh_is_retried(self):
+        site = standard_site()
+        site.overrides[("POST", "/auth/v1/token")] = [requests.ConnectionError(), None]
+        output, code = self.run_main(site, "analyser", execute=True, session=make_session(exp_offset=-10))
+        self.assertEqual((code, site.refreshes, len(self.token_posts(site))), (0, 1, 2))
+        self.assertEqual(self.store.load()["refresh_token"], "r1")
+        self.assertEqual(len(site.tag_links()), 3)
+
+    def test_refresh_is_postponed_while_the_token_is_still_valid(self):
+        site = standard_site()
+        site.overrides[("POST", "/auth/v1/token")] = requests.ConnectionError()
+        output, code = self.run_main(site, "analyser", execute=True, session=make_session(exp_offset=200))
+        self.assertEqual(code, 0)
+        self.assertIn("renouvellement de session reporté (réseau : ConnectionError)", output)
+        self.assertEqual(len(self.token_posts(site)), 1 + len(w.REFRESH_RETRY_DELAYS))  # pas à chaque requête
+        self.assertEqual(len(site.tag_links()), 3)
+
+    def test_refresh_impossible_with_expired_token_stops_and_tells_how_to_resume(self):
+        site = standard_site()
+        site.overrides[("POST", "/auth/v1/token")] = FakeResponse(503, {"error": "indisponible"})
+        output, code = self.run_main(site, "analyser", execute=True, session=make_session(exp_offset=-10),
+                                     mutate=lambda c: c["price"].update(cache_hours=6), args=["--fresh"])
+        self.assertEqual((code, site.mutations()), (1, []))
+        self.assertIn("renouvellement de session impossible (erreur 503)", output)
+        self.assertIn("(sans --fresh)", output)
 
     # --- corrections de la quatrième revue ---
 
@@ -1253,7 +1409,7 @@ class EndToEndTest(unittest.TestCase):
         site = standard_site()
         output, code = self.run_main(site, "login", session=None, stdin="Cookie: " + fake_cookie() + "\n")
         self.assertEqual(code, 0)
-        self.assertIn("Session enregistrée pour testeur", output)
+        self.assertIn("Compte testeur enregistré", output)
         self.assertEqual(self.store.load()["refresh_token"], "r0")
         self.assertEqual(os.stat(self.store.path).st_mode & 0o777, 0o600)
         self.assertEqual(len(site.gets("/api/marketplace/mine")), 1)

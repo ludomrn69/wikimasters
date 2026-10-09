@@ -1,0 +1,22 @@
+#!/bin/sh
+# Lanceur du bot WikiMasters (Mac / Linux). Au premier lancement, il installe ce qu'il faut.
+#   ./wm login        ajoute un compte
+#   ./wm tout         simulation ; ./wm tout --execute pour de vrai
+cd "$(dirname "$0")" || exit 1
+if [ ! -x .venv/bin/python ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Python 3 introuvable : installez-le depuis https://www.python.org/downloads/ puis relancez."
+        exit 1
+    fi
+    if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+        echo "Python $(python3 -c 'import platform; print(platform.python_version())') est trop ancien : il faut 3.10 ou plus (https://www.python.org/downloads/)."
+        exit 1
+    fi
+    echo "Première utilisation : installation (une minute)…"
+    python3 -m venv .venv || exit 1
+fi
+if [ ! -f .venv/.installe ] || [ requirements.txt -nt .venv/.installe ]; then
+    .venv/bin/python -m pip install --quiet --disable-pip-version-check -r requirements.txt || exit 1
+    touch .venv/.installe
+fi
+WM_CMD="./wm" exec .venv/bin/python wikimasters.py "$@"

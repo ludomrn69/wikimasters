@@ -26,9 +26,6 @@ site:
   supabase_url: "https://cyrxjeppjqsxxjayfrur.supabase.co"
   # Clé publique ("anon") intégrée au site : ce n'est pas un secret, elle est la même pour tous.
   supabase_anon_key: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN5cnhqZXBwanFzeHhqYXlmcnVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4ODAzMzksImV4cCI6MjA4OTQ1NjMzOX0.BZluyXygNxuQGDPxFX1zG5i-cqp10CVK-8GGtuak4Rg"
-  # Session du script, créée par « login ». Ne jamais la partager ni la committer.
-  # Si vous changez ce nom, gardez-le de la forme session*.json (exclu par .gitignore).
-  session_file: "session.json"
 
 # ----------------------------------------------------------------------------
 # Protections : ces cartes ne sont JAMAIS défaussées ni vendues, quelles que soient leurs étiquettes.
@@ -82,7 +79,7 @@ auto_tags: []
 discard:
   tags: ["defausse"]      # défausse les cartes portant une de ces étiquettes (posées par analyser ou à la main)
   max_value: 10           # garde-fou : ne défausse jamais une carte dont le prix moyen actuel est >= 10 (null = pas de vérification)
-  unknown_price: "skip"   # carte jamais vendue mais étiquetée à défausser : skip (garder) | discard (défausser)
+  unknown_rarities: []    # cartes jamais vendues à défausser (aucune dans les tests de base)
   max_per_run: 200        # au plus N défausses par passage (la suite au passage suivant)
   fresh_price: true       # relire le prix sur le site juste avant de défausser (au lieu du cache)
   require_existing_tag: true  # ne défausser que si « defausse » était déjà là au début du passage :
@@ -103,7 +100,6 @@ sell:
   min_value: 10           # garde-fou : ne vend jamais une carte dont le prix moyen est < 10 (null = pas de vérification)
   fresh_price: false      # true = relire le prix sur le site avant de vendre (sinon : cache de price.cache_hours)
   require_existing_tag: false  # true = ne vendre que les cartes déjà étiquetées au début du passage
-  state_file: "ventes.json"    # suivi des enchères lancées (bilan vendue/invendue, relances)
   # Relance des invendus : une carte revenue sans acheteur est remise en vente moins cher.
   relist:
     enabled: true
@@ -138,6 +134,5 @@ display:
 # Notifications Telegram
 # ----------------------------------------------------------------------------
 telegram:
-  enabled: false
   notify_on_dry_run: false   # true = notifier aussi les dry-runs (false = seulement les passages --execute)
   # Le jeton du bot et votre chat_id vont dans secrets.yaml (exclu de git), JAMAIS dans ce fichier.
