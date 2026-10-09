@@ -19,9 +19,10 @@ if not defined PY (
 echo Premiere utilisation : installation (une minute)...
 %PY% -m venv .venv || exit /b 1
 :install
-if exist ".venv\.installe" goto run
+rem .venv\.installe est une copie de requirements.txt : si le fichier a change, on reinstalle.
+fc /b requirements.txt ".venv\.installe" >nul 2>nul && goto run
 ".venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check -r requirements.txt || exit /b 1
-type nul > ".venv\.installe"
+copy /y requirements.txt ".venv\.installe" >nul
 :run
 set "WM_CMD=wm"
 ".venv\Scripts\python.exe" wikimasters.py %*

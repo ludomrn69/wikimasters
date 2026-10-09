@@ -15,8 +15,9 @@ if [ ! -x .venv/bin/python ]; then
     echo "Première utilisation : installation (une minute)…"
     python3 -m venv .venv || exit 1
 fi
-if [ ! -f .venv/.installe ] || [ requirements.txt -nt .venv/.installe ]; then
+# .venv/.installe est une copie de requirements.txt : si le fichier a changé, on réinstalle.
+if ! cmp -s requirements.txt .venv/.installe; then
     .venv/bin/python -m pip install --quiet --disable-pip-version-check -r requirements.txt || exit 1
-    touch .venv/.installe
+    cp requirements.txt .venv/.installe
 fi
 WM_CMD="./wm" exec .venv/bin/python wikimasters.py "$@"
