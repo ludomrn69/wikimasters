@@ -113,6 +113,8 @@ sell:
 safety:
   max_actions_per_run: 10000        # au plus N actions (étiquettes, défausses, ventes) par passage ; relancez pour continuer
   delay_seconds: 1.5              # pause après chaque action
+  auction_delay_seconds: 45       # pause après chaque mise en vente : enchaînées en quelques secondes, elles
+                                  # déclenchent la vérification anti-robot du site
   read_delay_seconds: 1.8         # pause après chaque lecture de prix
   max_consecutive_errors: 3       # arrêt après N actions refusées d'affilée
   max_consecutive_read_failures: 5  # arrêt après N prix illisibles d'affilée

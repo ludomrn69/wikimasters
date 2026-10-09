@@ -111,7 +111,7 @@ Faites `./wm login` une fois par compte : chacun a son dossier dans `comptes/`, 
 ./wm tout --execute --loop --compte monpseudo   # un compte précis
 ```
 
-Deux comptes peuvent tourner en même temps, dans deux terminaux.
+Deux comptes peuvent tourner en même temps, dans deux terminaux. Ils sollicitent alors deux fois plus le site : si les erreurs 503 ou 525 reviennent souvent, faites-les tourner l'un après l'autre.
 
 ## Vos réglages : `perso.yaml`
 
@@ -155,6 +155,8 @@ Le jeton ne va **jamais** dans `config.yaml` : le script refuse de démarrer s'i
 | `Plusieurs comptes enregistrés` | Ajoutez `--compte NOM` (voir `./wm comptes`). |
 | `Un autre passage --execute est actif` | Un autre terminal fait déjà tourner ce compte. Attendez qu'il finisse, ou arrêtez-le. |
 | `Configuration invalide` | Le message dit quel réglage corriger dans `perso.yaml`. |
+| `nouvel essai dans … s` | Le site ne répond pas ou est surchargé (erreurs 503, 525, délai dépassé). Le script attend, réessaie tout seul et ralentit un moment. Rien à faire. |
+| `le site demande une vérification anti-robot` | Le site soupçonne un robot. Le script met ce type d'action en pause (1 h, puis 2 h, 4 h, 8 h si le site insiste) et continue le reste. Pour reprendre plus tôt : ouvrez le site avec ce compte, faites l'action à la main (passez la vérification si elle s'affiche), puis relancez le script. |
 | `permission denied: ./wm` | Lancez `sh wm login`, ou une fois `chmod +x wm`. |
 
 ## Le journal
@@ -170,6 +172,9 @@ Chaque action réelle est inscrite dans **`journal.csv`** (date, compte, carte, 
 - Une carte déjà en vente n'est pas remise en vente. Une enchère que vous annulez vous-même n'est pas relancée.
 - Deux passages `--execute` ne peuvent pas tourner en même temps sur le même compte.
 - Le script fait une pause entre chaque action et chaque lecture, et il s'arrête après plusieurs échecs d'affilée.
+- Les mises en vente sont espacées de 45 secondes (`safety.auction_delay_seconds`) : enchaînées en quelques secondes, elles déclenchent la vérification anti-robot du site.
+- Si le site demande une vérification anti-robot, le script n'insiste pas : ce type d'action attend, le reste continue.
+- Si le serveur du site peine, le script attend, réessaie et ralentit. Une défausse ou une vente n'est renvoyée que si le serveur n'a certainement rien fait.
 - Un résumé s'affiche toujours à la fin, même après une interruption.
 
 ## À savoir

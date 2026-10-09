@@ -48,8 +48,23 @@ MAX_PAGES = 500
 REFRESH_MARGIN = 300
 # Taille maximale d'un morceau de cookie, comme le fait la bibliothèque Supabase du site.
 COOKIE_CHUNK_SIZE = 3180
-# Nouvelles tentatives pour une lecture (GET) en cas de coupure réseau, 429 ou 5xx : ~40 s de coupure tolérée.
+# Nouvelles tentatives pour une lecture (GET) en cas de coupure réseau, 429 ou 5xx : ~3 min de coupure tolérée.
 GET_RETRY_DELAYS = (2, 10, 30, 60, 90)
+# Nouvelles tentatives pour une écriture (étiquette, défausse, vente) : ~4 min de panne du serveur tolérée.
+WRITE_RETRY_DELAYS = (10, 30, 60, 120)
+# Réponses qui garantissent que le serveur n'a rien fait : même une défausse ou une vente peut être renvoyée.
+# (429 trop de requêtes, 503 indisponible, 521/522/523/525 Cloudflare n'a pas pu joindre le serveur.)
+NOT_PROCESSED = {429, 503, 521, 522, 523, 525}
+# Après une erreur du serveur, toutes les pauses sont doublées (jusqu'à ×8), puis reviennent peu à peu à la normale.
+MAX_SLOWDOWN = 8
+# Vérification anti-robot demandée par le site : ce type d'action est mis en pause 1 h, puis 2 h, 4 h, 8 h
+# si le site la redemande. Le reste du passage continue.
+ANTIBOT_PAUSES = (3600, 7200, 14400, 28800)
+ANTIBOT_CODE = "human_verification_required"
+ANTIBOT_HINT = ("Ouvrez wiki-masters.com dans votre navigateur avec ce compte et faites l'action à la main "
+                "(passez la vérification si elle s'affiche), puis relancez le script.")
+ANTIBOT_GROUPS = {"auction": "mises en vente", "discard": "défausses", "add_tag": "étiquettes",
+                  "remove_tag": "étiquettes"}
 # Nouvelles tentatives du renouvellement de session (réseau, 429, 5xx). Rapides : si la première demande était
 # arrivée, Supabase accepte encore l'ancien jeton pendant quelques secondes, au-delà il révoquerait la session.
 REFRESH_RETRY_DELAYS = (1, 3)
@@ -70,10 +85,15 @@ def cmd(args):
 class ApiError(Exception):
     """Erreur d'API. fatal=True arrête le passage, sinon seule l'action en cours est abandonnée."""
 
-    def __init__(self, message, fatal=False, status=None):
+    def __init__(self, message, fatal=False, status=None, code=None):
         super().__init__(message)
         self.fatal = fatal
         self.status = status
+        self.code = code  # code d'erreur renvoyé par le site ou Supabase (ex. "23505")
+
+    @property
+    def antibot(self):
+        return self.code == ANTIBOT_CODE
 
 
 @dataclass
@@ -414,10 +434,11 @@ def check_config(cfg):
         if common:
             err(f"{name_a} et {name_b} ont des étiquettes en commun : {sorted(common)}")
 
-    safety = section("safety", ("max_actions_per_run", "delay_seconds", "read_delay_seconds", "max_consecutive_errors",
-                                "max_consecutive_read_failures"))
+    safety = section("safety", ("max_actions_per_run", "delay_seconds", "auction_delay_seconds", "read_delay_seconds",
+                                "max_consecutive_errors", "max_consecutive_read_failures"))
     number(safety, "safety", "max_actions_per_run", 0, integer=True)
     number(safety, "safety", "delay_seconds", 0)
+    number(safety, "safety", "auction_delay_seconds", 0)
     number(safety, "safety", "read_delay_seconds", 0)
     number(safety, "safety", "max_consecutive_errors", 1, integer=True)
     number(safety, "safety", "max_consecutive_read_failures", 1, integer=True)
@@ -834,6 +855,8 @@ class WikiMastersClient:
         self.http.headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
         self.http.headers["Accept"] = "application/json"
         self.session_lost = None  # raison si la session ne peut plus être utilisée
+        self.slowdown = 1.0  # multiplie toutes les pauses après une erreur du serveur
+        self.last_uncertain = False  # la dernière écriture a dû être renvoyée après une tentative peut-être effectuée
         self._tag_ids = None
         self._last_refresh = None
 
@@ -944,42 +967,91 @@ class WikiMastersClient:
         except (ValueError, KeyError, TypeError):
             self.session_lost = f"le site a renvoyé une session invalide : relancez « {cmd('login')} »."
 
-    def _request(self, method, url, headers_fn, **kwargs):
+    def pause(self, seconds):
+        """Pause entre deux requêtes, allongée tant que le serveur montre des signes de surcharge."""
+        time.sleep(seconds * self.slowdown)
+
+    def _request(self, method, url, headers_fn, retry=None, **kwargs):
+        """Envoie la requête ; en cas de panne du serveur (429, 5xx, réseau), attend puis la renvoie.
+
+        Une lecture est toujours renvoyée. Une écriture ne l'est que si retry le permet :
+          "idempotent" : la refaire ne change rien (étiquette déjà posée ou déjà retirée) ;
+          "safe"       : seulement si le serveur n'a certainement rien fait (NOT_PROCESSED, connexion impossible).
+        """
         what = f"{method} {urlparse(url).path}"
-        maybe_done = f" {MAYBE_DONE}" if method != "GET" else ""
-        delays = GET_RETRY_DELAYS if method == "GET" else ()
+        if method == "GET":
+            retry, delays = "idempotent", GET_RETRY_DELAYS
+        else:
+            delays = WRITE_RETRY_DELAYS if retry else ()
+        uncertain = False  # une tentative d'écriture a peut-être été effectuée par le serveur
         for attempt in range(len(delays) + 1):
             self.ensure_fresh()
+            wait = delays[attempt] if attempt < len(delays) else 0
             try:
                 resp = self.http.request(
                     method, url, timeout=20, allow_redirects=False, headers=headers_fn(), **kwargs
                 )
             except requests.RequestException as e:
+                sent = not isinstance(e, requests.ConnectTimeout)  # délai de connexion dépassé : rien n'est parti
+                uncertain = uncertain or (sent and method != "GET")
                 # Jamais str(e) : le message peut contenir les en-têtes, donc le cookie.
-                error = ApiError(f"erreur réseau ({type(e).__name__}) sur {what}.{maybe_done}", fatal=True)
+                problem = f"erreur réseau ({type(e).__name__})"
+                error = ApiError(f"{problem} sur {what}.{self._maybe_done(uncertain)}", fatal=True)
+                retryable = retry == "idempotent" or not sent
             else:
                 self._adopt_server_cookies(resp)
                 if not (resp.status_code == 429 or resp.status_code >= 500):
-                    return self._parse(resp, what, maybe_done)
-                error = self._status_error(resp, what, maybe_done)
-            if attempt < len(delays):
-                time.sleep(delays[attempt])
+                    self.slowdown = max(1.0, self.slowdown * 0.9)
+                    self.last_uncertain = uncertain
+                    return self._parse(resp, what, self._maybe_done(uncertain))
+                problem = f"erreur {resp.status_code}"
+                processed = resp.status_code not in NOT_PROCESSED
+                uncertain = uncertain or (processed and method != "GET")
+                error = self._status_error(resp, what, self._maybe_done(uncertain))
+                retryable = retry == "idempotent" or not processed
+                wait = max(wait, min(self._retry_after(resp), 300))
+            self.slowdown = min(MAX_SLOWDOWN, self.slowdown * 2)
+            if not retryable or attempt == len(delays):
+                break
+            print(f"     {problem} sur {what} : nouvel essai dans {wait:g} s…")
+            time.sleep(wait)
         raise error
+
+    @staticmethod
+    def _maybe_done(uncertain):
+        return f" {MAYBE_DONE}" if uncertain else ""
+
+    @staticmethod
+    def _retry_after(resp):
+        """Délai demandé par le serveur (en-tête Retry-After, en secondes), 0 sinon."""
+        try:
+            return max(0.0, float(resp.headers.get("Retry-After") or 0))
+        except ValueError:
+            return 0.0
 
     def _status_error(self, resp, what, maybe_done):
         is_json = resp.headers.get("content-type", "").startswith("application/json")
         detail = f" : {resp.text[:200]}" if is_json and resp.text else ""
         if resp.status_code == 429:
             setting = "safety.read_delay_seconds" if what.startswith("GET") else "safety.delay_seconds"
-            return ApiError(f"trop de requêtes (429) : augmentez {setting} et réessayez plus tard.", True, 429)
-        return ApiError(f"erreur {resp.status_code} sur {what}{detail}", status=resp.status_code)
+            return ApiError(f"trop de requêtes (429) : augmentez {setting} et réessayez plus tard.{maybe_done}",
+                            True, 429)
+        return ApiError(f"erreur {resp.status_code} sur {what}{detail}{maybe_done}", status=resp.status_code,
+                        code=_json_code(resp) if is_json else None)
 
     def _parse(self, resp, what, maybe_done):
         is_json = resp.headers.get("content-type", "").startswith("application/json")
         detail = f" : {resp.text[:200]}" if is_json and resp.text else ""
+        code = _json_code(resp) if is_json else None
         if 300 <= resp.status_code < 400:
             raise ApiError(f"redirection {resp.status_code} sur {what} (session refusée ?)", fatal=True)
-        if resp.status_code == 403 and is_json and _json_code(resp) == "42501":
+        if resp.status_code == 403 and code == ANTIBOT_CODE:
+            # Le site veut qu'un humain passe une vérification : surtout ne pas insister. Une lecture refusée arrête
+            # le passage ; une action refusée met ce type d'action en pause (voir Runner).
+            hint = f" {ANTIBOT_HINT}" if what.startswith("GET") else ""
+            raise ApiError(f"le site demande une vérification anti-robot (« Vérification anti-bot requise ») sur "
+                           f"{what}.{hint}", fatal=what.startswith("GET"), status=403, code=code)
+        if resp.status_code == 403 and code == "42501":
             # Session valide mais règle d'accès Supabase refusée : en pratique, l'exemplaire a quitté la collection
             # pendant le passage. Seule cette carte est abandonnée ; si tout est refusé, max_consecutive_errors arrête.
             raise ApiError(
@@ -995,7 +1067,7 @@ class WikiMastersClient:
                 status=resp.status_code,
             )
         if not resp.ok:
-            raise ApiError(f"erreur {resp.status_code} sur {what}{detail}", status=resp.status_code)
+            raise ApiError(f"erreur {resp.status_code} sur {what}{detail}", status=resp.status_code, code=code)
         if not resp.content:
             return None
         if not is_json:
@@ -1035,7 +1107,7 @@ class WikiMastersClient:
             pages.append(dict(data, collection=new))
             if len(items) < PAGE_SIZE:
                 break
-            time.sleep(self.page_delay)
+            self.pause(self.page_delay)
         else:
             warning = f"plus de {MAX_PAGES} pages : seuls les {len(seen)} premiers exemplaires sont traités."
 
@@ -1058,7 +1130,7 @@ class WikiMastersClient:
         return data["maxConcurrentAuctions"] - data["sellingCount"]
 
     def discard(self, card):
-        return self._api("POST", f"/api/user-cards/{card.copy_id}/discard")
+        return self._api("POST", f"/api/user-cards/{card.copy_id}/discard", retry="safe")
 
     def get_auction(self, auction_id):
         return self._api("GET", f"/api/marketplace/{auction_id}")
@@ -1066,7 +1138,7 @@ class WikiMastersClient:
     def create_auction(self, card, base_amount, duration_minutes):
         # Le champ s'appelle "card_id" mais attend bien l'id de l'EXEMPLAIRE (vérifié dans le HAR).
         body = {"card_id": card.copy_id, "base_amount": base_amount, "duration_minutes": duration_minutes}
-        return self._api("POST", "/api/marketplace", json=body)
+        return self._api("POST", "/api/marketplace", json=body, retry="safe")
 
     def known_tags(self):
         """Étiquettes du compte : norm(nom) -> id (lues une fois)."""
@@ -1083,6 +1155,7 @@ class WikiMastersClient:
                 "tags",
                 json={"user_id": self.user_id, "name": display_tag(name), "color": color},
                 extra_headers={"Prefer": "return=representation"},
+                retry="safe",  # renvoyée sans précaution, elle pourrait créer l'étiquette en double
             )
             if not (isinstance(created, list) and created and isinstance(created[0], dict) and created[0].get("id")):
                 self._tag_ids = None  # relire les étiquettes au prochain usage
@@ -1092,7 +1165,14 @@ class WikiMastersClient:
 
     def add_tag(self, card, name, color):
         tag_id = self.tag_id(name, color)
-        self._rest("POST", "user_card_tags", json={"user_card_id": card.copy_id, "tag_id": tag_id})
+        try:
+            self._rest("POST", "user_card_tags", json={"user_card_id": card.copy_id, "tag_id": tag_id},
+                       retry="idempotent")
+        except ApiError as e:
+            # Doublon (code PostgreSQL 23505) : l'étiquette est déjà sur la carte, ce qui est le but recherché
+            # (tentative précédente arrivée malgré une coupure, ou collection affichée en retard par le site).
+            if not (e.status == 409 and e.code == "23505"):
+                raise
         card.tag_ids[norm(name)] = tag_id
 
     def remove_tag(self, card, name):
@@ -1105,8 +1185,11 @@ class WikiMastersClient:
             "user_card_tags",
             params={"user_card_id": f"eq.{card.copy_id}", "tag_id": f"eq.{tag_id}"},
             extra_headers={"Prefer": "return=representation"},
+            retry="idempotent",
         )
-        if not removed:  # PostgREST répond OK même si rien n'a été supprimé (droits, mauvais filtre)
+        # PostgREST répond OK même si rien n'a été supprimé (droits, mauvais filtre). Après une tentative coupée,
+        # une réponse vide veut dire au contraire que cette tentative avait déjà retiré l'étiquette.
+        if not removed and not self.last_uncertain:
             raise ApiError(f"étiquette « {name} » non retirée : suppression refusée par le site ?")
         card.tag_ids.pop(norm(name), None)
 
@@ -1404,6 +1487,9 @@ class Context:
     run_started: float = 0.0  # début du passage : « prix relu » = lu depuis ce moment
     collection_ids: set = field(default_factory=set)  # tous les exemplaires de la collection, lignes groupées comprises
     on_sale: set = field(default_factory=set)  # exemplaires dont l'enchère est confirmée en cours
+    # Vérification anti-robot demandée par le site : groupe d'actions -> {"until": fin de la pause, "strikes": n}.
+    # Gardé d'un cycle de --loop à l'autre ; relancer le script la lève (après une vérification faite à la main).
+    antibot: dict = field(default_factory=dict)
 
 
 # --- Commandes --------------------------------------------------------------
@@ -1418,7 +1504,37 @@ def new_summary():
                 "deferred")
     # Ensembles d'exemplaires : une carte vue dans plusieurs phases de « tout » n'est comptée qu'une fois.
     sets = ("protect", "skip", "up_to_date", "read_error")
-    return {**{k: 0 for k in counters}, **{k: set() for k in sets}}
+    # paused : groupe d'actions -> fin de sa pause anti-robot (voir antibot_strike)
+    return {**{k: 0 for k in counters}, **{k: set() for k in sets}, "paused": {}}
+
+
+def clock_time(timestamp):
+    return time.strftime("%H:%M", time.localtime(timestamp))
+
+
+def antibot_until(ctx, kind):
+    """Fin de la pause anti-robot de ce type d'action, ou None s'il n'est pas en pause."""
+    group = ANTIBOT_GROUPS[kind]
+    entry = ctx.antibot.get(group)
+    if entry and entry["until"] > time.time():
+        ctx.summary["paused"][group] = entry["until"]
+        return entry["until"]
+    return None
+
+
+def antibot_strike(ctx, kind):
+    """Le site demande une vérification anti-robot : ce type d'action est mis en pause, plus longtemps à chaque fois.
+
+    Insister ne la ferait pas disparaître et ressemblerait encore plus à un robot : on attend, et on prévient.
+    """
+    group = ANTIBOT_GROUPS[kind]
+    entry = ctx.antibot.setdefault(group, {"strikes": 0})
+    entry["until"] = time.time() + ANTIBOT_PAUSES[min(entry["strikes"], len(ANTIBOT_PAUSES) - 1)]
+    entry["strikes"] += 1
+    ctx.summary["paused"][group] = entry["until"]
+    print(f"     Le site demande une vérification anti-robot : {group} en pause jusqu'à {clock_time(entry['until'])} "
+          "(le reste continue).")
+    print(f"     {ANTIBOT_HINT}")
 
 
 def read_values(client, cards, cfg, cache, since=0):
@@ -1458,7 +1574,7 @@ def read_values(client, cards, cfg, cache, since=0):
                 raise ApiError(f"{failures_in_a_row} lectures de prix échouées d'affilée", fatal=True)
         finally:
             delay = safety["read_delay_seconds"]
-            time.sleep(random.uniform(delay * 0.8, delay * 1.5))
+            client.pause(random.uniform(delay * 0.8, delay * 1.5))
     return values
 
 
@@ -1581,7 +1697,7 @@ def settle_sales(ctx):
                 raise
             print(f"  ÉCHEC     bilan de l'enchère {name} : {e}")
         finally:
-            time.sleep(ctx.cfg["safety"]["read_delay_seconds"])
+            ctx.client.pause(ctx.cfg["safety"]["read_delay_seconds"])
         outcome = classify_auction(auction)
         back = entry.get("copy_id") in ctx.collection_ids
         status = auction.get("status") if isinstance(auction, dict) else None
@@ -1646,6 +1762,10 @@ def plan_sell(ctx, cards):
         for auction_id, entry in ctx.state.with_status(status):
             if entry.get("copy_id") not in ctx.collection_ids:
                 ctx.state.set_status(auction_id, "gone")
+    until = antibot_until(ctx, "auction")
+    if until:
+        print(f"  mises en vente en pause jusqu'à {clock_time(until)} : le site a demandé une vérification anti-robot")
+        return []
     candidates = filter_candidates(ctx, cards, lambda card: sell["tags"], cfg["discard"]["tags"], "à vendre",
                                    sell["require_existing_tag"])
     for card in [c for c in candidates if c.copy_id in ctx.on_sale]:
@@ -1724,6 +1844,10 @@ def plan_discard(ctx, cards):
     remplir discard.max_per_run sont lues, la suite attend le passage suivant.
     """
     cfg, summary = ctx.cfg, ctx.summary
+    until = antibot_until(ctx, "discard")
+    if until:
+        print(f"  défausses en pause jusqu'à {clock_time(until)} : le site a demandé une vérification anti-robot")
+        return []
     disc = cfg["discard"]
     unknown_tag = cfg["price_tags"].get("unknown_tag")
     unknown_rarities = {norm(r) for r in disc["unknown_rarities"]}
@@ -1793,6 +1917,9 @@ class Runner:
                 return False
             if self.execute and self.client.session_lost:
                 raise ApiError(self.client.session_lost, fatal=True)
+            if antibot_until(self.ctx, kind):
+                self.summary["deferred"] += 1
+                continue
             print(f"  -> {self._describe(kind, arg):<26} {label(card, value)}")
             if self.execute:
                 try:
@@ -1806,11 +1933,15 @@ class Runner:
                     if e.fatal:
                         raise
                     self.summary["error"] += 1
-                    self.errors_in_a_row += 1
                     failed.add(card.copy_id)  # on n'enchaîne pas les autres actions prévues pour cette carte
                     print(f"     ÉCHEC : {e}")
-                    if self.errors_in_a_row >= self.cfg["safety"]["max_consecutive_errors"]:
-                        raise ApiError(f"{self.errors_in_a_row} erreurs consécutives", fatal=True)
+                    if e.antibot:
+                        antibot_strike(self.ctx, kind)  # les actions suivantes de ce type attendront
+                    else:
+                        self.errors_in_a_row += 1
+                        if self.errors_in_a_row >= self.cfg["safety"]["max_consecutive_errors"]:
+                            raise ApiError(f"{self.errors_in_a_row} erreurs consécutives", fatal=True)
+                    self.client.pause(self.cfg["safety"]["delay_seconds"])  # jamais deux requêtes collées
                     continue
             self._apply(card, kind, arg)
             # Compté tout de suite : un Ctrl+C pendant la pause ne doit pas faire disparaître l'action du résumé.
@@ -1820,8 +1951,11 @@ class Runner:
             self.actions += 1
             if self.execute:
                 self.errors_in_a_row = 0
+                self.ctx.antibot.pop(ANTIBOT_GROUPS[kind], None)  # acceptée à nouveau : la prochaine pause repart à 1 h
                 print(f"     {result}")
-                time.sleep(self.cfg["safety"]["delay_seconds"])
+                # Des mises en vente enchaînées en quelques secondes déclenchent la vérification anti-robot du site.
+                safety = self.cfg["safety"]
+                self.client.pause(safety["auction_delay_seconds"] if kind == "auction" else safety["delay_seconds"])
         return True
 
     @staticmethod
@@ -2213,6 +2347,8 @@ def print_summary(summary, execute):
         others.append(f"{len(summary['read_error'])} prix illisible(s)")
     if summary["deferred"]:
         others.append(f"{summary['deferred']} action(s) reportée(s) au prochain passage")
+    for group, until in summary["paused"].items():
+        others.append(f"{group} en pause jusqu'à {clock_time(until)} (vérification anti-robot demandée par le site)")
     summary_text = f"Résumé ({verb}) : {', '.join(parts)} | {', '.join(others)}"
     print(f"\n{summary_text}")
     return summary_text

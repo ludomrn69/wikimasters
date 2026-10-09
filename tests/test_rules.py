@@ -730,9 +730,19 @@ class EndToEndTest(unittest.TestCase):
     def test_failed_tag_means_no_sale_in_same_run(self):
         site = standard_site()
         site.overrides[("POST", "/rest/v1/user_card_tags")] = [FakeResponse(201, None), FakeResponse(201, None),
-                                                              FakeResponse(409, {"code": "23505"})]
+                                                              FakeResponse(400, {"code": "22P02"})]
         self.run_main(site, "tout", execute=True)
         self.assertNotIn(AMPHIBIA, site.sells())
+
+    def test_tag_already_on_card_counts_as_done(self):
+        # 409 doublon : l'étiquette est déjà là (tentative coupée mais arrivée, collection affichée en retard).
+        site = standard_site()
+        site.overrides[("POST", "/rest/v1/user_card_tags")] = [FakeResponse(201, None), FakeResponse(201, None),
+                                                              FakeResponse(409, {"code": "23505"}), None]
+        output, code = self.run_main(site, "tout", execute=True)
+        self.assertEqual(code, 0)
+        self.assertIn("0 échec(s)", output)
+        self.assertIn(AMPHIBIA, site.sells())
 
     # --- journal, bilan des ventes et relances ---
 
@@ -1181,7 +1191,7 @@ class EndToEndTest(unittest.TestCase):
     def test_failed_protecting_tag_blocks_discard_later_in_run(self):
         site = standard_site(tags={CHACANA: ["defausse"]})
         # Seule la pose de « garder » sur Chacana échoue ; les autres étiquettes passent.
-        site.overrides[("POST", "/rest/v1/user_card_tags")] = [FakeResponse(500, {"error": "x"}), None]
+        site.overrides[("POST", "/rest/v1/user_card_tags")] = [FakeResponse(400, {"error": "x"}), None]
         mutate = lambda c: c.update(auto_tags=[{"tag": "garder", "when": {"name_contains": "Chacana"}}])  # noqa: E731
         output, _ = self.run_main(site, "tout", execute=True, mutate=mutate)
         self.assertIn("== Défausses ==", output)
@@ -1343,6 +1353,104 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn("peut-être été effectuée", output)
         self.assertIn("Résumé", output)
         self.assertNotIn("base64-", output)
+
+    # --- panne du serveur et vérification anti-robot ---
+
+    ANTIBOT = {"error": "Vérification anti-bot requise.", "code": "human_verification_required"}
+
+    def test_server_outage_on_tag_is_waited_out_then_retried(self):
+        site = standard_site()
+        site.overrides[("POST", "/rest/v1/user_card_tags")] = [
+            FakeResponse(503, None), FakeResponse(525, {"title": "Error 525: SSL handshake failed"}),
+            requests.exceptions.ReadTimeout(), None]
+        pauses = []
+        output, code = self.run_main(site, "analyser", execute=True, sleep=pauses.append)
+        self.assertEqual(code, 0)
+        self.assertIn("nouvel essai dans 10 s", output)
+        self.assertIn("3 étiquette(s) posée(s)", output)
+        self.assertIn("0 échec(s)", output)
+        first = pauses.index(w.WRITE_RETRY_DELAYS[0])  # avant : les pauses de lecture des prix
+        self.assertEqual(pauses[first:first + 3], list(w.WRITE_RETRY_DELAYS[:3]))
+        # Le serveur a peiné : les pauses suivantes sont allongées (×8 après trois erreurs, puis ×0,9 par succès).
+        delay = load_cfg()["safety"]["delay_seconds"]
+        self.assertAlmostEqual(pauses[first + 3], delay * 8 * 0.9)
+
+    def test_tag_removal_cut_off_but_done_is_not_a_failure(self):
+        site = standard_site(tags={FACE: ["+100"]})
+        site.delete_returns_rows = False  # la 1re tentative avait déjà retiré l'étiquette
+        site.overrides[("DELETE", "/rest/v1/user_card_tags")] = [requests.exceptions.ReadTimeout(), None]
+        output, code = self.run_main(site, "analyser", execute=True)
+        self.assertEqual(code, 0)
+        self.assertNotIn("non retirée", output)
+        self.assertIn("1 retirée(s)", output)
+
+    def test_discard_is_resent_only_if_the_server_surely_did_nothing(self):
+        site = standard_site(tags=SORTED)
+        site.overrides[("POST", f"{CHACANA}/discard")] = [FakeResponse(503, None), None]
+        output, code = self.run_main(site, "defausser", execute=True)
+        self.assertEqual((code, site.discards()), (0, [CHACANA, CHACANA]))
+        self.assertIn("1 défausse(s)", output)
+        # 502 : le serveur a peut-être défaussé la carte, on ne renvoie pas.
+        site = standard_site(tags=SORTED)
+        site.overrides[("POST", f"{CHACANA}/discard")] = FakeResponse(502, None)
+        output, code = self.run_main(site, "defausser", execute=True)
+        self.assertEqual(site.discards(), [CHACANA])
+        self.assertIn("1 échec(s)", output)
+        self.assertIn("peut-être été effectuée", output)
+
+    def test_network_cut_during_discard_is_not_resent(self):
+        site = standard_site(tags=SORTED)
+        site.overrides[("POST", f"{CHACANA}/discard")] = requests.exceptions.ReadTimeout()
+        output, code = self.run_main(site, "defausser", execute=True)
+        self.assertEqual((code, site.discards()), (1, [CHACANA]))
+        self.assertIn("peut-être été effectuée", output)
+
+    def test_auctions_are_spaced_out(self):
+        site = standard_site(tags=SORTED)
+        pauses = []
+        self.run_main(site, "vendre", execute=True, sleep=pauses.append)
+        self.assertEqual(len(site.sells()), 2)
+        self.assertEqual(pauses.count(load_cfg()["safety"]["auction_delay_seconds"]), 2)
+
+    def test_antibot_check_pauses_sales_but_not_discards(self):
+        site = standard_site(tags=SORTED)
+        site.overrides[("POST", "/api/marketplace")] = FakeResponse(403, self.ANTIBOT)
+        output, code = self.run_main(site, "tout", execute=True,
+                                     mutate=lambda c: c["discard"].update(require_existing_tag=False))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(site.sells()), 1)  # on n'insiste pas avec la carte suivante
+        self.assertEqual(site.discards(), [CHACANA])
+        self.assertIn("vérification anti-robot : mises en vente en pause jusqu'à", output)
+        self.assertIn("mises en vente en pause jusqu'à", output.split("Résumé")[-1])
+        self.assertNotIn("login", output)
+
+    def test_antibot_pause_lasts_across_loop_cycles_then_is_retried(self):
+        site, clock = standard_site(tags=SORTED), Clock()
+        site.overrides[("POST", "/api/marketplace")] = [FakeResponse(403, self.ANTIBOT), FakeResponse(403, self.ANTIBOT),
+                                                        None]
+        cycles = []
+
+        def sleep(seconds):
+            if seconds == 60:  # pause de --loop 1
+                cycles.append(len(site.sells()))
+                clock.now += 3600 + 60 if len(cycles) == 2 else 60
+                if len(cycles) == 4:
+                    raise KeyboardInterrupt
+
+        output, code = self.run_main(site, "vendre", execute=True, args=["--loop", "1"], sleep=sleep, clock=clock)
+        # Cycle 1 : refusée, pause 1 h. Cycle 2 : en pause, rien. Cycle 3 (1 h plus tard) : refusée, pause 2 h.
+        self.assertEqual(cycles[:3], [1, 1, 2])
+        self.assertIn("en pause jusqu'à", output)
+        self.assertEqual(code, 0)
+
+    def test_antibot_check_on_a_read_stops_and_says_what_to_do(self):
+        site = standard_site(tags=SORTED)
+        site.overrides[("GET", "/api/marketplace/mine")] = FakeResponse(403, self.ANTIBOT)
+        output, code = self.run_main(site, "vendre", execute=True)
+        self.assertEqual((code, site.mutations()), (1, []))
+        self.assertIn("vérification anti-robot", output)
+        self.assertIn("passez la vérification", output)
+        self.assertEqual(len(site.gets("/api/marketplace/mine")), 1)  # pas de nouvel essai
 
     def test_html_response_is_fatal(self):
         site = standard_site(tags=SORTED)
