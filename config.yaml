@@ -1,23 +1,21 @@
 # ============================================================================
-#  Configuration du bot WikiMasters
-#  Toutes les règles se modifient ici, sans toucher au code.
-#  Le script vérifie ce fichier au démarrage et refuse de tourner s'il est mal écrit.
+#  Réglages communs du bot WikiMasters (partagés sur GitHub).
 #
-#  Commandes :
-#    python wikimasters.py login        connexion unique (voir README)
-#    python wikimasters.py analyser     pose les étiquettes de prix (defausse, +10, +100…)
-#    python wikimasters.py vendre       met aux enchères les cartes étiquetées à vendre
-#    python wikimasters.py defausser    défausse les cartes étiquetées « defausse »
-#    python wikimasters.py tout         les trois à la suite
-#  Ajoutez --execute pour agir pour de vrai (sinon : dry-run, rien n'est modifié).
-#  Options : --fresh relit tous les prix sur le site (pour actualiser les étiquettes),
-#            --loop 30 recommence toutes les 30 minutes.
+#  NE MODIFIEZ PAS CE FICHIER pour vos réglages : mettez-les dans perso.yaml (copie de
+#  perso.exemple.yaml), qui n'est jamais envoyé sur GitHub. Il suffit d'y écrire ce que vous
+#  changez ; tout le reste vient d'ici. Le script vérifie l'ensemble au démarrage.
+#
+#  Commandes (Windows : wm au lieu de ./wm) :
+#    ./wm login                  ajoute un compte (voir README)
+#    ./wm tout                   simulation : montre ce qui serait fait
+#    ./wm tout --execute         le fait pour de vrai
+#    ./wm tout --execute --loop  recommence toutes les 15 minutes (Ctrl+C pour arrêter)
 #
 #  Les noms d'étiquettes ignorent majuscules, accents, espaces et le « # » affiché par le site :
 #  « Lyon », « lyon » et « #lyon » sont la même étiquette, tout comme « Défausse » et « defausse ».
 #
 #  Pour garder une carte que le script voudrait défausser ou vendre : ajoutez-lui une étiquette de
-#  protection (ex. « garder ») sur le site. Retirer « defausse » ne suffit pas : « analyser » la remettrait.
+#  protection (« garder ») sur le site. Retirer « defausse » ne suffit pas : « analyser » la remettrait.
 # ============================================================================
 
 site:
@@ -26,18 +24,14 @@ site:
   supabase_url: "https://cyrxjeppjqsxxjayfrur.supabase.co"
   # Clé publique ("anon") intégrée au site : ce n'est pas un secret, elle est la même pour tous.
   supabase_anon_key: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN5cnhqZXBwanFzeHhqYXlmcnVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4ODAzMzksImV4cCI6MjA4OTQ1NjMzOX0.BZluyXygNxuQGDPxFX1zG5i-cqp10CVK-8GGtuak4Rg"
-  # Session du script, créée par « login ». Ne jamais la partager ni la committer.
-  # Si vous changez ce nom, gardez-le de la forme session*.json (exclu par .gitignore).
-  session_file: "session.json"
+  # Les sessions (créées par « login ») sont dans comptes/<nom>/, jamais envoyé sur GitHub.
 
 # ----------------------------------------------------------------------------
 # Protections : ces cartes ne sont JAMAIS défaussées ni vendues, quelles que soient leurs étiquettes.
+# Les listes de perso.yaml (tags, rarities, name_contains) s'ajoutent à celles-ci, sans jamais en retirer.
 # ----------------------------------------------------------------------------
 protection:
-  tags:                 # étiquettes qui protègent une carte
-    - "favori"
-    - "garder"
-    - "lyon"
+  tags: ["garder", "favori"]   # étiquettes qui protègent une carte (ajoutez les vôtres dans perso.yaml)
   starred: true         # cartes mises en favori (étoile)
   shiny: true           # cartes shiny
   rarities: ["SR", "L"] # raretés à ne jamais toucher (vues sur le site : C, PC, R, SR, L)
@@ -48,8 +42,8 @@ protection:
 # Prix : valeur d'une carte = prix moyen de ses ventes passées, pour sa rareté (donnée du site).
 # ----------------------------------------------------------------------------
 price:
-  cache_hours: 6                   # prix lus gardés 6 h : « vendre » réutilise ceux d'« analyser » (0 = jamais)
-                                   # pour tout relire sur le site malgré le cache : option --fresh
+  cache_hours: 24        # prix lus gardés 24 h : un passage interrompu reprend sans tout relire (0 = jamais)
+                         # pour tout relire sur le site malgré le cache : option --fresh
   cache_file: "prix_cache.json"
 
 # ----------------------------------------------------------------------------
@@ -58,7 +52,8 @@ price:
 # ----------------------------------------------------------------------------
 price_tags:
   bands:
-    - { tag: "defausse", below: 10,             color: "#a855f7" }
+    - { tag: "defausse", below: 5,              color: "#a855f7" }
+    - { tag: "+5",       from: 5,    below: 10,   color: "#f59e0b" }
     - { tag: "+10",      from: 10,   below: 100,  color: "#6366f1" }
     - { tag: "+100",     from: 100,  below: 500,  color: "#22c55e" }
     - { tag: "+500",     from: 500,  below: 1000, color: "#8b5cf6" }
@@ -81,18 +76,19 @@ auto_tags: []
 # ----------------------------------------------------------------------------
 discard:
   tags: ["defausse"]      # défausse les cartes portant une de ces étiquettes (posées par analyser ou à la main)
-  max_value: 10           # garde-fou : ne défausse jamais une carte dont le prix moyen actuel est >= 10 (null = pas de vérification)
-  unknown_price: "skip"   # carte jamais vendue mais étiquetée à défausser : skip (garder) | discard (défausser)
+  max_value: 5            # garde-fou : ne défausse jamais une carte dont le prix moyen actuel est >= 5 (null = pas de vérification)
+  unknown_rarities: ["C", "PC", "R"]  # cartes jamais vendues (étiquette « inconnu ») défaussées aussi, pour ces
+                                      # raretés ([] = jamais). SR et L sont protégées (protection.rarities).
   max_per_run: 200        # au plus N défausses par passage (la suite au passage suivant)
-  fresh_price: true       # relire le prix sur le site juste avant de défausser (au lieu du cache)
-  require_existing_tag: true  # ne défausser que si « defausse » était déjà là au début du passage :
-                              # dans « tout », les cartes qu'analyser vient d'étiqueter attendent le passage suivant
+  fresh_price: true       # prix relu sur le site pendant le passage, juste avant de défausser (au lieu du cache)
+  require_existing_tag: false  # true = ne défausser qu'au passage suivant celui qui a posé « defausse »
+                               # (pour avoir le temps de vérifier) ; false = dès le premier passage
 
 # ----------------------------------------------------------------------------
 # Ventes aux enchères (commande « vendre »).
 # ----------------------------------------------------------------------------
 sell:
-  tags: ["+1000", "+500", "+100", "+10"]   # met aux enchères les cartes portant une de ces étiquettes
+  tags: ["+1000", "+500", "+100", "+10", "+5"]   # met aux enchères les cartes portant une de ces étiquettes
   order: "random"         # random : au hasard | value : les plus chères d'abord | tags : dans l'ordre de la liste, puis par prix
   price_factor: 0.75      # mise de départ = prix moyen × 0,75…
   rounding: "floor"       # … arrondie à l'inférieur (floor), au plus proche (round) ou au supérieur (ceil)
@@ -100,10 +96,9 @@ sell:
   max_start_price: null   # mise de départ maximale (null = pas de plafond)
   duration_minutes: 30    # durée : 10, 30, 60, 180, 360 ou 720 (10 min, 30 min, 1 h, 3 h, 6 h, 12 h)
   max_auctions: 5         # enchères lancées au plus par passage (le site en autorise 5 en même temps)
-  min_value: 10           # garde-fou : ne vend jamais une carte dont le prix moyen est < 10 (null = pas de vérification)
+  min_value: 5            # garde-fou : ne vend jamais une carte dont le prix moyen est < 5 (null = pas de vérification)
   fresh_price: false      # true = relire le prix sur le site avant de vendre (sinon : cache de price.cache_hours)
   require_existing_tag: false  # true = ne vendre que les cartes déjà étiquetées au début du passage
-  state_file: "ventes.json"    # suivi des enchères lancées (bilan vendue/invendue, relances)
   # Relance des invendus : une carte revenue sans acheteur est remise en vente moins cher.
   relist:
     enabled: true
@@ -116,7 +111,7 @@ sell:
 # Garde-fous et rythme.
 # ----------------------------------------------------------------------------
 safety:
-  max_actions_per_run: 1000        # au plus N actions (étiquettes, défausses, ventes) par passage ; relancez pour continuer
+  max_actions_per_run: 10000        # au plus N actions (étiquettes, défausses, ventes) par passage ; relancez pour continuer
   delay_seconds: 1.5              # pause après chaque action
   read_delay_seconds: 1.8         # pause après chaque lecture de prix
   max_consecutive_errors: 3       # arrêt après N actions refusées d'affilée
@@ -137,7 +132,8 @@ display:
 # ----------------------------------------------------------------------------
 # Notifications Telegram
 # ----------------------------------------------------------------------------
+# Notification à la fin de chaque passage. Le jeton du bot et votre chat_id vont dans perso.yaml
+# (voir perso.exemple.yaml), JAMAIS dans ce fichier : sans eux, pas de notification.
 telegram:
-  enabled: true
-  notify_on_dry_run: true   # true = notifier aussi les dry-runs (false = seulement les passages --execute)
-  # Le jeton du bot et votre chat_id vont dans secrets.yaml (exclu de git), JAMAIS dans ce fichier.
+  notify_on_dry_run: false   # true = notifier aussi les simulations (false = seulement les passages --execute)
+

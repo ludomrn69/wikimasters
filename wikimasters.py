@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Bot WikiMasters : trie les cartes de votre collection selon config.yaml.
+"""Bot WikiMasters : trie les cartes de votre collection selon config.yaml (et vos réglages de perso.yaml).
 
-    python wikimasters.py login        une seule fois : enregistre la session (cookie du navigateur)
-    python wikimasters.py analyser     lit les prix moyens et pose les étiquettes de prix (defausse, +10, +100…)
-    python wikimasters.py vendre       met aux enchères les cartes étiquetées à vendre (places libres)
-    python wikimasters.py defausser    défausse les cartes étiquetées « defausse »
-    python wikimasters.py tout         analyser, puis vendre, puis defausser
+    ./wm login        ajoute un compte (cookie du navigateur, voir README)
+    ./wm tout         analyser, puis vendre, puis defausser
+    ./wm analyser     lit les prix moyens et pose les étiquettes de prix (defausse, +5, +10…)
+    ./wm vendre       met aux enchères les cartes étiquetées à vendre (places libres)
+    ./wm defausser    défausse les cartes « defausse » (et les « inconnu » des raretés choisies)
+    ./wm comptes      liste les comptes enregistrés
 
-Sans --execute, chaque commande est un dry-run : elle affiche ce qu'elle ferait sans rien modifier.
+Sans --execute, chaque commande est une simulation : elle affiche ce qu'elle ferait sans rien modifier.
+Sous Windows : wm à la place de ./wm. Sans le lanceur : python wikimasters.py …
 """
 
 import argparse
 import base64
 import binascii
 import csv
+import difflib
 import html
 import json
 import math
@@ -21,6 +24,8 @@ import os
 import pathlib
 import random
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -43,12 +48,23 @@ MAX_PAGES = 500
 REFRESH_MARGIN = 300
 # Taille maximale d'un morceau de cookie, comme le fait la bibliothèque Supabase du site.
 COOKIE_CHUNK_SIZE = 3180
-# Nouvelles tentatives pour une lecture (GET) en cas de coupure réseau, 429 ou 5xx.
-GET_RETRY_DELAYS = (2, 8)
+# Nouvelles tentatives pour une lecture (GET) en cas de coupure réseau, 429 ou 5xx : ~40 s de coupure tolérée.
+GET_RETRY_DELAYS = (2, 10, 30, 60, 90)
+# Nouvelles tentatives du renouvellement de session (réseau, 429, 5xx). Rapides : si la première demande était
+# arrivée, Supabase accepte encore l'ancien jeton pendant quelques secondes, au-delà il révoquerait la session.
+REFRESH_RETRY_DELAYS = (1, 3)
 MAYBE_DONE = "L'action a peut-être été effectuée : vérifiez sur le site."
-COMMANDS = ("analyser", "vendre", "defausser", "tout")
-# Identifiants personnels (jeton Telegram…), à côté de config.yaml et exclus de git.
-SECRETS_FILE = "secrets.yaml"
+COMMANDS = ("tout", "analyser", "vendre", "defausser")
+# Réglages personnels (et jeton Telegram) par-dessus config.yaml, à côté de lui et jamais envoyés sur GitHub.
+PERSO_FILE = "perso.yaml"
+# Un dossier par compte : session, suivi des ventes, verrou.
+ACCOUNTS_DIR = "comptes"
+# Commande affichée dans les messages : le lanceur (./wm ou wm) la précise.
+CMD = os.environ.get("WM_CMD") or "python wikimasters.py"
+
+
+def cmd(args):
+    return f"{CMD} {args}"
 
 
 class ApiError(Exception):
@@ -99,19 +115,56 @@ def label(card, value):
     return f"{card.name} [{card.rarity}{shiny}] valeur={shown}"
 
 
-def load_config(path):
+def read_yaml(path, missing_ok=False):
     try:
         with open(path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        sys.exit(f"Impossible de lire {path} (fichier introuvable).")
     except OSError as e:
         sys.exit(f"Impossible de lire {path} ({type(e).__name__}).")
     except yaml.YAMLError as e:
         where = getattr(e, "problem_mark", None)
         line = f" ligne {where.line + 1}" if where else ""
         sys.exit(f"{path} est mal écrit{line} (indentation, guillemets, deux-points ?).")
+
+
+def merge(base, extra):
+    """Réglages de perso.yaml par-dessus ceux de config.yaml : une section est complétée, une valeur remplacée."""
+    out = dict(base)
+    for key, value in extra.items():
+        out[key] = merge(out[key], value) if isinstance(out.get(key), dict) and isinstance(value, dict) else value
+    return out
+
+
+def load_config(path):
+    """config.yaml (réglages communs, sur GitHub) complété par perso.yaml (les vôtres, jamais sur GitHub)."""
+    cfg = read_yaml(path)
     if not isinstance(cfg, dict):
         sys.exit(f"{path} est vide ou mal écrit : il doit contenir les sections site, protection, price…")
-    return cfg
+    telegram = cfg.get("telegram")
+    if isinstance(telegram, dict) and {"bot_token", "chat_id"} & set(telegram):
+        sys.exit(f"{path} contient telegram.bot_token ou telegram.chat_id : déplacez-les dans {PERSO_FILE} "
+                 "(jamais envoyé sur GitHub), voir le README.")
+    perso_path = config_path(path, PERSO_FILE)
+    perso = read_yaml(perso_path, missing_ok=True)
+    if perso is None:
+        return cfg
+    if not isinstance(perso, dict):
+        sys.exit(f"{perso_path} est mal écrit : il doit contenir des sections comme dans config.yaml "
+                 "(voir perso.exemple.yaml).")
+    merged = merge(cfg, perso)
+    # Les listes de protection de perso.yaml s'ajoutent à celles de config.yaml : oublier d'y recopier « garder »
+    # ne doit jamais retirer une protection (une défausse est définitive).
+    base, extra = cfg.get("protection"), perso.get("protection")
+    if isinstance(base, dict) and isinstance(extra, dict):
+        for key in ("tags", "rarities", "name_contains"):
+            if isinstance(base.get(key), list) and isinstance(extra.get(key), list):
+                have = {norm(x) for x in base[key]}
+                merged["protection"][key] = base[key] + [x for x in extra[key] if norm(x) not in have]
+    return merged
 
 
 def config_path(cfg_file, value):
@@ -139,11 +192,19 @@ def check_config(cfg):
     errors = []
     err = errors.append
 
-    def section(name):
+    def unknown_keys(sec, where, allowed, hint=""):
+        # Une clé mal orthographiée serait ignorée sans bruit, et la protection qu'elle devait poser avec.
+        for key in sorted(set(sec) - set(allowed), key=str):
+            close = difflib.get_close_matches(str(key), allowed, n=1)
+            err(f"{where}{'.' if where else ''}{key} : clé inconnue"
+                + (f" (vouliez-vous dire « {close[0]} » ?)" if close else hint))
+
+    def section(name, keys):
         value = cfg.get(name) if isinstance(cfg, dict) else None
         if not isinstance(value, dict):
             err(f"{name} : section manquante ou mal écrite")
             return {}
+        unknown_keys(value, name, keys)
         return value
 
     def number(sec, path, key, minimum=None, integer=False, allow_none=False, strict=False):
@@ -177,9 +238,7 @@ def check_config(cfg):
         if not isinstance(cond, dict):
             err(f"{where} doit être un dictionnaire")
             return
-        unknown = set(cond) - CONDITION_KEYS
-        if unknown:
-            err(f"{where} : condition(s) inconnue(s) {sorted(unknown)}")
+        unknown_keys(cond, where, CONDITION_KEYS)
         if "rarity_in" in cond:
             str_list(cond, where, "rarity_in", allow_empty=False)
         if "name_contains" in cond and not isinstance(cond["name_contains"], str):
@@ -190,24 +249,29 @@ def check_config(cfg):
             if key in cond and not _is_number(cond[key]):
                 err(f"{where}.{key} doit être un nombre")
 
-    site = section("site")
-    for key in ("base_url", "supabase_url", "supabase_anon_key", "session_file"):
+    if isinstance(cfg, dict):
+        unknown_keys(cfg, "", ("site", "protection", "price", "price_tags", "auto_tags", "discard", "sell", "safety",
+                               "journal", "display", "telegram"))
+
+    site_keys = ("base_url", "supabase_url", "supabase_anon_key")
+    site = section("site", site_keys)
+    for key in site_keys:
         if not isinstance(site.get(key), str) or not site.get(key):
             err(f"site.{key} doit être un texte")
 
-    prot = section("protection")
+    prot = section("protection", ("tags", "starred", "shiny", "rarities", "name_contains"))
     prot_tags = str_list(prot, "protection", "tags")
     boolean(prot, "protection", "starred")
     boolean(prot, "protection", "shiny")
     str_list(prot, "protection", "rarities")
     str_list(prot, "protection", "name_contains")
 
-    price = section("price")
+    price = section("price", ("cache_hours", "cache_file"))
     number(price, "price", "cache_hours", 0)
     if not isinstance(price.get("cache_file"), str) or not price.get("cache_file"):
         err("price.cache_file doit être un nom de fichier")
 
-    pt = section("price_tags")
+    pt = section("price_tags", ("bands", "unknown_tag", "remove_outdated", "tag_protected"))
     boolean(pt, "price_tags", "remove_outdated")
     boolean(pt, "price_tags", "tag_protected")
     if pt.get("unknown_tag") is not None and not isinstance(pt.get("unknown_tag"), str):
@@ -222,9 +286,7 @@ def check_config(cfg):
         if not isinstance(band, dict) or not isinstance(band.get("tag"), str) or not band["tag"].strip():
             err(f"{where}.tag doit être un texte non vide")
             continue
-        unknown = set(band) - {"tag", "from", "below", "color"}
-        if unknown:
-            err(f"{where} : clé(s) inconnue(s) {sorted(unknown)}")
+        unknown_keys(band, where, ("tag", "from", "below", "color"))
         if band.get("color") is not None and not isinstance(band.get("color"), str):
             err(f"{where}.color doit être un texte, ex. \"#22c55e\"")
         if any(_is_number(band.get(k)) and band[k] < 0 for k in ("from", "below")):
@@ -257,9 +319,7 @@ def check_config(cfg):
         if not isinstance(rule, dict) or not isinstance(rule.get("tag"), str) or not rule["tag"].strip():
             err(f"{where}.tag doit être un texte non vide")
             continue
-        unknown = set(rule) - {"tag", "when", "color"}
-        if unknown:
-            err(f"{where} : clé(s) inconnue(s) {sorted(unknown)} (les conditions vont sous « when: »)")
+        unknown_keys(rule, where, ("tag", "when", "color"), " (les conditions vont sous « when: »)")
         if not isinstance(rule.get("when"), dict) or not rule.get("when"):
             err(f"{where}.when doit contenir au moins une condition (sinon l'étiquette irait sur toutes les cartes)")
         else:
@@ -269,15 +329,26 @@ def check_config(cfg):
         if rule.get("color") is not None and not isinstance(rule.get("color"), str):
             err(f"{where}.color doit être un texte, ex. \"#22c55e\"")
 
-    disc = section("discard")
+    disc = section("discard", ("tags", "max_value", "unknown_rarities", "max_per_run", "fresh_price",
+                               "require_existing_tag"))
     disc_tags = str_list(disc, "discard", "tags", allow_empty=False)
     number(disc, "discard", "max_value", 0, allow_none=True)
-    choice(disc, "discard", "unknown_price", ["skip", "discard"])
+    unknown_rarities = str_list(disc, "discard", "unknown_rarities")
+    if unknown_rarities and not pt.get("unknown_tag"):
+        err("discard.unknown_rarities demande price_tags.unknown_tag (ex. \"inconnu\") : c'est cette étiquette "
+            "qui repère les cartes jamais vendues")
+    protected_rarities = {norm(r) for r in prot.get("rarities") or [] if isinstance(r, str)}
+    for rarity in unknown_rarities:
+        if norm(rarity) in protected_rarities:
+            err(f"discard.unknown_rarities contient {rarity}, qui est protégée (protection.rarities) : "
+                "retirez-la de l'une des deux listes")
     number(disc, "discard", "max_per_run", 0, integer=True)
     boolean(disc, "discard", "fresh_price")
     boolean(disc, "discard", "require_existing_tag")
 
-    sell = section("sell")
+    sell = section("sell", ("tags", "order", "price_factor", "rounding", "min_start_price", "max_start_price",
+                            "duration_minutes", "max_auctions", "min_value", "fresh_price", "require_existing_tag",
+                            "relist"))
     sell_tags = str_list(sell, "sell", "tags", allow_empty=False)
     number(sell, "sell", "price_factor", 0, strict=True)
     choice(sell, "sell", "rounding", ["floor", "round", "ceil"])
@@ -294,12 +365,11 @@ def check_config(cfg):
         err(f"sell.max_auctions ne peut pas dépasser {SITE_MAX_AUCTIONS} (limite du site)")
     number(sell, "sell", "min_value", 0, allow_none=True)
     choice(sell, "sell", "order", ["random", "value", "tags"])
-    if not isinstance(sell.get("state_file"), str) or not sell.get("state_file"):
-        err("sell.state_file doit être un nom de fichier")
     relist = sell.get("relist")
     if not isinstance(relist, dict):
         err("sell.relist : section manquante ou mal écrite")
     else:
+        unknown_keys(relist, "sell.relist", ("enabled", "factor", "min_start_price", "max_attempts", "first"))
         boolean(relist, "sell.relist", "enabled")
         boolean(relist, "sell.relist", "first")
         number(relist, "sell.relist", "factor", 0, strict=True)
@@ -308,7 +378,7 @@ def check_config(cfg):
         number(relist, "sell.relist", "min_start_price", 1, integer=True)
         number(relist, "sell.relist", "max_attempts", 1, integer=True)
 
-    journal = section("journal")
+    journal = section("journal", ("enabled", "file", "delimiter"))
     boolean(journal, "journal", "enabled")
     if not isinstance(journal.get("file"), str) or not journal.get("file"):
         err("journal.file doit être un nom de fichier")
@@ -344,7 +414,8 @@ def check_config(cfg):
         if common:
             err(f"{name_a} et {name_b} ont des étiquettes en commun : {sorted(common)}")
 
-    safety = section("safety")
+    safety = section("safety", ("max_actions_per_run", "delay_seconds", "read_delay_seconds", "max_consecutive_errors",
+                                "max_consecutive_read_failures"))
     number(safety, "safety", "max_actions_per_run", 0, integer=True)
     number(safety, "safety", "delay_seconds", 0)
     number(safety, "safety", "read_delay_seconds", 0)
@@ -352,25 +423,24 @@ def check_config(cfg):
     number(safety, "safety", "max_consecutive_read_failures", 1, integer=True)
 
     display = cfg.get("display", {})
+    if isinstance(display, dict):
+        unknown_keys(display, "display", ("verbose", "waiting_shown"))
     if not isinstance(display, dict) or not isinstance(display.get("verbose", False), bool):
         err("display.verbose doit valoir true ou false")
     elif not _is_int(display.get("waiting_shown", 5)) or display.get("waiting_shown", 5) < 0:
         err("display.waiting_shown doit être un entier >= 0")
 
-    telegram = cfg.get("telegram", {"enabled": False})
+    telegram = cfg.get("telegram", {})
     if not isinstance(telegram, dict):
         err("telegram : section mal écrite")
     else:
-        for key in ("bot_token", "chat_id"):
-            if key in telegram:
-                err(f"telegram.{key} ne doit pas être dans ce fichier (il finirait dans git) : "
-                    f"mettez-le dans {SECRETS_FILE}, voir le README")
-        unknown = set(telegram) - {"enabled", "notify_on_dry_run", "bot_token", "chat_id"}
-        if unknown:
-            err(f"telegram : clé(s) inconnue(s) {sorted(unknown)}")
-        boolean(telegram, "telegram", "enabled")
+        unknown_keys(telegram, "telegram", ("notify_on_dry_run", "bot_token", "chat_id"))
         if "notify_on_dry_run" in telegram:
             boolean(telegram, "telegram", "notify_on_dry_run")
+        if telegram.get("bot_token") is not None and not isinstance(telegram["bot_token"], str):
+            err("telegram.bot_token doit être un texte entre guillemets")
+        if telegram.get("chat_id") is not None and not isinstance(telegram["chat_id"], (str, int)):
+            err("telegram.chat_id doit être un nombre ou un texte")
 
     if errors:
         sys.exit("Configuration invalide :\n  - " + "\n  - ".join(errors))
@@ -467,7 +537,7 @@ class SessionStore:
         except FileNotFoundError:
             return None
         except (OSError, json.JSONDecodeError):
-            sys.exit(f"{self.path} est illisible : relancez « python wikimasters.py login ».")
+            sys.exit(f"{self.path} est illisible : relancez « {cmd('login')} ».")
         return data.get("session") if isinstance(data, dict) else None
 
     def save(self, session):
@@ -614,11 +684,13 @@ class PriceCache:
     def _key(self, card):
         return f"{card.card_id}:{card.rarity}"
 
-    def get(self, card):
+    def _alive(self, entry):
+        return isinstance(entry, dict) and _is_number(entry.get("at")) and time.time() - entry["at"] <= self.ttl
+
+    def get(self, card, since=0):
+        """Prix gardé, ou MISSING. since : ignorer les prix lus avant ce moment (relus sur le site)."""
         entry = self.data.get(self._key(card))
-        if self.ttl <= 0 or not isinstance(entry, dict) or not _is_number(entry.get("at")):
-            return self.MISSING
-        if time.time() - entry["at"] > self.ttl or entry["at"] < self.not_before:
+        if self.ttl <= 0 or not self._alive(entry) or entry["at"] < max(since, self.not_before):
             return self.MISSING
         return entry.get("value")
 
@@ -627,11 +699,23 @@ class PriceCache:
             self.data[self._key(card)] = {"value": value, "at": time.time()}
 
     def save(self):
+        """Fusionne avec le fichier (un autre compte a pu l'enrichir entre-temps) et oublie les prix périmés."""
         if self.ttl <= 0:
             return
         try:
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(self.data), encoding="utf-8")
+            on_disk = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            on_disk = {}
+        merged = {}
+        for source in (on_disk if isinstance(on_disk, dict) else {}, self.data):
+            for key, entry in source.items():
+                if self._alive(entry) and entry["at"] >= merged.get(key, {}).get("at", 0):
+                    merged[key] = entry
+        self.data = merged
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".prix.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(merged, f)
             os.replace(tmp, self.path)
         except OSError as e:  # le cache n'est qu'une optimisation : jamais bloquant
             print(f"Attention : cache des prix non enregistré ({type(e).__name__}).")
@@ -755,11 +839,11 @@ class WikiMastersClient:
 
         session = session or store.load()
         if not session:
-            sys.exit("Aucune session enregistrée : lancez d'abord « python wikimasters.py login » (voir README).")
+            sys.exit(f"Aucune session enregistrée : lancez d'abord « {cmd('login')} » (voir README).")
         try:
             self._use_session(session, save=False)
         except (ValueError, KeyError, TypeError):
-            sys.exit(f"{store.path} est invalide : relancez « python wikimasters.py login ».")
+            sys.exit(f"{store.path} est invalide : relancez « {cmd('login')} ».")
 
     def _use_session(self, session, save=True, fresh=False):
         """Adopte une session. Elle est d'abord écrite sur le disque, puis seulement utilisée."""
@@ -779,7 +863,7 @@ class WikiMastersClient:
         self.session = session
         self.access_token = session["access_token"]
         self.user_id = claims["sub"]
-        self.username = (claims.get("user_metadata") or {}).get("username") or claims.get("email") or "?"
+        self.username = account_name(claims)
         self.expires_at = min(deadlines)
         self.cookies = session_cookies(session, self.ref)
 
@@ -790,29 +874,44 @@ class WikiMastersClient:
         """Renouvelle la session comme le fait le navigateur (jeton de renouvellement Supabase)."""
         url = f"{self.supabase_url}/auth/v1/token"
         self._last_refresh = time.time()
-        try:
-            resp = self.http.request(
-                "POST",
-                url,
-                params={"grant_type": "refresh_token"},
-                json={"refresh_token": self.session["refresh_token"]},
-                headers={"apikey": self.anon_key},
-                timeout=20,
-                allow_redirects=False,
-            )
-        except requests.RequestException as e:
-            raise ApiError(f"renouvellement de session impossible (réseau : {type(e).__name__})", fatal=True) from None
+        for attempt in range(len(REFRESH_RETRY_DELAYS) + 1):
+            if attempt:
+                time.sleep(REFRESH_RETRY_DELAYS[attempt - 1])
+            try:
+                resp = self.http.request(
+                    "POST",
+                    url,
+                    params={"grant_type": "refresh_token"},
+                    json={"refresh_token": self.session["refresh_token"]},
+                    headers={"apikey": self.anon_key},
+                    timeout=20,
+                    allow_redirects=False,
+                )
+            except requests.RequestException as e:
+                problem = f"réseau : {type(e).__name__}"
+                continue
+            if resp.status_code == 429 or resp.status_code >= 500:
+                problem = f"erreur {resp.status_code}"
+                continue
+            break
+        else:
+            # Coupure passagère : tant que le jeton actuel est valable, on continue et on réessaie dans une minute.
+            if self.time_left() > 30:
+                print(f"  Attention : renouvellement de session reporté ({problem}), nouvel essai dans 1 min.")
+                return
+            raise ApiError(f"renouvellement de session impossible ({problem}) : vérifiez la connexion internet "
+                           "(et la mise en veille), puis relancez.", fatal=True)
         if resp.status_code in (400, 401, 403):
             # Définitif : --loop s'arrête au lieu de réessayer à chaque cycle.
             self.session_lost = ("session révoquée ou expirée (déconnexion, ou session partagée avec un navigateur) : "
-                                 "relancez « python wikimasters.py login ».")
+                                 f"relancez « {cmd('login')} ».")
             raise ApiError(self.session_lost, fatal=True)
         if not resp.ok:
             raise ApiError(f"renouvellement de session impossible (erreur {resp.status_code})", fatal=True)
         try:
             self._use_session(resp.json(), fresh=True)
         except SessionSaveError as e:
-            raise ApiError(f"{e} : la nouvelle session est perdue, relancez « python wikimasters.py login ».",
+            raise ApiError(f"{e} : la nouvelle session est perdue, relancez « {cmd('login')} ».",
                            fatal=True) from None
         except (ValueError, KeyError, TypeError):
             raise ApiError("réponse de renouvellement de session inattendue", fatal=True) from None
@@ -836,14 +935,14 @@ class WikiMastersClient:
         try:
             session = supabase_session(merged, self.ref)
         except ValueError:
-            self.session_lost = "le site a renouvelé la session de façon illisible : relancez « python wikimasters.py login »."
+            self.session_lost = f"le site a renouvelé la session de façon illisible : relancez « {cmd('login')} »."
             return
         try:
             self._use_session(session)
         except SessionSaveError as e:
-            self.session_lost = f"{e} : la nouvelle session est perdue, relancez « python wikimasters.py login »."
+            self.session_lost = f"{e} : la nouvelle session est perdue, relancez « {cmd('login')} »."
         except (ValueError, KeyError, TypeError):
-            self.session_lost = "le site a renvoyé une session invalide : relancez « python wikimasters.py login »."
+            self.session_lost = f"le site a renvoyé une session invalide : relancez « {cmd('login')} »."
 
     def _request(self, method, url, headers_fn, **kwargs):
         what = f"{method} {urlparse(url).path}"
@@ -891,7 +990,7 @@ class WikiMastersClient:
         if resp.status_code in (401, 403):
             raise ApiError(
                 f"accès refusé ({resp.status_code}) sur {what}{detail}. "
-                "Session refusée ou blocage Cloudflare : relancez « python wikimasters.py login ».",
+                f"Session refusée ou blocage Cloudflare : relancez « {cmd('login')} ».",
                 fatal=True,
                 status=resp.status_code,
             )
@@ -1302,6 +1401,7 @@ class Context:
     verbose: bool
     journal: Journal
     state: SalesState
+    run_started: float = 0.0  # début du passage : « prix relu » = lu depuis ce moment
     collection_ids: set = field(default_factory=set)  # tous les exemplaires de la collection, lignes groupées comprises
     on_sale: set = field(default_factory=set)  # exemplaires dont l'enchère est confirmée en cours
 
@@ -1321,24 +1421,24 @@ def new_summary():
     return {**{k: 0 for k in counters}, **{k: set() for k in sets}}
 
 
-def read_values(client, cards, cfg, cache, use_cache=True):
+def read_values(client, cards, cfg, cache, since=0):
     """Prix moyen de chaque carte (par card_id) ; FAILED si illisible. Lecture seule.
 
-    use_cache=False relit le prix sur le site (garde-fou avant une action irréversible).
+    since : les prix lus avant ce moment sont relus sur le site (garde-fou avant une action irréversible).
     """
     safety = cfg["safety"]
     values, failures_in_a_row = {}, 0
     distinct = list(dict.fromkeys(c.card_id for c in cards))
     if not distinct:
         return values
-    fresh = "" if use_cache else ", prix actuels relus sur le site"
+    fresh = ", prix relus sur le site pendant ce passage" if since else ""
     print(f"  lecture des prix de {len(distinct)} carte(s) (aucune modification{fresh})…")
     for card in cards:
         if card.card_id in values:
             continue
         if len(values) and len(values) % 50 == 0:
             print(f"  … {len(values)}/{len(distinct)}")
-        cached = cache.get(card) if use_cache else PriceCache.MISSING
+        cached = cache.get(card, since)
         if cached is not PriceCache.MISSING:
             values[card.card_id] = cached
             continue
@@ -1410,18 +1510,20 @@ def plan_analyse(ctx, cards):
     return steps
 
 
-def filter_candidates(ctx, cards, tags, other_tags, what, require_existing=False):
-    """Exemplaires portant une des étiquettes `tags`, hors protections et étiquettes contradictoires.
+def filter_candidates(ctx, cards, tags_for, other_tags, what, require_existing=False):
+    """Exemplaires portant une des étiquettes tags_for(carte), hors protections et étiquettes contradictoires.
 
     require_existing : l'étiquette devait déjà être sur le site au début du passage (pas posée à l'instant par
     « analyser » dans « tout ») : vous avez ainsi le temps de la vérifier avant une action irréversible.
     """
-    out = []
+    out, waiting = [], 0
     for card in cards:
+        tags = tags_for(card)
         if not card.has_any_tag(tags):
             continue
         if require_existing and not card.has_any_tag(tags, initial_only=True):
             ctx.summary["skip"].add(card.copy_id)
+            waiting += 1
             if ctx.verbose:
                 print(f"  ignorée   {card.name} [{card.rarity}] : étiquetée {what} pendant ce passage, "
                       "traitée au prochain (vérifiez-la d'ici là)")
@@ -1436,6 +1538,9 @@ def filter_candidates(ctx, cards, tags, other_tags, what, require_existing=False
             print(f"  ignorée   {card.name} [{card.rarity}] : étiquettes contradictoires (vente et défausse)")
             continue
         out.append(card)
+    if waiting and not ctx.verbose:
+        print(f"  {waiting} carte(s) étiquetée(s) {what} pendant ce passage : traitée(s) au prochain passage "
+              "(vérifiez-les d'ici là, --verbose pour la liste)")
     return out
 
 
@@ -1541,7 +1646,7 @@ def plan_sell(ctx, cards):
         for auction_id, entry in ctx.state.with_status(status):
             if entry.get("copy_id") not in ctx.collection_ids:
                 ctx.state.set_status(auction_id, "gone")
-    candidates = filter_candidates(ctx, cards, sell["tags"], cfg["discard"]["tags"], "à vendre",
+    candidates = filter_candidates(ctx, cards, lambda card: sell["tags"], cfg["discard"]["tags"], "à vendre",
                                    sell["require_existing_tag"])
     for card in [c for c in candidates if c.copy_id in ctx.on_sale]:
         candidates.remove(card)
@@ -1552,7 +1657,7 @@ def plan_sell(ctx, cards):
         summary["no_slot"] += len(candidates)
         print(f"  {len(candidates)} carte(s) à vendre, mais aucune place d'enchère libre : rien à faire maintenant")
         return []
-    values = read_values(ctx.client, candidates, cfg, ctx.cache, use_cache=not sell["fresh_price"])
+    values = read_values(ctx.client, candidates, cfg, ctx.cache, ctx.run_started if sell["fresh_price"] else 0)
     count_read_errors(candidates, values, summary)
 
     relists, fresh = [], []
@@ -1613,33 +1718,50 @@ def plan_sell(ctx, cards):
 
 
 def plan_discard(ctx, cards):
-    """Défausses : cartes étiquetées à défausser, après vérification du prix actuel."""
+    """Défausses : cartes « defausse », et cartes jamais vendues (« inconnu ») des raretés de discard.unknown_rarities.
+
+    Le prix est relu sur le site (sauf discard.fresh_price: false), par lots : seules les cartes nécessaires pour
+    remplir discard.max_per_run sont lues, la suite attend le passage suivant.
+    """
     cfg, summary = ctx.cfg, ctx.summary
     disc = cfg["discard"]
-    candidates = filter_candidates(ctx, cards, disc["tags"], cfg["sell"]["tags"], "à défausser",
+    unknown_tag = cfg["price_tags"].get("unknown_tag")
+    unknown_rarities = {norm(r) for r in disc["unknown_rarities"]}
+
+    def tags_for(card):
+        if unknown_tag and norm(card.rarity) in unknown_rarities:
+            return disc["tags"] + [unknown_tag]
+        return disc["tags"]
+
+    candidates = filter_candidates(ctx, cards, tags_for, cfg["sell"]["tags"], "à défausser",
                                    disc["require_existing_tag"])
-    values = read_values(ctx.client, candidates, cfg, ctx.cache, use_cache=not disc["fresh_price"])
-    count_read_errors(candidates, values, summary)
-    steps = []
-    for card in candidates:
-        value = values.get(card.card_id)
-        if value is FAILED:
-            continue
-        if value is None and disc["unknown_price"] == "skip":
-            summary["skip"].add(card.copy_id)
-            print(f"  ignorée   {label(card, value)} : jamais vendue, prix inconnu (discard.unknown_price)")
-            continue
-        if value is not None and disc["max_value"] is not None and value >= disc["max_value"]:
-            summary["skip"].add(card.copy_id)
-            print(f"  ignorée   {label(card, value)} : vaut maintenant {value:g} (>= {disc['max_value']:g}), "
-                  "relancez analyser")
-            continue
-        steps.append((card, "discard", None, value))
+    candidates.sort(key=lambda c: not c.has_any_tag(disc["tags"]))  # « defausse » d'abord, puis « inconnu »
+    since = ctx.run_started if disc["fresh_price"] else 0
+    limit = disc["max_per_run"]
+    steps, rest = [], candidates
+    while rest and len(steps) < limit:
+        batch, rest = rest[:limit - len(steps)], rest[limit - len(steps):]
+        values = read_values(ctx.client, batch, cfg, ctx.cache, since)
+        count_read_errors(batch, values, summary)
+        for card in batch:
+            value = values.get(card.card_id)
+            if value is FAILED:
+                continue
+            if value is None and norm(card.rarity) not in unknown_rarities:
+                summary["skip"].add(card.copy_id)
+                print(f"  ignorée   {label(card, value)} : jamais vendue, prix inconnu (discard.unknown_rarities)")
+                continue
+            if value is not None and disc["max_value"] is not None and value >= disc["max_value"]:
+                summary["skip"].add(card.copy_id)
+                print(f"  ignorée   {label(card, value)} : vaut maintenant {value:g} (>= {disc['max_value']:g}), "
+                      "relancez analyser")
+                continue
+            steps.append((card, "discard", None, value))
+    if rest:
+        summary["deferred"] += len(rest)
+        print(f"  {len(rest)} autre(s) carte(s) à défausser : {limit} au plus par passage (discard.max_per_run), "
+              "la suite au prochain passage")
     steps.sort(key=lambda s: -1 if s[3] is None else s[3])  # les moins chères d'abord
-    if len(steps) > disc["max_per_run"]:
-        summary["deferred"] += len(steps) - disc["max_per_run"]
-        print(f"  {len(steps)} défausses prévues : {disc['max_per_run']} au plus par passage (discard.max_per_run)")
-        steps = steps[:disc["max_per_run"]]
     return steps
 
 
@@ -1753,6 +1875,7 @@ class Runner:
 
 
 def run_command(ctx, command):
+    ctx.run_started = time.time()
     cards, warning = ctx.client.list_cards()
     ctx.collection_ids = {c.copy_id for c in cards}
     ctx.on_sale = set()  # relu par le bilan à chaque passage (sinon --loop ne relancerait jamais une carte)
@@ -1794,9 +1917,9 @@ def run_command(ctx, command):
             ctx.state.save()
 
 
-LOGIN_STEPS = """Connexion unique du script.
+LOGIN_STEPS = """Ajout d'un compte (à refaire seulement si le script affiche « session révoquée »).
   1. Ouvrez une fenêtre de NAVIGATION PRIVÉE et connectez-vous sur https://www.wiki-masters.com.
-  2. Outils développeur (Cmd+Option+I ou F12) > onglet Network.
+  2. Outils développeur (Cmd+Option+I sur Mac, F12 sur Windows) > onglet Network (Réseau).
   3. Allez sur la page Collection, tapez my-collection dans le filtre, puis rechargez la page.
   4. Cliquez sur la requête my-collection (GET, www.wiki-masters.com).
   5. Dans Request Headers, clic droit sur « cookie » > Copy value.
@@ -1805,15 +1928,58 @@ LOGIN_STEPS = """Connexion unique du script.
 """
 
 
-def cmd_login(cfg, store):
+def account_name(claims):
+    """Nom du compte d'après le jeton : pseudo du site, sinon e-mail, sinon début de l'identifiant."""
+    name = (claims.get("user_metadata") or {}).get("username") or claims.get("email") or claims["sub"][:8]
+    return str(name)
+
+
+def account_dir(cfg_file, name):
+    """Dossier du compte : session, suivi des ventes et verrou (le nom est nettoyé pour le système de fichiers)."""
+    safe = re.sub(r"[^\w.@-]", "_", name).strip("._") or "compte"
+    return config_path(cfg_file, ACCOUNTS_DIR) / safe
+
+
+def known_accounts(cfg_file):
+    root = config_path(cfg_file, ACCOUNTS_DIR)
+    if not root.is_dir():
+        return []
+    return sorted((p.name for p in root.iterdir() if (p / "session.json").is_file()), key=str.casefold)
+
+
+def choose_account(cfg_file, wanted):
+    """Le compte demandé par --compte, ou le seul compte enregistré."""
+    accounts = known_accounts(cfg_file)
+    if wanted:
+        found = [a for a in accounts if a.casefold() == wanted.casefold()]
+        if not found:
+            listed = ", ".join(accounts) or "aucun"
+            sys.exit(f"Compte « {wanted} » inconnu (comptes enregistrés : {listed}). "
+                     f"Pour l'ajouter : « {cmd('login')} ».")
+        return found[0]
+    if not accounts:
+        sys.exit(f"Aucun compte enregistré : lancez d'abord « {cmd('login')} » (voir README).")
+    if len(accounts) > 1:
+        sys.exit(f"Plusieurs comptes enregistrés ({', '.join(accounts)}) : précisez lequel, "
+                 f"ex. « {cmd('tout --compte ' + accounts[0])} ».")
+    return accounts[0]
+
+
+def cmd_login(cfg, cfg_file):
     print(LOGIN_STEPS)
     raw = read_secret("Cookie : ")
     ref = urlparse(cfg["site"]["supabase_url"]).netloc.split(".", 1)[0]
     try:
         session = supabase_session(parse_cookie_header(normalize_cookie_header(raw)), ref)
-        jwt_claims(session["access_token"])
+        claims = jwt_claims(session["access_token"])
     except ValueError as e:
         sys.exit(f"Cookie invalide : {e}. Recommencez en copiant toute la valeur de l'en-tête cookie.")
+    folder = account_dir(cfg_file, account_name(claims))
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.exit(f"Impossible de créer {folder} ({type(e).__name__}).")
+    store = SessionStore(folder / "session.json")
     client = WikiMastersClient(cfg["site"], store, session=session)
     try:
         client.store.save(client.session)
@@ -1825,39 +1991,54 @@ def cmd_login(cfg, store):
         sys.exit(f"Session enregistrée, mais le site la refuse : {e}")
     if client.session_lost:
         sys.exit(f"Session refusée : {client.session_lost}")
-    print(f"Session enregistrée pour {client.username} dans {store.path} ({slots} place(s) d'enchère libre(s)).")
-    print("Vous pouvez maintenant lancer : python wikimasters.py analyser")
+    print(f"Compte {client.username} enregistré ({slots} place(s) d'enchère libre(s)).")
+    others = [a for a in known_accounts(cfg_file) if a != folder.name]
+    option = f" --compte {folder.name}" if others else ""
+    print(f"Simulation (rien n'est modifié) : {cmd('tout' + option)}")
+    print(f"Pour de vrai :                   {cmd('tout' + option + ' --execute')}")
 
 
-def load_secrets(path):
-    """secrets.yaml : identifiants personnels (Telegram), à côté de config.yaml et jamais dans git. {} s'il est absent."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-    except FileNotFoundError:
-        return {}
-    except OSError as e:
-        sys.exit(f"Impossible de lire {path} ({type(e).__name__}).")
-    except yaml.YAMLError:
-        sys.exit(f"{path} est mal écrit (indentation, guillemets, deux-points ?).")
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        sys.exit(f"{path} est mal écrit : il doit contenir une section telegram (voir le README).")
-    return data
+def cmd_accounts(cfg_file):
+    root = config_path(cfg_file, ACCOUNTS_DIR)
+    folders = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name.casefold()) \
+        if root.is_dir() else []
+    if not folders:
+        print(f"Aucun compte enregistré : lancez « {cmd('login')} ».")
+        return
+    print("Comptes :")
+    for folder in folders:
+        state = SalesState(folder / "ventes.json")
+        session = "" if (folder / "session.json").is_file() else f"   (pas de session : « {cmd('login')} »)"
+        print(f"  {folder.name:<24} {len(state.with_status('open'))} enchère(s) suivie(s){session}")
+    if len(known_accounts(cfg_file)) > 1:
+        print(f"Choisissez avec --compte, ex. « {cmd('tout --compte ' + known_accounts(cfg_file)[0])} ».")
 
 
-def telegram_settings(cfg, secrets_path):
-    """Réglages Telegram avec le jeton lu dans secrets.yaml, ou None si les notifications sont désactivées."""
+def keep_awake():
+    """Empêche la mise en veille pendant le passage : une veille coupe le réseau et arrête le script."""
+    if sys.platform == "darwin" and shutil.which("caffeinate"):
+        try:  # caffeinate s'arrête tout seul à la fin de ce processus
+            subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    elif os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)  # ES_CONTINUOUS | SYSTEM_REQUIRED
+        except (AttributeError, OSError):
+            pass
+
+
+def telegram_settings(cfg):
+    """Réglages Telegram (jeton dans perso.yaml), ou None si les notifications ne sont pas configurées."""
     tg = cfg.get("telegram") or {}
-    if not tg.get("enabled"):
+    token, chat_id = tg.get("bot_token"), tg.get("chat_id")
+    if not token and not chat_id:
         return None
-    secret = load_secrets(secrets_path).get("telegram")
-    secret = secret if isinstance(secret, dict) else {}
-    token, chat_id = secret.get("bot_token"), secret.get("chat_id")
-    if not isinstance(token, str) or not token.strip() or not isinstance(chat_id, (str, int)) or not str(chat_id).strip():
-        print(f"Attention : telegram.enabled vaut true, mais {secrets_path.name} n'a pas telegram.bot_token et "
-              "telegram.chat_id : pas de notification (voir le README).")
+    if not isinstance(token, str) or not token.strip() or not str(chat_id or "").strip():
+        print(f"Attention : il faut telegram.bot_token ET telegram.chat_id dans {PERSO_FILE} : pas de notification.")
         return None
     return {"bot_token": token.strip(), "chat_id": str(chat_id).strip(),
             "notify_on_dry_run": tg.get("notify_on_dry_run", False)}
@@ -1900,28 +2081,34 @@ def loop_minutes(text):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=("login",) + COMMANDS, help="ce que le script doit faire")
-    parser.add_argument("--config", default="config.yaml", help="fichier de règles (par défaut config.yaml)")
-    parser.add_argument("--execute", action="store_true", help="appliquer réellement les actions (sinon dry-run)")
-    parser.add_argument("--verbose", action="store_true", help="tout afficher (cartes protégées, en attente…)")
+    parser = argparse.ArgumentParser(prog=CMD, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("command", choices=COMMANDS + ("login", "comptes"), help="ce que le script doit faire")
+    parser.add_argument("--execute", action="store_true", help="agir pour de vrai (sinon : simulation)")
+    parser.add_argument("--loop", type=loop_minutes, nargs="?", const=15, metavar="MINUTES",
+                        help="recommencer toutes les N minutes (15 si rien n'est précisé), jusqu'à Ctrl+C")
+    parser.add_argument("--compte", help="compte à utiliser, s'il y en a plusieurs (voir « comptes »)")
     parser.add_argument("--fresh", action="store_true",
                         help="relire tous les prix sur le site au lieu du cache (pour actualiser les étiquettes)")
-    parser.add_argument("--loop", type=loop_minutes, metavar="MINUTES", help="relancer la commande toutes les N minutes")
+    parser.add_argument("--verbose", action="store_true", help="tout afficher (cartes protégées, en attente…)")
+    parser.add_argument("--config", default="config.yaml", help="fichier de règles (par défaut config.yaml)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     check_config(cfg)
-    store = SessionStore(config_path(args.config, cfg["site"]["session_file"]))
     if args.command == "login":
         try:
-            cmd_login(cfg, store)
+            cmd_login(cfg, args.config)
         except KeyboardInterrupt:
             sys.exit("\nConnexion annulée.")
         return
+    if args.command == "comptes":
+        cmd_accounts(args.config)
+        return
 
-    client = WikiMastersClient(cfg["site"], store, page_delay=cfg["safety"]["read_delay_seconds"])
-    telegram = telegram_settings(cfg, config_path(args.config, SECRETS_FILE))
+    folder = account_dir(args.config, choose_account(args.config, args.compte))
+    client = WikiMastersClient(cfg["site"], SessionStore(folder / "session.json"),
+                               page_delay=cfg["safety"]["read_delay_seconds"])
+    telegram = telegram_settings(cfg)
     journal_cfg = cfg["journal"]
     ctx = Context(
         client=client,
@@ -1930,25 +2117,27 @@ def main():
         summary=new_summary(),
         cache=PriceCache(config_path(args.config, cfg["price"]["cache_file"]), cfg["price"]["cache_hours"]),
         verbose=args.verbose or cfg.get("display", {}).get("verbose", False),
-        # Le journal n'enregistre que les actions réelles : rien en dry-run.
+        # Le journal n'enregistre que les actions réelles : rien en simulation.
         journal=Journal(config_path(args.config, journal_cfg["file"]), journal_cfg["delimiter"],
                         journal_cfg["enabled"] and args.execute, client.username, args.command),
-        state=SalesState(config_path(args.config, cfg["sell"]["state_file"])),
+        state=SalesState(folder / "ventes.json"),
     )
-    mode = "EXÉCUTION RÉELLE" if args.execute else "DRY-RUN (aucune modification)"
-    lock = RunLock(config_path(args.config, cfg["sell"]["state_file"]).with_name(".wikimasters.lock"))
+    mode = "EXÉCUTION RÉELLE" if args.execute else "SIMULATION (rien n'est modifié, ajoutez --execute pour agir)"
+    lock = RunLock(folder / ".wikimasters.lock")
     if args.execute:
         lock.acquire()
+    keep_awake()
 
-    outcome = ("ok", None)
+    outcome, cycle = ("ok", None), 0
     try:
         while True:
             # Un bilan par cycle de --loop.
+            cycle += 1
             ctx.summary = new_summary()
             ctx.journal.lost = ctx.journal.diverted = 0
             ctx.journal.merge_backup()
             print(f"\n=== [{time.strftime('%H:%M:%S')}] {args.command} — {mode} — compte {client.username} ===")
-            if args.fresh:
+            if args.fresh and cycle == 1:  # les cycles suivants de --loop réutilisent ces prix
                 ctx.cache.not_before = time.time()
                 print("Option --fresh : tous les prix sont relus sur le site (cache ignoré).")
             outcome = ("ok", None)
@@ -1957,6 +2146,14 @@ def main():
             except ApiError as e:
                 outcome = ("error", str(e))
                 print(f"\nARRÊT : {e}")
+                if args.loop:
+                    print("Le prochain cycle reprendra là où ce passage s'est arrêté (prix déjà lus gardés).")
+                elif cfg["price"]["cache_hours"] > 0:
+                    again = [args.command] + (["--compte", args.compte] if args.compte else []) \
+                        + (["--execute"] if args.execute else []) \
+                        + (["--config", args.config] if args.config != "config.yaml" else [])
+                    print(f"Les prix déjà lus sont gardés : pour reprendre, relancez « {cmd(' '.join(again))} »"
+                          f"{' (sans --fresh)' if args.fresh else ''}. Avec --loop, le script reprend tout seul.")
             except KeyboardInterrupt:
                 outcome = ("interrupted", None)
                 raise

@@ -1,4 +1,6 @@
-# Contiennent le jeton de session : ne jamais committer.
+# Données personnelles (sessions, jeton Telegram, réglages) : ne jamais committer.
+comptes/
+perso.yaml
 # Si vous changez session_file ou cache_file dans config.yaml, gardez un nom couvert ici.
 session*.json
 secrets*.yaml

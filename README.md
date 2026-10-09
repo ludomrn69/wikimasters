@@ -1,160 +1,185 @@
 # Bot WikiMasters
 
-Ce script trie automatiquement les cartes de **votre** compte WikiMasters, en s'appuyant sur les **étiquettes** du site :
+Ce script trie automatiquement les cartes de **votre** compte [WikiMasters](https://www.wiki-masters.com) :
 
-1. **`analyser`** lit le prix moyen de vente de chaque carte et pose une étiquette de prix : `defausse` (moins de 10 wikicoins), `+10`, `+100`, `+500` ou `+1000` ;
-2. vous vérifiez ces étiquettes sur le site. **Pour garder une carte, ajoutez-lui une étiquette de protection** (par exemple `garder`). Retirer `defausse` ne suffit pas : le prochain `analyser` la remettrait ;
-3. **`vendre`** fait le bilan des enchères précédentes (vendue / invendue), **relance les invendus moins cher** (mise précédente × 0,8), puis met aux enchères des cartes étiquetées à vendre, **tirées au hasard** (le tirage est le même toute la journée : le dry-run montre exactement les cartes que `--execute` vendra), à 75 % de leur prix moyen et dans la limite des 5 enchères simultanées du site ;
-4. **`defausser`** défausse les cartes étiquetées `defausse` (une défausse rapporte 1 wikicoin), après avoir relu leur prix sur le site.
+- il lit le prix moyen de vente de chaque carte et lui pose une **étiquette de prix** (`defausse`, `+5`, `+10`, `+100`, `+500`, `+1000`, ou `inconnu` si la carte ne s'est jamais vendue) ;
+- il **met aux enchères** les cartes qui valent 5 wikicoins ou plus, et relance moins cher celles qui ne trouvent pas preneur ;
+- il **défausse** les cartes qui valent moins de 5, ainsi que les cartes jamais vendues de rareté C, PC ou R (une défausse rapporte 1 wikicoin).
 
-Chaque action réelle est inscrite dans **`journal.csv`** (date, carte, prix, résultat, solde), qui s'ouvre directement dans Excel ou Numbers. Les ventes terminées y apparaissent avec leur prix final : de quoi suivre vos gains. S'il est ouvert dans Excel pendant un passage, les nouvelles lignes vont dans `journal_secours.csv` et sont recopiées dans `journal.csv` au passage suivant : rien n'est perdu.
+Il ne touche **jamais** aux cartes protégées : étiquette `garder` ou `favori`, étoile, shiny, rareté SR ou L, échange en cours.
 
-`tout` enchaîne les trois. Par sécurité, une carte qu'`analyser` vient d'étiqueter `defausse` n'est défaussée qu'au passage **suivant** : vous avez le temps de vérifier. Le script **ne touche jamais** aux cartes protégées, qu'elles le soient par une étiquette (`lyon`, `garder`…), une étoile, l'état shiny, la rareté ou un échange en cours.
+## Démarrage rapide
 
-Toutes les règles se trouvent dans `config.yaml` : tranches de prix, étiquettes, prix de vente, durée, protections, limites…
+**1. Installer Python** (3.10 ou plus récent) depuis [python.org](https://www.python.org/downloads/). Sous Windows, cochez **« Add python.exe to PATH »** pendant l'installation.
 
-## Installation
-
-Il faut Python 3.10 ou plus récent.
-
-**Mac / Linux**
+**2. Récupérer le projet**, avec git :
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+git clone https://github.com/ludomrn69/wikimasters.git
+cd wikimasters
 ```
 
-**Windows (PowerShell)**
+ou avec le bouton vert **Code > Download ZIP** sur GitHub, puis ouvrez un terminal dans le dossier décompressé.
 
-```powershell
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+**3. Ajouter votre compte** (le premier lancement installe ce qu'il faut, environ une minute) :
+
+| Mac / Linux | Windows (PowerShell) |
+|---|---|
+| `./wm login` | `.\wm login` |
+
+Suivez les étapes affichées (détail plus bas, dans [Connexion](#connexion)).
+
+**4. Lancer le tri :**
+
+```bash
+./wm tout                    # simulation : montre ce qui serait fait, sans rien modifier
+./wm tout --execute          # le fait pour de vrai
+./wm tout --execute --loop   # recommence toutes les 15 minutes, jusqu'à Ctrl+C
 ```
 
-Si PowerShell refuse d'activer l'environnement, lancez une fois `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. Vous pouvez aussi vous passer de l'activation et appeler directement `.venv\Scripts\python wikimasters.py …`.
+Sous Windows, remplacez `./wm` par `.\wm` dans PowerShell (ou `wm` dans l'invite de commandes).
 
-Sous Windows, utilisez PowerShell ou l'invite de commandes pour `login`, pas Git Bash.
+Commencez **toujours** par une simulation pour vérifier ce que le script compte faire : une défausse est définitive.
 
-## Connexion (une seule fois)
+Le premier passage est long : le script lit le prix de chaque carte, avec une pause d'environ 2 secondes entre deux lectures (compter environ 2 h pour 3000 cartes). Les prix sont ensuite gardés 24 h, donc les passages suivants vont beaucoup plus vite. Le script empêche l'ordinateur de se mettre en veille pendant qu'il tourne.
 
-Le script n'utilise pas votre mot de passe. Il garde sa propre session dans `session.json` et la renouvelle tout seul, comme le fait le navigateur.
+## Les commandes
+
+| Commande | Ce qu'elle fait |
+|---|---|
+| `./wm tout` | Les trois étapes ci-dessous, à la suite |
+| `./wm analyser` | Pose les étiquettes de prix |
+| `./wm vendre` | Met des cartes aux enchères (5 en même temps au plus, c'est la limite du site) |
+| `./wm defausser` | Défausse les cartes `defausse` et les `inconnu` de rareté C, PC ou R |
+| `./wm login` | Ajoute un compte, ou le reconnecte |
+| `./wm comptes` | Liste vos comptes enregistrés |
+
+Options, à ajouter à `tout`, `analyser`, `vendre` ou `defausser` :
+
+| Option | Effet |
+|---|---|
+| `--execute` | Agir pour de vrai. Sans cette option, c'est une simulation. |
+| `--loop` | Recommencer toutes les 15 minutes (`--loop 30` : toutes les 30). Indispensable pour vendre une grosse collection, 5 enchères à la fois. |
+| `--compte NOM` | Choisir le compte, si vous en avez plusieurs. |
+| `--fresh` | Relire tous les prix sur le site au lieu de ceux gardés depuis moins de 24 h. |
+| `--verbose` | Tout afficher, y compris les cartes protégées. |
+
+## Ce que fait `tout`, étape par étape
+
+**1. Analyser.** Chaque carte non protégée reçoit l'étiquette de sa tranche de prix moyen :
+
+| Prix moyen | Étiquette | Ensuite |
+|---|---|---|
+| moins de 5 | `defausse` | défaussée |
+| 5 à 9 | `+5` | vendue |
+| 10 à 99 | `+10` | vendue |
+| 100 à 499 | `+100` | vendue |
+| 500 à 999 | `+500` | vendue |
+| 1000 et plus | `+1000` | vendue |
+| jamais vendue | `inconnu` | défaussée si de rareté C, PC ou R, gardée sinon |
+
+Si le prix d'une carte change de tranche, l'ancienne étiquette est remplacée.
+
+**2. Vendre.** Le script fait d'abord le bilan des enchères précédentes (vendue ou invendue). Il relance ensuite les invendus à 80 % de la mise précédente (3 essais au plus), puis remplit les places libres avec des cartes tirées au hasard, à 75 % de leur prix moyen, pour 30 minutes.
+
+**3. Défausser.** Le prix est relu juste avant : une carte qui vaut maintenant 5 ou plus est épargnée. Le script fait au plus 200 défausses par passage ; la suite au passage suivant.
+
+**Pour garder une carte**, ajoutez-lui l'étiquette `garder` sur le site. Retirer `defausse` ne suffit pas : le passage suivant la remettrait.
+
+## Connexion
+
+Le script n'utilise pas votre mot de passe. Il garde sa propre session et la renouvelle tout seul, comme le fait le navigateur.
 
 1. Ouvrez une **fenêtre de navigation privée** et connectez-vous sur https://www.wiki-masters.com.
 2. Ouvrez les outils développeur (`Cmd+Option+I` sur Mac, `F12` sur Windows), puis l'onglet **Network** (Réseau).
 3. Allez sur la page **Collection**, tapez `my-collection` dans le filtre, puis rechargez la page.
 4. Cliquez sur la requête `my-collection` (méthode GET, domaine www.wiki-masters.com).
-5. Dans **Request Headers**, faites un clic droit sur la ligne **cookie**, puis choisissez **Copy value**.
-6. Dans le terminal, lancez la commande ci-dessous et collez quand elle le demande. Rien ne s'affiche pendant le collage, c'est normal.
-
-   ```bash
-   python wikimasters.py login
-   ```
-
+5. Dans **Request Headers**, faites un clic droit sur la ligne **cookie**, puis **Copy value**.
+6. Lancez `./wm login` et collez quand c'est demandé. Rien ne s'affiche pendant le collage, c'est normal.
 7. **Fermez la fenêtre privée sans vous déconnecter.**
 
-Pourquoi une fenêtre privée ? Le script doit avoir une session à lui. S'il partageait celle de votre navigateur habituel, ils renouvelleraient la même session chacun de leur côté, et le site finirait par les déconnecter tous les deux.
+Pourquoi une fenêtre privée ? Le script doit avoir une session à lui. S'il partageait celle de votre navigateur habituel, ils la renouvelleraient chacun de leur côté et le site finirait par les déconnecter tous les deux. Une déconnexion depuis le site peut aussi déconnecter le script : refaites alors `./wm login`.
 
-Si le script affiche « session révoquée », par exemple après une déconnexion depuis le site, refaites simplement `python wikimasters.py login`.
+> ⚠️ Le dossier `comptes/` donne accès à vos comptes. Ne l'envoyez à personne. Ne collez jamais votre cookie dans un chat ou un message.
 
-> ⚠️ `session.json` donne accès à votre compte. **Ne l'envoyez à personne et ne le committez jamais** (il est déjà exclu par `.gitignore`). Ne collez jamais votre cookie dans un chat, un message ou une issue.
+## Plusieurs comptes
 
-## Utilisation
-
-Chaque commande est d'abord un **dry-run** : elle affiche ce qu'elle ferait, sans rien modifier. Ajoutez `--execute` pour agir réellement.
+Faites `./wm login` une fois par compte : chacun a son dossier dans `comptes/`, avec sa session et le suivi de ses ventes. Choisissez ensuite le compte à chaque commande :
 
 ```bash
-python wikimasters.py analyser              # voir les étiquettes de prix qui seraient posées
-python wikimasters.py analyser --execute    # les poser
-python wikimasters.py vendre                # voir les ventes prévues
-python wikimasters.py vendre --execute      # lancer les enchères (jusqu'à 5 places libres)
-python wikimasters.py defausser             # voir les défausses prévues
-python wikimasters.py defausser --execute   # défausser
-python wikimasters.py tout --execute        # les trois à la suite
-python wikimasters.py analyser --fresh      # relire tous les prix sur le site (voir plus bas)
-python wikimasters.py tout --execute --loop 30   # recommencer toutes les 30 minutes (Ctrl+C pour arrêter)
+./wm comptes                                    # liste les comptes
+./wm tout --execute --loop --compte monpseudo   # un compte précis
 ```
 
-Avec beaucoup de cartes, la première lecture des prix prend du temps. Les prix lus sont gardés 6 heures dans `prix_cache.json` (`price.cache_hours`), même après un dry-run, pour qu'un `--execute` lancé juste après ne relise pas tout : `vendre` réutilise ceux lus par `analyser` (sauf `sell.fresh_price: true`). `defausser` relit toujours les prix sur le site avant de défausser (`discard.fresh_price`). Un dry-run ne modifie rien sur le site et n'écrit que ce cache.
+Deux comptes peuvent tourner en même temps, dans deux terminaux.
 
-### Actualiser toutes les étiquettes de prix
+## Vos réglages : `perso.yaml`
 
-`analyser` réévalue à chaque passage **toutes** les cartes non protégées, y compris celles qui portent déjà `defausse`, `+10`, `+100`… Si une carte a changé de tranche, l'ancienne étiquette est retirée et la nouvelle posée ; sinon rien ne change. Les cartes protégées (`lyon`, `garder`, étoile, shiny, raretés protégées, échange en cours) ne sont jamais touchées.
+`config.yaml` contient les règles communes : ne le modifiez pas, sinon vos changements entreraient en conflit avec les mises à jour. Mettez vos réglages dans **`perso.yaml`** : copiez `perso.exemple.yaml` sous ce nom, puis décommentez ce que vous voulez changer. Il suffit d'y écrire ce qui change ; tout le reste vient de `config.yaml`. `perso.yaml` n'est jamais envoyé sur GitHub.
 
-Par défaut, les prix viennent du cache (6 h). Pour tenir compte de leur évolution, ajoutez `--fresh` : tous les prix sont relus sur le site.
+Par exemple, pour protéger aussi les cartes étiquetées `lyon` et ne défausser aucune carte jamais vendue :
 
-```bash
-python wikimasters.py analyser --fresh      # voir les étiquettes qui changeraient
-python wikimasters.py analyser --execute    # les changer (réutilise les prix que --fresh vient de lire)
+```yaml
+protection:
+  tags: ["lyon"]        # s'ajoute à garder et favori
+discard:
+  unknown_rarities: []  # remplace la liste de config.yaml
 ```
 
-### Relancer automatiquement
+Une liste écrite dans `perso.yaml` remplace celle de `config.yaml`, sauf dans `protection` : là, elle s'y ajoute. Une protection de `config.yaml` ne peut donc pas être retirée par un oubli dans `perso.yaml`.
 
-`--loop 30` recommence la commande toutes les 30 minutes, jusqu'à Ctrl+C. Un passage qui échoue (réseau, site indisponible) est retenté au cycle suivant ; une session révoquée arrête la boucle.
-
-Ajoutez `--verbose` pour tout voir, y compris les cartes protégées et toutes celles qui attendent une place d'enchère.
-
-Garde-fous :
-- `defausser` relit le prix sur le site juste avant de défausser : une carte étiquetée `defausse` dont le prix moyen est remonté à 10 ou plus n'est pas défaussée. `vendre` ne vend pas une carte étiquetée `+10` qui vaut moins de 10 (prix du cache, sauf `sell.fresh_price: true`). Dans les deux cas, relancez `analyser --fresh` ;
-- une carte déjà en vente n'est pas remise en vente ; s'il n'y a aucune place d'enchère libre, `vendre` ne lit même pas les prix ;
-- une enchère que vous annulez vous-même sur le site n'est pas relancée ; une relance est toujours moins chère que la précédente, et jamais plus chère que la mise normale au prix actuel ;
-- deux passages `--execute` ne peuvent pas tourner en même temps (fichier `.wikimasters.lock`, repris automatiquement si le passage qui le tenait a disparu) ;
-- une carte qui porte à la fois une étiquette de vente et `defausse` est laissée de côté ;
-- le script s'arrête après `safety.max_actions_per_run` actions et indique combien il en reste ; relancez-le pour continuer ;
-- il fait une pause entre chaque action et chaque lecture de prix ;
-- si une action échoue, la carte concernée est sautée et le passage continue ; après plusieurs échecs d'affilée, il s'arrête ;
-- un résumé s'affiche toujours à la fin, même après une interruption.
-
-Pour utiliser un autre fichier de règles : `python wikimasters.py vendre --config autre.yaml`.
-
-## Modifier les règles
-
-Commencez par adapter `config.yaml` à votre compte, en particulier `protection.tags`. Chaque paramètre y est expliqué en commentaire. Les principaux :
-
-| Section | Rôle |
-|---|---|
-| `protection` | Étiquettes, raretés, mots dans le nom, étoile et shiny qui protègent une carte |
-| `price_tags.bands` | Tranches de prix et étiquette de chacune (`defausse`, `+10`, `+100`…) |
-| `price_tags.remove_outdated` | Retirer l'ancienne étiquette de prix quand une carte change de tranche |
-| `auto_tags` | Étiquettes en plus selon le nom, la rareté, l'état shiny ou la valeur |
-| `discard` | Étiquettes à défausser, prix maximal pour défausser, limite par passage |
-| `sell` | Étiquettes à vendre, choix des cartes (hasard, plus chères, ordre des étiquettes), mise de départ (× 0,75 arrondi à l'inférieur), durée (10 min à 12 h), nombre d'enchères |
-| `sell.relist` | Relance des invendus : réduction (× 0,8), mise minimale, nombre d'essais |
-| `journal` | Fichier CSV des actions, séparateur (`;` pour Excel en français) |
-| `safety` | Nombre maximal d'actions, pauses, arrêt après N erreurs |
-| `telegram` | Notification à la fin de chaque passage (le jeton va dans `secrets.yaml`, voir plus bas) |
-
-Les noms d'étiquettes ignorent les majuscules, les accents, les espaces et le `#` affiché par le site. Si une étiquette n'existe pas encore sur votre compte, le script la crée (le dry-run indique lesquelles).
-
-`secrets.yaml`, `journal.csv`, `ventes.json` et `prix_cache.json` sont des fichiers personnels, exclus de git.
-
-Le script refuse de démarrer si la config est incohérente : une liste écrite comme un simple texte, des tranches de prix qui se chevauchent, une même étiquette à la fois protégée et à défausser, plus de 5 enchères, un jeton Telegram écrit dans `config.yaml`…
+Chaque réglage possible est expliqué en commentaire dans `config.yaml`. Le script refuse de démarrer si un réglage est mal orthographié ou incohérent, et il explique pourquoi.
 
 ## Notifications Telegram (facultatif)
 
-À la fin de chaque passage `--execute` (et des dry-runs si `telegram.notify_on_dry_run: true`), le script envoie le résumé sur Telegram, avec le vrai résultat : bilan, arrêt sur erreur, interruption ou plantage.
+À la fin de chaque passage `--execute`, le script peut vous envoyer le résumé sur Telegram : bilan, arrêt sur erreur, interruption ou plantage.
 
-1. Créez un bot avec [@BotFather](https://t.me/BotFather) et notez son jeton ; obtenez votre identifiant avec [@userinfobot](https://t.me/userinfobot).
-2. Créez `secrets.yaml` à côté de `config.yaml` :
+1. Créez un bot avec [@BotFather](https://t.me/BotFather) et notez son jeton. Obtenez votre identifiant avec [@userinfobot](https://t.me/userinfobot).
+2. Ajoutez dans `perso.yaml` :
 
    ```yaml
    telegram:
-     bot_token: "123456789:ABC..."
+     bot_token: "123456789:AAH..."
      chat_id: "123456789"
+     notify_on_dry_run: false   # true = aussi pour les simulations
    ```
 
-3. Mettez `telegram.enabled: true` dans `config.yaml`.
+Le jeton ne va **jamais** dans `config.yaml` : le script refuse de démarrer s'il l'y trouve. Si votre jeton a fuité, régénérez-le avec `/revoke` dans BotFather.
 
-> ⚠️ Le jeton ne va **jamais** dans `config.yaml` : le script refuse de démarrer s'il l'y trouve. `secrets.yaml` est exclu par `.gitignore`. Ne le partagez pas : quiconque a le jeton peut se servir de votre bot. S'il a fuité, régénérez-le avec `/revoke` dans BotFather.
+## En cas de problème
+
+| Message | Que faire |
+|---|---|
+| `session révoquée` | Refaites `./wm login` pour ce compte. |
+| `erreur réseau` ou `renouvellement de session impossible` | Vérifiez la connexion, puis relancez la même commande **sans `--fresh`** : les prix déjà lus sont gardés et le passage reprend où il en était. Avec `--loop`, il reprend tout seul. |
+| `Plusieurs comptes enregistrés` | Ajoutez `--compte NOM` (voir `./wm comptes`). |
+| `Un autre passage --execute est actif` | Un autre terminal fait déjà tourner ce compte. Attendez qu'il finisse, ou arrêtez-le. |
+| `Configuration invalide` | Le message dit quel réglage corriger dans `perso.yaml`. |
+| `permission denied: ./wm` | Lancez `sh wm login`, ou une fois `chmod +x wm`. |
+
+## Le journal
+
+Chaque action réelle est inscrite dans **`journal.csv`** (date, compte, carte, prix, résultat, solde), qui s'ouvre directement dans Excel ou Numbers. Les ventes terminées y apparaissent avec leur prix final. Si le fichier est ouvert dans Excel pendant un passage, les nouvelles lignes vont dans `journal_secours.csv` et sont recopiées au passage suivant.
+
+## Garde-fous
+
+- Chaque commande est une simulation tant que vous n'ajoutez pas `--execute`.
+- Le prix d'une carte est relu sur le site juste avant de la défausser.
+- Une carte qui porte à la fois une étiquette de vente et `defausse` est laissée de côté.
+- Une ligne de la collection qui regroupe plusieurs exemplaires (×2, ×3…) n'est jamais touchée.
+- Une carte déjà en vente n'est pas remise en vente. Une enchère que vous annulez vous-même n'est pas relancée.
+- Deux passages `--execute` ne peuvent pas tourner en même temps sur le même compte.
+- Le script fait une pause entre chaque action et chaque lecture, et il s'arrête après plusieurs échecs d'affilée.
+- Un résumé s'affiche toujours à la fin, même après une interruption.
 
 ## À savoir
 
-- Ce script automatise un compte de jeu. Le site a une protection anti-robot et peut suspendre les comptes qui l'utilisent. Lisez ses conditions d'utilisation : vous l'utilisez à vos risques.
-- Si une ligne de la collection regroupe plusieurs exemplaires (×2, ×3…), le script n'y touche pas.
+Ce script automatise un compte de jeu. Le site a une protection anti-robot et peut suspendre les comptes qui en utilisent. Lisez ses conditions d'utilisation : vous l'utilisez à vos risques.
 
-## Tests
+## Pour les développeurs
+
+Sans le lanceur : `python wikimasters.py tout` (après `pip install -r requirements.txt`). Les tests :
 
 ```bash
-python -m unittest discover -s tests
+.venv/bin/python -m unittest discover -s tests
 ```
