@@ -687,6 +687,37 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn("4 autre(s) carte(s) à défausser", output)
         self.assertIn("4 action(s) reportée(s)", output)
 
+    def cheap_cards(self, site, count):
+        base = site.pages[0]["collection"][1]
+        for n in range(count):
+            item = copy.deepcopy(base)
+            item.update(id=f"cheap-{n}", card_id=f"cheap-card-{n}")
+            item["tags"] = [{"id": "t-defausse", "name": "defausse"}]
+            site.pages[0]["collection"].append(item)
+            site.values[f"cheap-card-{n}"] = 2
+
+    def test_discards_start_after_the_first_batch_of_prices(self):
+        site = standard_site()
+        self.cheap_cards(site, w.DISCARD_BATCH + 2)
+        output, code = self.run_main(site, "defausser", execute=True)
+        self.assertEqual(code, 0)
+        kinds = ["prix" if "/sales" in u else "défausse" for m, u, *_ in site.calls
+                 if "/sales" in u or u.endswith("/discard")]
+        batch = w.DISCARD_BATCH
+        self.assertEqual(kinds, ["prix"] * batch + ["défausse"] * batch + ["prix"] * 2 + ["défausse"] * 2)
+        self.assertIn(f"{batch + 2} défausse(s)", output)
+        self.assertEqual(output.count("== Défausses =="), 1)
+
+    def test_antibot_check_during_discards_stops_reading_prices(self):
+        site = standard_site()
+        self.cheap_cards(site, w.DISCARD_BATCH + 5)
+        site.overrides[("POST", "/discard")] = FakeResponse(403, {"code": "human_verification_required"})
+        output, code = self.run_main(site, "defausser", execute=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(site.discards()), 1)
+        self.assertEqual(len(site.gets("/sales")), w.DISCARD_BATCH)  # le lot suivant n'est même pas relu
+        self.assertIn(f"{w.DISCARD_BATCH + 4} action(s) reportée(s)", output)
+
     def test_discard_max_per_run(self):
         site = standard_site(tags={CHACANA: ["defausse"]})
         output, _ = self.run_main(site, "defausser", execute=True, mutate=lambda c: c["discard"].update(max_per_run=0))

@@ -43,6 +43,8 @@ KNOWN_DURATIONS = {10, 30, 60, 180, 360, 720}
 # Le site n'accepte pas plus de 5 enchères en cours en même temps (lu aussi sur /api/marketplace/mine).
 SITE_MAX_AUCTIONS = 5
 PAGE_SIZE = 50
+# Défausses par lots : prix relus pour 10 cartes, ces 10 cartes défaussées, et ainsi de suite.
+DISCARD_BATCH = 10
 MAX_PAGES = 500
 # Le jeton d'accès est renouvelé quand il lui reste moins que cette marge (secondes).
 REFRESH_MARGIN = 300
@@ -1537,10 +1539,11 @@ def antibot_strike(ctx, kind):
     print(f"     {ANTIBOT_HINT}")
 
 
-def read_values(client, cards, cfg, cache, since=0):
+def read_values(client, cards, cfg, cache, since=0, quiet=False):
     """Prix moyen de chaque carte (par card_id) ; FAILED si illisible. Lecture seule.
 
     since : les prix lus avant ce moment sont relus sur le site (garde-fou avant une action irréversible).
+    quiet : pas d'annonce ni de progression (petits lots).
     """
     safety = cfg["safety"]
     values, failures_in_a_row = {}, 0
@@ -1548,11 +1551,12 @@ def read_values(client, cards, cfg, cache, since=0):
     if not distinct:
         return values
     fresh = ", prix relus sur le site pendant ce passage" if since else ""
-    print(f"  lecture des prix de {len(distinct)} carte(s) (aucune modification{fresh})…")
+    if not quiet:
+        print(f"  lecture des prix de {len(distinct)} carte(s) (aucune modification{fresh})…")
     for card in cards:
         if card.card_id in values:
             continue
-        if len(values) and len(values) % 50 == 0:
+        if len(values) and len(values) % 50 == 0 and not quiet:
             print(f"  … {len(values)}/{len(distinct)}")
         cached = cache.get(card, since)
         if cached is not PriceCache.MISSING:
@@ -1840,14 +1844,16 @@ def plan_sell(ctx, cards):
 def plan_discard(ctx, cards):
     """Défausses : cartes « defausse », et cartes jamais vendues (« inconnu ») des raretés de discard.unknown_rarities.
 
-    Le prix est relu sur le site (sauf discard.fresh_price: false), par lots : seules les cartes nécessaires pour
-    remplir discard.max_per_run sont lues, la suite attend le passage suivant.
+    Générateur de lots de DISCARD_BATCH cartes : le prix de chaque lot est relu sur le site (sauf
+    discard.fresh_price: false) juste avant de le défausser. Les défausses commencent donc tout de suite, et le prix
+    vérifié date d'une minute, pas du début de la relecture. Seules les cartes nécessaires pour remplir
+    discard.max_per_run sont lues, la suite attend le passage suivant.
     """
     cfg, summary = ctx.cfg, ctx.summary
     until = antibot_until(ctx, "discard")
     if until:
         print(f"  défausses en pause jusqu'à {clock_time(until)} : le site a demandé une vérification anti-robot")
-        return []
+        return
     disc = cfg["discard"]
     unknown_tag = cfg["price_tags"].get("unknown_tag")
     unknown_rarities = {norm(r) for r in disc["unknown_rarities"]}
@@ -1862,11 +1868,20 @@ def plan_discard(ctx, cards):
     candidates.sort(key=lambda c: not c.has_any_tag(disc["tags"]))  # « defausse » d'abord, puis « inconnu »
     since = ctx.run_started if disc["fresh_price"] else 0
     limit = disc["max_per_run"]
-    steps, rest = [], candidates
-    while rest and len(steps) < limit:
-        batch, rest = rest[:limit - len(steps)], rest[limit - len(steps):]
-        values = read_values(ctx.client, batch, cfg, ctx.cache, since)
+    if candidates and limit:
+        fresh = " ; prix relu sur le site juste avant" if since else ""
+        print(f"  {len(candidates)} carte(s) à défausser, {min(len(candidates), limit)} au plus ce passage, "
+              f"par lots de {DISCARD_BATCH}{fresh}")
+    planned, rest = 0, candidates
+    while rest and planned < limit:
+        if antibot_until(ctx, "discard"):  # vérification anti-robot demandée pendant ce passage
+            summary["deferred"] += len(rest)
+            return
+        size = min(DISCARD_BATCH, limit - planned)
+        batch, rest = rest[:size], rest[size:]
+        values = read_values(ctx.client, batch, cfg, ctx.cache, since, quiet=True)
         count_read_errors(batch, values, summary)
+        steps = []
         for card in batch:
             value = values.get(card.card_id)
             if value is FAILED:
@@ -1881,12 +1896,13 @@ def plan_discard(ctx, cards):
                       "relancez analyser")
                 continue
             steps.append((card, "discard", None, value))
+        planned += len(steps)
+        steps.sort(key=lambda s: -1 if s[3] is None else s[3])  # les moins chères d'abord
+        yield steps
     if rest:
         summary["deferred"] += len(rest)
         print(f"  {len(rest)} autre(s) carte(s) à défausser : {limit} au plus par passage (discard.max_per_run), "
               "la suite au prochain passage")
-    steps.sort(key=lambda s: -1 if s[3] is None else s[3])  # les moins chères d'abord
-    return steps
 
 
 class Runner:
@@ -2036,14 +2052,19 @@ def run_command(ctx, command):
     try:
         for n, (title, plan) in enumerate(phases):
             print(f"\n== {title} ==")
-            steps = plan(ctx, cards)
-            if not steps:
+            batches = plan(ctx, cards)
+            if isinstance(batches, list):  # sinon : générateur de lots (défausses, prix relus au fur et à mesure)
+                batches = [batches]
+            acted = False
+            for steps in batches:
+                acted = acted or bool(steps)
+                if steps and not runner.run(steps):
+                    skipped = [t for t, _ in phases[n + 1:]]
+                    if skipped:
+                        print(f"  Étape(s) non lancée(s) pour cette raison : {', '.join(skipped)}.")
+                    return
+            if not acted:
                 print("  rien à faire")
-            elif not runner.run(steps):
-                skipped = [t for t, _ in phases[n + 1:]]
-                if skipped:
-                    print(f"  Étape(s) non lancée(s) pour cette raison : {', '.join(skipped)}.")
-                return
             cards = [c for c in cards if c.copy_id not in runner.consumed and c.copy_id not in runner.failed]
     finally:
         ctx.cache.save()  # même en dry-run : un --execute juste après ne relit pas tous les prix
