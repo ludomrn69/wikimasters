@@ -1616,6 +1616,7 @@ class Market:
         self.bid_replies = []  # réponses imposées aux mises
         self.price_latency = 0  # secondes que met le site à répondre à une lecture de prix
         self.checks = []  # (moment, id) de chaque lecture d'une annonce
+        self.extend = 0  # prolongation (s) d'une enchère après une mise dans ses dernières secondes, comme le site
 
     def add(self, aid, title, end_in, current=None, value=None, category="", rarity="R", **extra):
         card_id = f"card-{aid}"
@@ -1634,11 +1635,17 @@ class Market:
         now = self.clock.now
         for at, aid, amount in [r for r in self.rivals if r[0] <= now]:
             self.rivals.remove((at, aid, amount))
-            self.auctions[aid].update(current_bid=amount, current_bidder_id="rival")
+            self._lands(self.auctions[aid], amount, "rival")
         for a in self.auctions.values():
             if a["status"] == "active" and w.parse_time(a["end_at"]) + 30 <= now:
                 a.update(status="sold" if a["current_bidder_id"] else "expired", settled_at=iso(now),
                          winner_id=a["current_bidder_id"], final_price=a["current_bid"])
+
+    def _lands(self, auction, amount, bidder):
+        end = w.parse_time(auction["end_at"])
+        if self.extend and end - self.clock.now <= self.extend:
+            auction["end_at"] = iso(end + self.extend)
+        auction.update(current_bid=amount, current_bidder_id=bidder)
 
     def __call__(self, method, url, timeout=None, params=None, json=None, headers=None, allow_redirects=True, **kw):
         path = url.split(".com", 1)[1] if ".com" in url else url.split(".co", 1)[1]
@@ -1671,7 +1678,7 @@ class Market:
             if self.bid_replies:
                 return self.bid_replies.pop(0)
             self.bids.append((self.clock.now, m.group(1), body["amount"]))
-            auction.update(current_bid=body["amount"], current_bidder_id=USER_ID)
+            self._lands(auction, body["amount"], USER_ID)
             return FakeResponse(200, {"auction_id": m.group(1), "current_bid": body["amount"],
                                       "bidder_balance": 1000 - body["amount"]})
         if path == "/rest/v1/rpc/sync_profile_packs":
@@ -1839,7 +1846,23 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertIn("mise minimale 21 > plafond 20, on laisse", output)
         self.assertIn("perdue    Olympique lyonnais [R] : adjugée 19 à un autre joueur", output)
         self.assertIn("achats : 1 gagné(s), 1 perdu(s)", output)
+        self.assertIn("(dépassé à 13, plafond 20", output)
         self.assertEqual({k: v["status"] for k, v in self.purchases().items()}, {"mk-A": "won"})
+        self.assertTrue(any(";perdue;Olympique lyonnais;R;;card-mk-G;mk-G;20;19;;notre dernière mise : 12;" in r
+                            for r in self.journal_rows()), self.journal_rows())
+
+    def test_extended_auction_is_followed_until_its_real_end(self):
+        m = self.market
+        m.extend = 60  # le site prolonge de 60 s une enchère qui reçoit une mise dans sa dernière minute
+        m.add("mk-A", "Rue des Forces (Lyon)", 100, current=10, value=20)
+        start = self.clock.now
+        m.rivals = [(start + 157, "mk-A", 14)]  # après notre vérification à 6 s de la fin (prolongée)
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12), ("mk-A", 16)])
+        self.assertIn("prolongée Rue des Forces (Lyon)", output)
+        self.assertIn("(dépassé à 14, plafond 20", output)
+        self.assertIn("ACHETÉE   Rue des Forces (Lyon) [R] pour 16 wikibidous", output)
 
     def test_same_card_is_followed_on_one_auction_only(self):
         m = self.market

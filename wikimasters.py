@@ -78,6 +78,9 @@ COMMANDS = ("tout", "analyser", "vendre", "defausser", "boosters", "acheter")
 # Achats : après la mise de buy.snipe_seconds, dernière vérification de l'enchère quand il reste ce nombre de
 # secondes (pour répondre à une surenchère de dernière minute).
 LAST_CHECK_SECONDS = 6
+# Une mise tardive fait prolonger l'enchère par le site (+60 s, vu le 10/10/2026) : l'enchère suivie est revue
+# ce nombre de secondes après sa fin prévue ; prolongée, tout recommence (mise, vérification) avant la nouvelle fin.
+AFTER_END_SECONDS = 3
 # Aucune autre requête ne part quand une vérification d'enchère tombe dans les N secondes : le site met parfois
 # plusieurs secondes à répondre, et la mise arriverait trop tard.
 CHECK_MARGIN = 10
@@ -2206,7 +2209,7 @@ class Target:
     end_at: float
     value: float
     ceiling: int | None  # None : pas de plafond
-    stage: int = 0  # 0 : mise à venir, 1 : dernière vérification à venir
+    stage: int = 0  # 0 : mise à venir, 1 : dernière vérification à venir, 2 : fin (ou prolongation) à constater
     bid: int | None = None  # dernière mise du script sur cette enchère
 
 
@@ -2268,7 +2271,11 @@ class Sniper:
         return antibot_until(self.ctx, "bid") is not None
 
     def _due(self, target):
-        return target.end_at - (self.buy["snipe_seconds"] if target.stage == 0 else LAST_CHECK_SECONDS)
+        if target.stage == 0:
+            return target.end_at - self.buy["snipe_seconds"]
+        if target.stage == 1:
+            return target.end_at - LAST_CHECK_SECONDS
+        return target.end_at + AFTER_END_SECONDS
 
     def _next_check(self):
         return min((self._due(t) for t in self.targets.values()), default=math.inf)
@@ -2419,7 +2426,9 @@ class Sniper:
     # --- mises ---
 
     def _check(self, target):
-        stage, target.stage = target.stage, target.stage + 1  # avancé d'abord : un échec ne la refait pas en boucle
+        """Suivie jusqu'à sa vraie fin : une mise de dernière minute (la nôtre ou une autre) la fait prolonger."""
+        stage = target.stage
+        target.stage = min(stage + 1, 2)  # avancé d'abord : un échec ne la refait pas en boucle
         data = self.client.get_auction(target.auction_id)
         auction = data.get("auction", data) if isinstance(data, dict) else {}
         end, now = parse_time(auction.get("end_at")) or target.end_at, time.time()
@@ -2427,10 +2436,12 @@ class Sniper:
             self._finish(target)
             return
         if end > target.end_at + 1:
-            # Fin repoussée (le site prolonge peut-être une enchère après une mise tardive) : on recommence.
             target.end_at, target.stage = end, 0
-            self.say(f"prolongée {target.card.name} : nouvelle fin à {time.strftime('%H:%M:%S', time.localtime(end))}")
+            self.say(f"prolongée {target.card.name} : nouvelle fin à {time.strftime('%H:%M:%S', time.localtime(end))}"
+                     f" (mise actuelle {auction.get('current_bid')})")
             return
+        if stage >= 2:
+            return  # pas encore finie (horloge de ce PC en avance ?) : revue un peu plus tard
         current, leader, need = auction.get("current_bid"), auction.get("current_bidder_id"), next_bid(auction)
         # Simulation : la mise n'est pas partie, mais tant que personne n'a misé depuis, elle serait en tête.
         simulated = not self.ctx.execute and target.bid is not None and need is not None and need <= target.bid
@@ -2440,21 +2451,19 @@ class Sniper:
                      f"(plafond {show_ceiling(target.ceiling)}), fin dans {end - now:.0f} s")
         elif leader in self.mine:
             self.say(f"laissée   {label(target.card, target.value)} : votre compte {self.mine[leader]} est en tête")
-            target.stage = 2
-        else:
-            if need is None or (target.ceiling is not None and need > target.ceiling):
-                self.say(f"trop chère {label(target.card, target.value)} : mise minimale {need} > plafond "
-                         f"{target.ceiling}, on laisse")
-                target.stage = 2
-            else:
-                self._bid(target, need, end - now)
-        if stage >= 1 or target.stage >= 2:
             self._finish(target)
+        elif need is None or (target.ceiling is not None and need > target.ceiling):
+            self.say(f"trop chère {label(target.card, target.value)} : mise minimale {need} > plafond "
+                     f"{target.ceiling}, on laisse")
+            self._finish(target)
+        else:
+            outbid = f"dépassé à {current}, " if target.bid is not None else ""
+            self._bid(target, need, end - now, outbid)
 
-    def _bid(self, target, amount, left):
+    def _bid(self, target, amount, left, note=""):
         ctx = self.ctx
-        self.say(f"-> MISE {amount:<8} {label(target.card, target.value)} (plafond {show_ceiling(target.ceiling)}, "
-                 f"fin dans {left:.0f} s)")
+        self.say(f"-> MISE {amount:<8} {label(target.card, target.value)} ({note}plafond "
+                 f"{show_ceiling(target.ceiling)}, fin dans {left:.0f} s)")
         if not ctx.execute:
             target.bid = amount
             ctx.summary["bid"] += 1
@@ -2521,6 +2530,9 @@ class Sniper:
             status = "won"
         else:
             self.say(f"perdue    {name}" + (f" : adjugée {final} à un autre joueur" if outcome == "sold" else ""))
+            self.ctx.journal.write("perdue", entry.get("name", ""), entry.get("rarity", ""), "",
+                                   entry.get("card_id", ""), entry.get("value"), price=final, auction_id=aid,
+                                   result=f"notre dernière mise : {entry.get('price')}")
             status = "lost"
         self.ctx.summary[status] += 1
         purchases.set_status(aid, status, final_price=final)
