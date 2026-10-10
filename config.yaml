@@ -108,6 +108,33 @@ sell:
     first: true           # les relances passent avant les nouvelles ventes
 
 # ----------------------------------------------------------------------------
+# Boosters (commande « boosters », ou au début de « tout » avec in_tout: true).
+# ----------------------------------------------------------------------------
+packs:
+  in_tout: false          # true = « tout » ouvre d'abord les boosters disponibles (leurs cartes sont triées ensuite)
+  max_per_run: 10         # au plus N boosters ouverts par passage
+  delay_seconds: 12       # pause entre deux boosters : enchaînés en quelques secondes, ils déclenchent la
+                          # vérification anti-robot du site (les boosters sont alors en pause 1 h, puis 2 h, 4 h…)
+
+# ----------------------------------------------------------------------------
+# Achats aux enchères (commande « acheter », ou pendant « tout --loop » si keywords n'est pas vide).
+# Le script repère sur le marché les annonces dont le titre ou la catégorie contient un mot-clé, puis mise
+# le minimum quand il reste snipe_seconds secondes, sans jamais dépasser le prix moyen de la carte.
+# Il revérifie quelques secondes avant la fin et remise si quelqu'un l'a dépassé (toujours sous le plafond).
+# ----------------------------------------------------------------------------
+buy:
+  keywords: []            # mots cherchés sur le marché, ex. ["lyon"] ([] = aucun achat), en début de mot :
+                          # « lyon » trouve « lyonnais » ou « To-Lyon », pas « Elyon »
+  tag: null               # étiquette posée sur les cartes gagnées. Elle doit être dans protection.tags,
+                          # sinon « analyser » pourrait les revendre ou les défausser. Ex. "lyon"
+  price_factor: 1.0       # plafond = prix moyen de la carte × 1,0 ; null = pas de plafond lié au prix
+  max_price: null         # plafond absolu par carte, en wikibidous (null = pas d'autre plafond)
+  buy_unknown: false      # true = acheter aussi les cartes jamais vendues (prix inconnu), plafonnées par max_price
+  skip_owned: true        # ignorer les cartes déjà dans votre collection
+  snipe_seconds: 20       # mise quand il reste N secondes (10 au moins)
+  scan_minutes: 5         # le marché est relu toutes les N minutes
+
+# ----------------------------------------------------------------------------
 # Garde-fous et rythme.
 # ----------------------------------------------------------------------------
 safety:

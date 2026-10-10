@@ -7,6 +7,7 @@ secrets*.yaml
 .session.*
 prix_cache*.json
 ventes*.json
+achats*.json
 journal*.csv
 *.tmp
 auth.json

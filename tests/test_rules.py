@@ -1,9 +1,11 @@
 import base64
 import copy
+import datetime
 import io
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -493,7 +495,7 @@ class ReadSecretTest(unittest.TestCase):
         self.assertEqual(err.decode().strip()[-4:], "5000")
 
 
-class EndToEndTest(unittest.TestCase):
+class MainHarness:
     """Fait tourner main() contre un faux site, avec session et cache dans un dossier temporaire."""
 
     def setUp(self):
@@ -546,6 +548,8 @@ class EndToEndTest(unittest.TestCase):
                 p.__exit__(None, None, None)
         return out.getvalue(), code
 
+
+class EndToEndTest(MainHarness, unittest.TestCase):
     # --- analyser ---
 
     def test_analyse_dry_run_sends_nothing_and_shows_spread(self):
@@ -1590,6 +1594,391 @@ class EndToEndTest(unittest.TestCase):
         with mock.patch("wikimasters.read_secret", side_effect=KeyboardInterrupt):
             output, code = self.run_main(standard_site(), "login", session=None, stdin="")
         self.assertIn("Connexion annulée", str(code))
+
+def iso(timestamp):
+    return datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc).isoformat()
+
+
+class Market:
+    """Marché et boosters simulés par-dessus un FakeSite (le reste lui est transmis).
+
+    La recherche renvoie toutes les annonces actives, comme un site qui chercherait large : le filtre local sur
+    le titre et la catégorie est donc testé. Une enchère est réglée 30 s après sa fin.
+    """
+
+    def __init__(self, site, clock):
+        self.site, self.clock = site, clock
+        self.auctions, self.values = {}, {}
+        self.bids = []  # (moment, id, montant)
+        self.rivals = []  # (moment, id, montant) : mises d'un autre joueur
+        self.packs, self.pack_replies = 0, []
+        self.search_replies = []  # réponses imposées à la recherche, avant les annonces
+        self.bid_replies = []  # réponses imposées aux mises
+        self.price_latency = 0  # secondes que met le site à répondre à une lecture de prix
+        self.checks = []  # (moment, id) de chaque lecture d'une annonce
+
+    def add(self, aid, title, end_in, current=None, value=None, category="", rarity="R", **extra):
+        card_id = f"card-{aid}"
+        self.auctions[aid] = dict({
+            "id": aid, "card_id": card_id, "status": "active", "end_at": iso(self.clock.now + end_in),
+            "current_bid": current, "current_bidder_id": None if current is None else "rival",
+            "effective_bid": current or 2, "base_amount": 2, "seller_id": "vendeur", "owned": False,
+            "snapshot_rarity": rarity, "is_shiny": False, "winner_id": None, "final_price": None, "settled_at": None,
+            "snapshot_search_document": w.norm(f"{title} {category}"),
+            "card": {"id": card_id, "wikipedia_title": title, "category": category, "rarity": rarity},
+        }, **extra)
+        if value is not None:
+            self.values[card_id] = value
+
+    def _update(self):
+        now = self.clock.now
+        for at, aid, amount in [r for r in self.rivals if r[0] <= now]:
+            self.rivals.remove((at, aid, amount))
+            self.auctions[aid].update(current_bid=amount, current_bidder_id="rival")
+        for a in self.auctions.values():
+            if a["status"] == "active" and w.parse_time(a["end_at"]) + 30 <= now:
+                a.update(status="sold" if a["current_bidder_id"] else "expired", settled_at=iso(now),
+                         winner_id=a["current_bidder_id"], final_price=a["current_bid"])
+
+    def __call__(self, method, url, timeout=None, params=None, json=None, headers=None, allow_redirects=True, **kw):
+        path = url.split(".com", 1)[1] if ".com" in url else url.split(".co", 1)[1]
+        self._update()
+        reply = self._market(method, path, params, json)
+        if reply is None:
+            return self.site(method, url, timeout=timeout, params=params, json=json, headers=headers,
+                             allow_redirects=allow_redirects, **kw)
+        self.site.calls.append((method, url, json, headers or {}, params or {}))
+        return reply
+
+    def _market(self, method, path, params, body):
+        if path == "/api/marketplace" and method == "GET":
+            if self.search_replies:
+                return self.search_replies.pop(0)
+            found = sorted((a for a in self.auctions.values() if a["status"] == "active"), key=lambda a: a["end_at"])
+            return FakeResponse(200, {"auctions": copy.deepcopy(found), "page": params["page"], "hasMore": False})
+        if path.startswith("/api/marketplace/cards/card-"):
+            self.clock.now += self.price_latency
+            card_id = path.split("/")[4]
+            rarity = next(a["snapshot_rarity"] for a in self.auctions.values() if a["card_id"] == card_id)
+            value = self.values.get(card_id)
+            return FakeResponse(200, {"summary": {} if value is None else {rarity: {"average": value}}})
+        m = re.fullmatch(r"/api/marketplace/(mk-[^/]+)(/bid)?", path)
+        if m:
+            auction = self.auctions[m.group(1)]
+            if not m.group(2):
+                self.checks.append((self.clock.now, m.group(1)))
+                return FakeResponse(200, {"auction": copy.deepcopy(auction), "bids": []})
+            if self.bid_replies:
+                return self.bid_replies.pop(0)
+            self.bids.append((self.clock.now, m.group(1), body["amount"]))
+            auction.update(current_bid=body["amount"], current_bidder_id=USER_ID)
+            return FakeResponse(200, {"auction_id": m.group(1), "current_bid": body["amount"],
+                                      "bidder_balance": 1000 - body["amount"]})
+        if path == "/rest/v1/rpc/sync_profile_packs":
+            return FakeResponse(200, {"id": USER_ID, "packs_remaining": self.packs})
+        if path == "/api/packs/open":
+            return self.pack_replies.pop(0)
+        return None
+
+
+class MarketTest(MainHarness, unittest.TestCase):
+    """Boosters et achats aux enchères (commandes boosters et acheter)."""
+
+    ANTIBOT = {"error": "Vérification anti-bot requise pour continuer à ouvrir des paquets.",
+               "human_verification_required": True, "code": "human_verification_required"}
+
+    def setUp(self):
+        super().setUp()
+        self.clock = Clock()
+        self.market = Market(standard_site(), self.clock)
+        self.slept = 0
+
+    def sleep(self, seconds):
+        self.slept += 1
+        if self.slept > 5000:
+            raise AssertionError("boucle d'attente sans fin")
+        self.clock.now += seconds
+
+    def run_market(self, command, execute=False, buy=None, packs=None, **kw):
+        def mutate(cfg):
+            cfg["buy"].update(keywords=["lyon"], tag="lyon", **(buy or {}))
+            cfg["packs"].update(packs or {})
+            cfg["safety"]["read_delay_seconds"] = 1
+        return self.run_main(self.market, command, execute=execute, mutate=mutate, clock=self.clock,
+                             sleep=self.sleep, **kw)
+
+    def purchases(self):
+        path = self.acc / "achats.json"
+        return json.loads(path.read_text(encoding="utf-8"))["auctions"] if path.exists() else {}
+
+    def journal_rows(self):
+        path = self.dir / "journal.csv"
+        return path.read_text(encoding="utf-8-sig").splitlines()[1:] if path.exists() else []
+
+    # --- règles ---
+
+    def test_next_bid_follows_the_site(self):
+        for current, expected in ((5, 6), (11, 13), (27, 30), (33, 37), (50, 56), (100, 111)):
+            self.assertEqual(w.next_bid({"current_bid": current}), expected, current)
+        self.assertEqual(w.next_bid({"current_bid": None, "effective_bid": 90, "base_amount": 100}), 90)
+        self.assertIsNone(w.next_bid({"current_bid": "?"}))
+        buy = load_cfg()["buy"]
+        self.assertEqual(w.buy_ceiling(14.9, buy), 14)
+        self.assertEqual(w.buy_ceiling(500, dict(buy, max_price=120)), 120)
+        self.assertEqual(w.buy_ceiling(100, dict(buy, price_factor=0.29)), 29)
+        self.assertIsNone(w.buy_ceiling(None, dict(buy, price_factor=None)))
+        self.assertIsNone(w.buy_ceiling(500, dict(buy, price_factor=None)))
+        self.assertEqual(w.buy_ceiling(None, dict(buy, price_factor=None, max_price=50)), 50)
+
+    def test_parse_time(self):
+        t = w.parse_time("2026-10-10T08:04:51.554552+00:00")
+        self.assertEqual(t, datetime.datetime(2026, 10, 10, 8, 4, 51, 554552, datetime.timezone.utc).timestamp())
+        self.assertAlmostEqual(w.parse_time("2026-10-10T08:04:51.55455+00:00"), t, places=4)
+        self.assertEqual(w.parse_time("2026-10-10T10:04:51.554552+02:00"), t)
+        self.assertAlmostEqual(w.parse_time("2026-10-10T08:04:51.554Z"), t, places=2)
+        for bad in (None, "", "demain", "2026-13-40T99:00:00+00:00"):
+            self.assertIsNone(w.parse_time(bad), bad)
+
+    def test_buy_config_is_checked(self):
+        def rejected(mutate, fragment):
+            cfg = load_cfg()
+            mutate(cfg["buy"])
+            with self.assertRaises(SystemExit) as ctx:
+                w.check_config(cfg)
+            self.assertIn(fragment, str(ctx.exception.code))
+
+        rejected(lambda b: b.update(keywords=["lyon"]), "buy.tag doit être une étiquette de protection")
+        rejected(lambda b: b.update(keywords=["lyon"], tag="+10"), "buy.tag doit être une étiquette de protection")
+        rejected(lambda b: b.update(snipe_seconds=5), "buy.snipe_seconds")
+        rejected(lambda b: b.update(price_factor=0), "buy.price_factor")
+        cfg = load_cfg()
+        cfg["buy"].update(keywords=["lyon"], tag="#Lyon", price_factor=None)
+        w.check_config(cfg)
+
+    # --- boosters ---
+
+    def test_packs_stop_at_the_antibot_check(self):
+        self.market.packs = 3
+        self.market.pack_replies = [
+            FakeResponse(200, {"cards": [{"id": "c1", "wikipedia_title": "Route 566", "rarity": "C", "user_card_id": "u1"},
+                                         {"id": "c2", "wikipedia_title": "Jun Azumi", "rarity": "PC", "user_card_id": "u2"}],
+                               "packs_remaining": 2}),
+            FakeResponse(403, self.ANTIBOT),
+        ]
+        output, code = self.run_market("boosters", execute=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len([u for m, u, _ in self.market.site.mutations() if u.endswith("/api/packs/open")]), 2)
+        self.assertIn("3 booster(s) disponible(s) → 3 ouverture(s)", output)
+        self.assertIn("booster 1/3 : Route 566 [C], Jun Azumi [PC]", output)
+        self.assertIn("boosters en pause jusqu'à", output)
+        self.assertIn("1 booster(s) ouvert(s)", output)
+        self.assertEqual(self.market.site.gets("my-collection"), [])
+        rows = self.journal_rows()
+        self.assertTrue(any("booster;Route 566;C;u1;c1" in r for r in rows), rows)
+        self.assertGreaterEqual(self.slept, 1)  # pause entre deux boosters
+
+    def test_packs_dry_run_opens_nothing_and_tout_opens_them_first(self):
+        self.market.packs = 2
+        output, code = self.run_market("boosters")
+        self.assertEqual(code, 0)
+        self.assertIn("2 booster(s) ouvert(s)", output)
+        self.assertNotIn("/api/packs/open", str(self.market.site.calls))
+
+        self.market.packs = 1
+        self.market.pack_replies = [FakeResponse(200, {"cards": [], "packs_remaining": 0})]
+        output, code = self.run_market("tout", execute=True, packs={"in_tout": True})
+        urls = [u for _, u, *_ in self.market.site.calls]
+        opened = next(i for i, u in enumerate(urls) if u.endswith("/api/packs/open"))
+        self.assertLess(opened, next(i for i, u in enumerate(urls) if "my-collection" in u))
+
+    # --- achats ---
+
+    def standard_market(self):
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20, category="rue de Lyon, en France")
+        m.add("mk-B", "Gare de Lyon", 200, owned=True, value=50)
+        m.add("mk-C", "Stade de Gerland", 250, current=10, value=5, category="stade de Lyon")
+        m.add("mk-D", "Paris", 150, value=50, category="ville de France")
+        m.add("mk-E", "Lyon-Bron", 280, value=None)
+        m.add("mk-F", "Musée de Lyon", 3600, value=40)
+        m.add("mk-Y", "Elyon (jeu vidéo)", 260, value=40)
+        return m
+
+    def test_buy_bids_the_minimum_20_seconds_before_the_end_and_tracks_the_win(self):
+        m = self.standard_market()
+        end = w.parse_time(m.auctions["mk-A"]["end_at"])
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
+        self.assertTrue(end - 20 <= m.bids[0][0] < end - w.LAST_CHECK_SECONDS, m.bids[0][0] - end)
+        self.assertIn("repérée   Rue Émile-Zola (Lyon) [R] valeur=20 : fin à", output)
+        self.assertIn("Stade de Gerland [R] valeur=5 : mise minimale 12 > plafond 5", output)
+        self.assertIn("Lyon-Bron [R] valeur=? : jamais vendue, prix inconnu", output)
+        self.assertNotIn("Gare de Lyon", output)  # déjà possédée : écartée sans bruit
+        self.assertNotIn("Paris", output)  # « lyon » ni dans le titre ni dans la catégorie
+        self.assertNotIn("Elyon", output)  # « lyon » au milieu d'un mot ne compte pas
+        self.assertEqual(self.market.site.gets("card-mk-F"), [])  # se termine trop tard : prix même pas lu
+        self.assertIn("en tête", output)  # dernière vérification : toujours devant, pas de nouvelle mise
+        self.assertIn("ACHETÉE   Rue Émile-Zola (Lyon) [R] pour 12 wikibidous", output)
+        self.assertIn("1 mise(s) sur le marché", output)
+        self.assertIn("achats : 1 gagné(s), 0 perdu(s)", output)
+        self.assertEqual(self.purchases()["mk-A"]["status"], "won")
+        rows = self.journal_rows()
+        self.assertTrue(any(";mise;Rue Émile-Zola (Lyon);R;;card-mk-A;mk-A;20;12;" in r for r in rows), rows)
+        self.assertTrue(any(";achat;Rue Émile-Zola (Lyon);" in r for r in rows), rows)
+
+    def test_buy_answers_a_late_outbid_but_never_above_the_ceiling(self):
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.add("mk-G", "Olympique lyonnais", 300, current=10, value=20)
+        start = self.clock.now
+        m.rivals = [(start + 290, "mk-A", 13), (start + 290, "mk-G", 19)]
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12), ("mk-G", 12), ("mk-A", 15)])
+        self.assertIn("mise minimale 21 > plafond 20, on laisse", output)
+        self.assertIn("perdue    Olympique lyonnais [R] : adjugée 19 à un autre joueur", output)
+        self.assertIn("achats : 1 gagné(s), 1 perdu(s)", output)
+        self.assertEqual({k: v["status"] for k, v in self.purchases().items()}, {"mk-A": "won"})
+
+    def test_same_card_is_followed_on_one_auction_only(self):
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.add("mk-A2", "Rue Émile-Zola (Lyon)", 320, current=10, value=20)
+        m.auctions["mk-A2"]["card_id"] = "card-mk-A"
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
+
+    def test_buy_never_outbids_your_other_account(self):
+        other = make_session()
+        other_id = "00000000-0000-4000-8000-000000000002"
+        claims = {"sub": other_id, "exp": int(time.time()) + 3600, "user_metadata": {"username": "second"}}
+        other["access_token"] = f"{b64({'alg': 'HS256'})}.{b64(claims)}.sig"
+        (self.dir / "comptes" / "second").mkdir()
+        w.SessionStore(self.dir / "comptes" / "second" / "session.json").save(other)
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.add("mk-S", "Gare de Lyon", 300, current=None, value=20, seller_id=other_id)
+        m.auctions["mk-A"]["current_bidder_id"] = other_id
+        output, code = self.run_market("acheter", execute=True, args=["--compte", "testeur"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(m.bids, [])
+        self.assertIn("votre compte second est en tête", output)
+
+    def test_buy_dry_run_bids_nothing(self):
+        self.standard_market()
+        output, code = self.run_market("acheter")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.market.bids, [])
+        self.assertEqual(output.count("-> MISE 12"), 1)  # à la dernière vérification, la mise simulée est en tête
+        self.assertIn(": 12 (simulation) (plafond 20)", output)
+        self.assertIn("Résumé (prévue(s))", output)
+        self.assertFalse((self.acc / "achats.json").exists())
+
+    def test_slow_price_reads_do_not_delay_the_bids(self):
+        m = self.market
+        m.price_latency = 7  # le site met 7 s à donner un prix
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 35, current=10, value=20)
+        for i in range(6):
+            m.add(f"mk-L{i}", f"Lyon {i}", 300 + i, current=10, value=20)
+        end = w.parse_time(m.auctions["mk-A"]["end_at"])
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        checks = [at - end for at, aid in m.checks if aid == "mk-A"]
+        self.assertTrue(-20 <= checks[0] < -19 and -6 <= checks[1] < -5, checks)
+
+    def test_without_ceiling_buys_whatever_the_price_without_reading_it(self):
+        m = self.standard_market()
+        output, code = self.run_market("acheter", execute=True, buy={"price_factor": None})
+        self.assertEqual(code, 0, output)
+        self.assertEqual(sorted((aid, amount) for _, aid, amount in m.bids), [("mk-A", 12), ("mk-C", 12), ("mk-E", 2)])
+        self.assertEqual([u for _, u, *_ in m.site.calls if "/sales" in u], [])  # aucun prix lu
+        self.assertIn("Lyon-Bron [R] valeur=? : fin à", output)
+        self.assertIn("plafond aucun", output)
+
+        self.setUp()
+        m = self.standard_market()
+        output, code = self.run_market("acheter", execute=True, buy={"price_factor": None, "max_price": 11})
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-E", 2)])
+
+    def test_ceiling_at_five_times_the_average_and_unknown_prices_bought(self):
+        m = self.standard_market()
+        m.add("mk-K", "Château de la Duchère", 270, current=125, value=9, category="château de Lyon")  # 138 > 9 × 5
+        output, code = self.run_market("acheter", execute=True, buy={"price_factor": 5, "buy_unknown": True})
+        self.assertEqual(code, 0, output)
+        # Stade de Gerland : 12 <= 5 × 5 ; Lyon-Bron (jamais vendue) : achetée quand même.
+        self.assertEqual(sorted((aid, amount) for _, aid, amount in m.bids), [("mk-A", 12), ("mk-C", 12), ("mk-E", 2)])
+        self.assertIn("Château de la Duchère [R] valeur=9 : mise minimale 138 > plafond 45", output)
+        self.assertIn("Lyon-Bron [R] valeur=? : fin à", output)
+
+    def test_buy_respects_max_price_and_price_factor(self):
+        self.standard_market()
+        output, code = self.run_market("acheter", execute=True, buy={"max_price": 11})
+        self.assertEqual(self.market.bids, [])
+        self.assertIn("mise minimale 12 > plafond 11", output)
+
+    def test_buy_needs_keywords(self):
+        output, code = self.run_main(self.market, "acheter")
+        self.assertIn("buy.keywords est vide", str(code))
+
+    def test_market_error_does_not_stop_the_run(self):
+        self.standard_market()
+        self.market.search_replies = [FakeResponse(500, {"error": "<!DOCTYPE html>"})] * 6
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0)
+        self.assertIn("[achats] ÉCHEC : erreur 500 sur GET /api/marketplace", output)
+        self.assertIn("aucune enchère à suivre", output)
+
+    def test_antibot_on_a_bid_pauses_buying(self):
+        self.standard_market()
+        self.market.add("mk-H", "Olympique lyonnais", 310, current=10, value=20)
+        self.market.bid_replies = [FakeResponse(403, self.ANTIBOT)]
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0)
+        self.assertIn("vérification anti-robot : achats en pause jusqu'à", output)
+        self.assertIn("achats en pause jusqu'à", output.split("Résumé")[-1])
+        # La mise suivante (10 s plus tard) n'est pas tentée : on n'insiste pas.
+        self.assertEqual(len([u for _, u, *_ in self.market.site.calls if u.endswith("/bid")]), 1)
+        self.assertEqual(self.purchases(), {})
+
+    def test_won_card_gets_its_protective_tag_before_being_sorted(self):
+        chacana = load("collection.json")["collection"][1]["card_id"]
+        (self.acc / "achats.json").write_text(json.dumps({"auctions": {"mk-Z": {
+            "card_id": chacana, "name": "Chacana", "rarity": "R", "value": 5, "price": 4,
+            "end_at": self.clock.now - 100, "status": "won"}}}), encoding="utf-8")
+        output, code = self.run_market("tout", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("== Cartes achetées : étiquette « lyon » ==", output)
+        self.assertIn((CHACANA, LYON_TAG), self.market.site.tag_links())
+        self.assertNotIn(CHACANA, self.market.site.discards())  # sans l'étiquette, elle aurait été défaussée
+        self.assertEqual(self.purchases(), {})
+
+    def test_tout_without_loop_does_not_buy(self):
+        self.standard_market()
+        output, code = self.run_market("tout")
+        self.assertIn("seulement avec --loop", output)
+        self.assertEqual(self.market.site.gets("/api/marketplace?"), [])
+        self.assertEqual([u for _, u, *_ in self.market.site.calls if u.endswith("/api/marketplace")], [])
+
+    def test_tout_loop_bids_during_its_pauses(self):
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 150, current=10, value=20)
+        end, start = w.parse_time(m.auctions["mk-A"]["end_at"]), self.clock.now
+
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock.now - start > 400:
+                raise KeyboardInterrupt
+
+        def mutate(cfg):
+            cfg["buy"].update(keywords=["lyon"], tag="lyon")
+        output, code = self.run_main(m, "tout", execute=True, mutate=mutate, clock=self.clock, sleep=sleep,
+                                     args=["--loop", "2"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
+        self.assertTrue(end - 20 <= m.bids[0][0] < end - w.LAST_CHECK_SECONDS)
+        self.assertIn("ACHETÉE", output)
+        self.assertIn("1 mise(s) sur le marché", output)
 
 
 class PtyMixin:

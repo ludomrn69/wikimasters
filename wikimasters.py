@@ -6,6 +6,8 @@
     ./wm analyser     lit les prix moyens et pose les étiquettes de prix (defausse, +5, +10…)
     ./wm vendre       met aux enchères les cartes étiquetées à vendre (places libres)
     ./wm defausser    défausse les cartes « defausse » (et les « inconnu » des raretés choisies)
+    ./wm boosters     ouvre les boosters disponibles
+    ./wm acheter      mise à la dernière seconde sur les enchères du marché qui correspondent à buy.keywords
     ./wm comptes      liste les comptes enregistrés
 
 Sans --execute, chaque commande est une simulation : elle affiche ce qu'elle ferait sans rien modifier.
@@ -16,6 +18,7 @@ import argparse
 import base64
 import binascii
 import csv
+import datetime
 import difflib
 import html
 import json
@@ -66,12 +69,22 @@ ANTIBOT_CODE = "human_verification_required"
 ANTIBOT_HINT = ("Ouvrez wiki-masters.com dans votre navigateur avec ce compte et faites l'action à la main "
                 "(passez la vérification si elle s'affiche), puis relancez le script.")
 ANTIBOT_GROUPS = {"auction": "mises en vente", "discard": "défausses", "add_tag": "étiquettes",
-                  "remove_tag": "étiquettes"}
+                  "remove_tag": "étiquettes", "pack": "boosters", "bid": "achats"}
 # Nouvelles tentatives du renouvellement de session (réseau, 429, 5xx). Rapides : si la première demande était
 # arrivée, Supabase accepte encore l'ancien jeton pendant quelques secondes, au-delà il révoquerait la session.
 REFRESH_RETRY_DELAYS = (1, 3)
 MAYBE_DONE = "L'action a peut-être été effectuée : vérifiez sur le site."
-COMMANDS = ("tout", "analyser", "vendre", "defausser")
+COMMANDS = ("tout", "analyser", "vendre", "defausser", "boosters", "acheter")
+# Achats : après la mise de buy.snipe_seconds, dernière vérification de l'enchère quand il reste ce nombre de
+# secondes (pour répondre à une surenchère de dernière minute).
+LAST_CHECK_SECONDS = 6
+# Aucune autre requête ne part quand une vérification d'enchère tombe dans les N secondes : le site met parfois
+# plusieurs secondes à répondre, et la mise arriverait trop tard.
+CHECK_MARGIN = 10
+# Résultat d'une enchère où le script a misé : lu une minute après sa fin, puis toutes les 5 minutes.
+RESULT_DELAY, RESULT_RETRY = 60, 300
+# Pages du marché lues au plus par mot-clé et par relecture (triées par fin la plus proche).
+MAX_SCAN_PAGES = 5
 # Réglages personnels (et jeton Telegram) par-dessus config.yaml, à côté de lui et jamais envoyés sur GitHub.
 PERSO_FILE = "perso.yaml"
 # Un dossier par compte : session, suivi des ventes, verrou.
@@ -272,8 +285,8 @@ def check_config(cfg):
                 err(f"{where}.{key} doit être un nombre")
 
     if isinstance(cfg, dict):
-        unknown_keys(cfg, "", ("site", "protection", "price", "price_tags", "auto_tags", "discard", "sell", "safety",
-                               "journal", "display", "telegram"))
+        unknown_keys(cfg, "", ("site", "protection", "price", "price_tags", "auto_tags", "discard", "sell", "packs",
+                               "buy", "safety", "journal", "display", "telegram"))
 
     site_keys = ("base_url", "supabase_url", "supabase_anon_key")
     site = section("site", site_keys)
@@ -399,6 +412,26 @@ def check_config(cfg):
             err("sell.relist.factor doit être <= 1 (une relance ne se fait pas plus cher)")
         number(relist, "sell.relist", "min_start_price", 1, integer=True)
         number(relist, "sell.relist", "max_attempts", 1, integer=True)
+
+    packs = section("packs", ("in_tout", "max_per_run", "delay_seconds"))
+    boolean(packs, "packs", "in_tout")
+    number(packs, "packs", "max_per_run", 0, integer=True)
+    number(packs, "packs", "delay_seconds", 0)
+
+    buy = section("buy", ("keywords", "tag", "price_factor", "max_price", "buy_unknown", "skip_owned",
+                          "snipe_seconds", "scan_minutes"))
+    keywords = str_list(buy, "buy", "keywords")
+    number(buy, "buy", "price_factor", 0, strict=True, allow_none=True)
+    number(buy, "buy", "max_price", 1, integer=True, allow_none=True)
+    boolean(buy, "buy", "buy_unknown")
+    boolean(buy, "buy", "skip_owned")
+    number(buy, "buy", "snipe_seconds", 10)
+    number(buy, "buy", "scan_minutes", 1)
+    if buy.get("tag") is not None and (not isinstance(buy["tag"], str) or not buy["tag"].strip()):
+        err("buy.tag doit être un texte (ou null)")
+    elif keywords and norm(buy.get("tag") or "") not in {norm(t) for t in prot_tags}:
+        # Sans elle, « analyser » mettrait en vente ou défausserait les cartes que le script vient d'acheter.
+        err("buy.tag doit être une étiquette de protection.tags (ex. « garder ») : elle protège les cartes achetées")
 
     journal = section("journal", ("enabled", "file", "delimiter"))
     boolean(journal, "journal", "enabled")
@@ -833,6 +866,46 @@ def start_price(value, sell):
     return price
 
 
+def parse_time(text):
+    """Horodatage du site (ex. 2026-10-10T08:04:51.55455+00:00) en secondes depuis 1970, ou None s'il est illisible."""
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)?", str(text or "").strip())
+    if not m:
+        return None
+    moment, fraction, zone = m.groups()
+    zone = "+00:00" if zone in (None, "Z") else zone[:3] + ":" + zone[-2:]
+    try:
+        stamp = datetime.datetime.fromisoformat(moment + zone).timestamp()
+    except ValueError:
+        return None
+    return stamp + (float("0." + fraction) if fraction else 0.0)
+
+
+def next_bid(auction):
+    """Mise minimale acceptée : la mise de départ s'il n'y a pas encore de mise, sinon la mise actuelle + 10 %
+    (arrondi à l'inférieur) + 1, comme le propose le site (relevé dans un HAR : 5 → 6, 27 → 30, 100 → 111)."""
+    current = auction.get("current_bid")
+    if current is None:
+        start = auction.get("effective_bid", auction.get("base_amount"))
+        return max(1, math.ceil(start)) if _is_number(start) else None
+    if not _is_number(current):
+        return None
+    current = int(current)
+    return current + current // 10 + 1
+
+
+def buy_ceiling(value, buy):
+    """Mise maximale pour une carte, ou None sans limite : prix moyen × buy.price_factor (arrondi à l'inférieur, si
+    price_factor n'est pas null et le prix connu), et buy.max_price."""
+    limits = [buy["max_price"]] if buy.get("max_price") else []
+    if buy.get("price_factor") is not None and value is not None:
+        limits.append(math.floor(round(value * buy["price_factor"], 6)))
+    return min(limits) if limits else None
+
+
+def show_ceiling(ceiling):
+    return "aucun" if ceiling is None else ceiling
+
+
 # --- Client HTTP ------------------------------------------------------------
 
 
@@ -858,6 +931,7 @@ class WikiMastersClient:
         self.http.headers["Accept"] = "application/json"
         self.session_lost = None  # raison si la session ne peut plus être utilisée
         self.slowdown = 1.0  # multiplie toutes les pauses après une erreur du serveur
+        self.waiter = None  # remplace time.sleep pendant les pauses : les achats misent pendant ce temps (Sniper)
         self.last_uncertain = False  # la dernière écriture a dû être renvoyée après une tentative peut-être effectuée
         self._tag_ids = None
         self._last_refresh = None
@@ -971,7 +1045,7 @@ class WikiMastersClient:
 
     def pause(self, seconds):
         """Pause entre deux requêtes, allongée tant que le serveur montre des signes de surcharge."""
-        time.sleep(seconds * self.slowdown)
+        (self.waiter or time.sleep)(seconds * self.slowdown)
 
     def _request(self, method, url, headers_fn, retry=None, **kwargs):
         """Envoie la requête ; en cas de panne du serveur (429, 5xx, réseau), attend puis la renvoie.
@@ -1141,6 +1215,25 @@ class WikiMastersClient:
         # Le champ s'appelle "card_id" mais attend bien l'id de l'EXEMPLAIRE (vérifié dans le HAR).
         body = {"card_id": card.copy_id, "base_amount": base_amount, "duration_minutes": duration_minutes}
         return self._api("POST", "/api/marketplace", json=body, retry="safe")
+
+    def packs_left(self):
+        """Boosters disponibles. Même appel que la page des boosters à chaque visite : le site y compte la recharge."""
+        profile = self._rest("POST", "rpc/sync_profile_packs", json={"user_id": self.user_id}, retry="idempotent")
+        left = profile.get("packs_remaining") if isinstance(profile, dict) else None
+        if not _is_int(left):
+            raise ApiError("nombre de boosters disponibles illisible")
+        return left
+
+    def open_pack(self):
+        return self._api("POST", "/api/packs/open", retry="safe")
+
+    def search_auctions(self, query, page):
+        """Une page d'enchères du marché correspondant à query, de la plus proche de sa fin à la plus lointaine."""
+        return self._api("GET", "/api/marketplace",
+                         params={"page": page, "limit": PAGE_SIZE, "sort": "ending_soon", "q": query})
+
+    def bid(self, auction_id, amount):
+        return self._api("POST", f"/api/marketplace/{auction_id}/bid", json={"amount": amount}, retry="safe")
 
     def known_tags(self):
         """Étiquettes du compte : norm(nom) -> id (lues une fois)."""
@@ -1318,14 +1411,15 @@ class Journal:
         return self.write(action, card.name, card.rarity, card.copy_id, card.card_id, value, **kw)
 
 
-class SalesState:
-    """ventes.json : enchères lancées par le script, pour le bilan (vendue / invendue) et les relances.
+class AuctionFile:
+    """Enchères suivies par le script dans un fichier JSON du compte : {"auctions": {id: entrée avec "status"}}.
 
-    Statuts : open (en cours), unsold (revenue sans acheteur), abandoned (trop d'essais, on ne la vend plus) ;
-    les autres (sold, cancelled, relisted, gone) sont terminés et retirés du fichier à l'enregistrement.
+    Seules les entrées aux statuts KEPT sont gardées à l'enregistrement, les autres sont terminées.
     """
 
-    KEPT = ("open", "unsold", "abandoned")
+    KEPT = ()
+    WHAT = ""  # « suivi des … », pour les messages
+    LOST = ""  # conséquence d'un enregistrement raté
 
     def __init__(self, path):
         self.path = pathlib.Path(path)
@@ -1344,10 +1438,36 @@ class SalesState:
                 os.replace(self.path, backup)
             except OSError:
                 pass
-            print(f"Attention : {self.path.name} illisible, mis de côté dans {backup.name} : le suivi des ventes repart à zéro.")
+            print(f"Attention : {self.path.name} illisible, mis de côté dans {backup.name} : le {self.WHAT} repart à zéro.")
 
     def with_status(self, status):
         return [(aid, e) for aid, e in self.auctions.items() if e.get("status") == status]
+
+    def set_status(self, auction_id, status, **extra):
+        if auction_id in self.auctions:
+            self.auctions[auction_id].update(status=status, **extra)
+
+    def save(self):
+        keep = {a: e for a, e in self.auctions.items() if e.get("status") in self.KEPT}
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.stem}.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"auctions": keep}, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            print(f"Attention : {self.WHAT} non enregistré ({type(e).__name__}) : {self.LOST}.")
+
+
+class SalesState(AuctionFile):
+    """ventes.json : enchères lancées par le script, pour le bilan (vendue / invendue) et les relances.
+
+    Statuts : open (en cours), unsold (revenue sans acheteur), abandoned (trop d'essais, on ne la vend plus) ;
+    les autres (sold, cancelled, relisted, gone) sont terminés et retirés du fichier à l'enregistrement.
+    """
+
+    KEPT = ("open", "unsold", "abandoned")
+    WHAT = "suivi des ventes"
+    LOST = "le bilan et les relances seront incomplets"
 
     def latest_for(self, copy_id, status):
         found = [(e.get("listed_at") or 0, aid, e) for aid, e in self.with_status(status) if e.get("copy_id") == copy_id]
@@ -1366,19 +1486,24 @@ class SalesState:
             "listed_at": time.time(), "status": "open",
         }
 
-    def set_status(self, auction_id, status, **extra):
-        if auction_id in self.auctions:
-            self.auctions[auction_id].update(status=status, **extra)
 
-    def save(self):
-        keep = {a: e for a, e in self.auctions.items() if e.get("status") in self.KEPT}
-        try:
-            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".ventes.", suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"auctions": keep}, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, self.path)
-        except OSError as e:
-            print(f"Attention : suivi des ventes non enregistré ({type(e).__name__}) : le bilan et les relances seront incomplets.")
+class PurchaseState(AuctionFile):
+    """achats.json : enchères du marché où le script a misé, jusqu'au résultat puis à l'étiquette posée sur la carte.
+
+    Statuts : bid (mise posée, résultat pas encore lu), won (gagnée : buy.tag reste à poser sur la carte) ;
+    les autres (lost, tagged, gone) sont terminés et retirés du fichier à l'enregistrement.
+    """
+
+    KEPT = ("bid", "won")
+    WHAT = "suivi des achats"
+    LOST = "le résultat des mises et l'étiquette des cartes gagnées seront incomplets"
+
+    def record(self, target, amount):
+        card = target.card
+        self.auctions[target.auction_id] = {
+            "card_id": card.card_id, "name": card.name, "rarity": card.rarity, "value": target.value,
+            "price": amount, "end_at": target.end_at, "status": "bid",
+        }
 
 
 def pid_alive(pid):
@@ -1492,6 +1617,8 @@ class Context:
     # Vérification anti-robot demandée par le site : groupe d'actions -> {"until": fin de la pause, "strikes": n}.
     # Gardé d'un cycle de --loop à l'autre ; relancer le script la lève (après une vérification faite à la main).
     antibot: dict = field(default_factory=dict)
+    purchases: object = None  # PurchaseState : enchères du marché où le script a misé
+    sniper: object = None  # Sniper, quand les achats sont actifs (« acheter », ou « tout --loop » avec buy.keywords)
 
 
 # --- Commandes --------------------------------------------------------------
@@ -1503,7 +1630,7 @@ FINAL_ACTIONS = ("discard", "auction")
 
 def new_summary():
     counters = ("tag_add", "tag_remove", "discard", "auction", "relist", "sold", "unsold", "no_slot", "error",
-                "deferred")
+                "deferred", "pack", "bid", "won", "lost")
     # Ensembles d'exemplaires : une carte vue dans plusieurs phases de « tout » n'est comptée qu'une fois.
     sets = ("protect", "skip", "up_to_date", "read_error")
     # paused : groupe d'actions -> fin de sa pause anti-robot (voir antibot_strike)
@@ -2024,8 +2151,427 @@ class Runner:
             self.consumed.add(card.copy_id)
 
 
+def open_packs(ctx):
+    """Ouvre les boosters disponibles (au plus packs.max_per_run), espacés de packs.delay_seconds."""
+    client, packs, summary = ctx.client, ctx.cfg["packs"], ctx.summary
+    until = antibot_until(ctx, "pack")
+    if until:
+        print(f"  boosters en pause jusqu'à {clock_time(until)} : le site a demandé une vérification anti-robot")
+        return
+    try:
+        left = client.packs_left()
+    except ApiError as e:
+        if e.fatal:
+            raise
+        print(f"  ÉCHEC     boosters : {e}")
+        return
+    count = min(left, packs["max_per_run"])
+    print(f"  {left} booster(s) disponible(s) → {count} ouverture(s)")
+    if not ctx.execute:
+        summary["pack"] += count
+        return
+    for n in range(count):
+        if n:
+            delay = packs["delay_seconds"]
+            client.pause(random.uniform(delay * 0.8, delay * 1.5))  # un rythme trop régulier ferait robot
+        try:
+            data = client.open_pack() or {}
+        except ApiError as e:
+            ctx.journal.write("booster", result=f"ECHEC : {e}")
+            if e.fatal:
+                raise
+            summary["error"] += 1
+            print(f"  ÉCHEC     booster : {e}")
+            if e.antibot:
+                antibot_strike(ctx, "pack")
+            return
+        summary["pack"] += 1
+        ctx.antibot.pop(ANTIBOT_GROUPS["pack"], None)  # accepté à nouveau : la prochaine pause repart à 1 h
+        cards = [c for c in data.get("cards") or [] if isinstance(c, dict)]
+        shown = ", ".join(f"{c.get('wikipedia_title', '?')} [{c.get('rarity', '?')}]" for c in cards)
+        print(f"  booster {n + 1}/{count} : {shown or 'aucune carte reçue'}")
+        for c in cards:
+            ctx.journal.write("booster", c.get("wikipedia_title", ""), c.get("rarity", ""),
+                              str(c.get("user_card_id") or ""), str(c.get("id") or ""))
+        if _is_int(data.get("packs_remaining")) and data["packs_remaining"] <= 0:
+            break
+
+
+@dataclass
+class Target:
+    """Enchère du marché suivie par les achats : mise à fin - buy.snipe_seconds, revue à fin - LAST_CHECK_SECONDS."""
+
+    auction_id: str
+    card: Card  # copy_id vide : la carte n'est pas (encore) à nous
+    end_at: float
+    value: float
+    ceiling: int | None  # None : pas de plafond
+    stage: int = 0  # 0 : mise à venir, 1 : dernière vérification à venir
+    bid: int | None = None  # dernière mise du script sur cette enchère
+
+
+class Sniper:
+    """Achats aux enchères : repère sur le marché les annonces qui correspondent à buy.keywords, puis mise le minimum
+    quelques secondes avant la fin, sans jamais dépasser le plafond (prix moyen de la carte × buy.price_factor).
+
+    Tout se fait pendant les pauses (client.waiter) : celle de --loop entre deux passages, et celles entre deux
+    requêtes d'un passage. Une seule requête à la fois et une seule session, donc rien à partager entre processus.
+    """
+
+    def __init__(self, ctx, one_shot=False, mine=None):
+        self.ctx, self.client, self.buy = ctx, ctx.client, ctx.cfg["buy"]
+        self.one_shot = one_shot  # sans --loop : « acheter » attend la fin des enchères repérées, puis s'arrête
+        # Vos autres comptes enregistrés (id -> nom) : on ne surenchérit pas sur eux et on n'achète pas leurs annonces.
+        self.mine = {k: v for k, v in (mine or {}).items() if k != self.client.user_id}
+        self.targets = {}  # auction_id -> Target
+        self.ignored = {}  # auction_id -> fin : annonces écartées pour de bon (trop chère, déjà possédée…)
+        self.results = {}  # auction_id -> moment de lire le résultat d'une enchère où le script a misé
+        self.next_scan = 0.0
+        self.busy = False  # lecture du marché ou mise en cours : une pause demandée entre-temps est une simple pause
+        if ctx.execute:
+            for aid, entry in ctx.purchases.with_status("bid"):
+                self.results[aid] = (entry.get("end_at") or 0) + RESULT_DELAY
+
+    def say(self, text):
+        print(f"  [achats] {text}")
+
+    # --- attente ---
+
+    def wait(self, seconds, scan=True):
+        """Remplace time.sleep : attend `seconds` secondes en traitant les enchères qui arrivent à échéance."""
+        deadline = time.time() + seconds
+        if self.busy:
+            time.sleep(seconds)
+            return
+        while True:
+            if self._paused():
+                time.sleep(max(0.0, deadline - time.time()))
+                return
+            self._run_due(scan)
+            now = time.time()
+            # Vérification imminente : on l'attend, plutôt que de laisser partir une requête qui la retarderait.
+            soon = self._next_check() <= now + CHECK_MARGIN
+            if now >= deadline and not soon:
+                return
+            until = self._next_event(scan) if soon else min(deadline, self._next_event(scan))
+            time.sleep(max(0.0, until - now))
+
+    def drain(self):
+        """Sans --loop : attend la fin des enchères repérées, et leur résultat, sans relire le marché."""
+        while not self._paused():
+            due = self._next_event(scan=False)
+            if due == math.inf:
+                return
+            self.wait(max(0.0, due - time.time()), scan=False)
+
+    def _paused(self):
+        return antibot_until(self.ctx, "bid") is not None
+
+    def _due(self, target):
+        return target.end_at - (self.buy["snipe_seconds"] if target.stage == 0 else LAST_CHECK_SECONDS)
+
+    def _next_check(self):
+        return min((self._due(t) for t in self.targets.values()), default=math.inf)
+
+    def _clear_ahead(self):
+        """Avant une lecture du marché : les vérifications des secondes à venir passent d'abord."""
+        while not self._paused():
+            due, now = self._next_check(), time.time()
+            if due > now + CHECK_MARGIN:
+                return
+            time.sleep(max(0.0, due - now))
+            self._checks_due()
+
+    def _next_event(self, scan):
+        times = [self._due(t) for t in self.targets.values()] + list(self.results.values())
+        return min(times + ([self.next_scan] if scan else []), default=math.inf)
+
+    def _run_due(self, scan):
+        if scan and time.time() >= self.next_scan:
+            self._guarded(self.scan)
+        self._checks_due()
+        for aid, at in sorted(self.results.items(), key=lambda x: x[1]):
+            if at <= time.time():
+                self._guarded(self._result, aid)
+
+    def _checks_due(self):
+        for target in sorted(self.targets.values(), key=self._due):
+            if self._due(target) > time.time():
+                break
+            if target.auction_id in self.targets:
+                self._guarded(self._check, target)
+
+    def _guarded(self, action, *args):
+        """Une erreur n'arrête pas les achats (sauf session perdue) : elle est affichée, la suite continue."""
+        was_busy, self.busy = self.busy, True
+        try:
+            action(*args)
+        except ApiError as e:
+            if e.antibot:
+                antibot_strike(self.ctx, "bid")
+            elif e.fatal and self.client.session_lost:
+                raise
+            else:
+                self.say(f"ÉCHEC : {e}")
+        finally:
+            self.busy = was_busy
+
+    # --- marché ---
+
+    def scan(self):
+        """Relit le marché : annonces qui se terminent avant la relecture d'après (avec de la marge)."""
+        now = time.time()
+        self.next_scan = now + self.buy["scan_minutes"] * 60
+        horizon = now + 2 * self.buy["scan_minutes"] * 60 + self.buy["snipe_seconds"]
+        self.ignored = {aid: end for aid, end in self.ignored.items() if end > now}
+        found = {}
+        for keyword in self.buy["keywords"]:
+            for page in range(1, MAX_SCAN_PAGES + 1):
+                self._clear_ahead()
+                data = self.client.search_auctions(keyword, page) or {}
+                self.client.pause(self.ctx.cfg["safety"]["read_delay_seconds"])
+                auctions = [a for a in data.get("auctions") or [] if isinstance(a, dict)]
+                ends = [parse_time(a.get("end_at")) for a in auctions]
+                for auction, end in zip(auctions, ends):
+                    if end is not None and now + LAST_CHECK_SECONDS + 2 < end <= horizon:
+                        found.setdefault(str(auction.get("id")), (auction, end))
+                if not data.get("hasMore") or not auctions or None in ends or max(ends) > horizon:
+                    break
+        new = sorted((v for aid, v in found.items() if aid not in self.targets and aid not in self.ignored),
+                     key=lambda v: v[1])
+        read = 0
+        for auction, end in new:
+            self._clear_ahead()  # lire un prix prend du temps : les mises à faire bientôt passent avant
+            read += self._consider(auction, end)
+        if read:
+            self.ctx.cache.save()
+
+    def _consider(self, auction, end):
+        """Suit l'annonce si elle convient. Retourne 1 si un prix a été lu sur le site, 0 sinon."""
+        aid = str(auction.get("id"))
+        info = auction.get("card") if isinstance(auction.get("card"), dict) else {}
+        card = Card(copy_id="", card_id=str(auction.get("card_id") or info.get("id") or ""),
+                    name=str(info.get("wikipedia_title") or "?"),
+                    rarity=str(auction.get("snapshot_rarity") or info.get("rarity") or ""),
+                    is_shiny=bool(auction.get("is_shiny")))
+        reason, value, ceiling, read = self._reject(auction, info, card), None, None, 0
+        quiet = bool(reason)
+        if not reason:
+            cached = self.ctx.cache.get(card)
+            if cached is not PriceCache.MISSING:
+                value = cached
+            elif self.buy["price_factor"] is not None:  # sans plafond lié au prix, inutile de le lire
+                read = 1
+                try:
+                    value = self._value(card)
+                except ApiError as e:
+                    if e.fatal:
+                        raise
+                    self.say(f"ÉCHEC     {card.name} [{card.rarity}] : prix illisible ({e})")
+                    return read  # nouvel essai à la prochaine relecture
+            need, ceiling = next_bid(auction), buy_ceiling(value, self.buy)
+            if value is None and self.buy["price_factor"] is not None and not self.buy["buy_unknown"]:
+                reason = "jamais vendue, prix inconnu (buy_unknown: true pour l'acheter quand même)"
+            elif need is None:
+                reason = "mise actuelle illisible"
+            elif ceiling is not None and need > ceiling:
+                reason = f"mise minimale {need} > plafond {ceiling}"
+        if reason:
+            self.ignored[aid] = end
+            if self.ctx.verbose or not quiet:
+                self.say(f"ignorée   {label(card, value)} : {reason}")
+            return read
+        self.targets[aid] = Target(aid, card, end, value, ceiling)
+        current = auction.get("current_bid")
+        self.say(f"repérée   {label(card, value)} : fin à {time.strftime('%H:%M:%S', time.localtime(end))}, "
+                 f"mise actuelle {'aucune' if current is None else current}, plafond {show_ceiling(ceiling)}")
+        return read
+
+    def _reject(self, auction, info, card):
+        """Pourquoi cette annonce n'est pas pour nous (None si elle l'est)."""
+        if auction.get("status") != "active":
+            return "enchère terminée"
+        if auction.get("seller_id") == self.client.user_id or auction.get("seller_id") in self.mine:
+            return "votre propre annonce"
+        if self.buy["skip_owned"] and auction.get("owned"):
+            return "déjà dans votre collection"
+        # Deux annonces de la même carte : on n'en suit qu'une, pour ne pas l'acheter deux fois.
+        if any(t.card.card_id == card.card_id for t in self.targets.values()) \
+                or any(e.get("card_id") == card.card_id for status in ("bid", "won")
+                       for _, e in self.ctx.purchases.with_status(status)):
+            return "même carte déjà suivie ou achetée"
+        # Le site cherche peut-être plus large : on vérifie que le mot-clé est bien dans le titre ou la catégorie.
+        text = norm(" ".join(str(x or "") for x in (auction.get("snapshot_search_document"),
+                                                     info.get("wikipedia_title"), info.get("category"))))
+        # En début de mot : « lyon » trouve « lyonnais » ou « To-Lyon », pas « Elyon ».
+        if not any(re.search(r"(?<!\w)" + re.escape(norm(k)), text) for k in self.buy["keywords"]):
+            return "mot-clé absent du titre et de la catégorie"
+        return None
+
+    def _value(self, card):
+        try:
+            value = self.client.card_value(card)
+        finally:
+            self.client.pause(self.ctx.cfg["safety"]["read_delay_seconds"])
+        self.ctx.cache.set(card, value)
+        return value
+
+    # --- mises ---
+
+    def _check(self, target):
+        stage, target.stage = target.stage, target.stage + 1  # avancé d'abord : un échec ne la refait pas en boucle
+        data = self.client.get_auction(target.auction_id)
+        auction = data.get("auction", data) if isinstance(data, dict) else {}
+        end, now = parse_time(auction.get("end_at")) or target.end_at, time.time()
+        if auction.get("status") != "active" or end <= now:
+            self._finish(target)
+            return
+        if end > target.end_at + 1:
+            # Fin repoussée (le site prolonge peut-être une enchère après une mise tardive) : on recommence.
+            target.end_at, target.stage = end, 0
+            self.say(f"prolongée {target.card.name} : nouvelle fin à {time.strftime('%H:%M:%S', time.localtime(end))}")
+            return
+        current, leader, need = auction.get("current_bid"), auction.get("current_bidder_id"), next_bid(auction)
+        # Simulation : la mise n'est pas partie, mais tant que personne n'a misé depuis, elle serait en tête.
+        simulated = not self.ctx.execute and target.bid is not None and need is not None and need <= target.bid
+        if leader == self.client.user_id or simulated:
+            shown = f"{target.bid} (simulation)" if simulated else current
+            self.say(f"en tête   {label(target.card, target.value)} : {shown} "
+                     f"(plafond {show_ceiling(target.ceiling)}), fin dans {end - now:.0f} s")
+        elif leader in self.mine:
+            self.say(f"laissée   {label(target.card, target.value)} : votre compte {self.mine[leader]} est en tête")
+            target.stage = 2
+        else:
+            if need is None or (target.ceiling is not None and need > target.ceiling):
+                self.say(f"trop chère {label(target.card, target.value)} : mise minimale {need} > plafond "
+                         f"{target.ceiling}, on laisse")
+                target.stage = 2
+            else:
+                self._bid(target, need, end - now)
+        if stage >= 1 or target.stage >= 2:
+            self._finish(target)
+
+    def _bid(self, target, amount, left):
+        ctx = self.ctx
+        self.say(f"-> MISE {amount:<8} {label(target.card, target.value)} (plafond {show_ceiling(target.ceiling)}, "
+                 f"fin dans {left:.0f} s)")
+        if not ctx.execute:
+            target.bid = amount
+            ctx.summary["bid"] += 1
+            return
+        try:
+            response = self.client.bid(target.auction_id, amount) or {}
+        except ApiError as e:
+            self._log(target, amount, f"ECHEC : {e}")
+            if e.fatal:
+                # Mise peut-être partie : on lira le résultat de l'enchère comme si elle l'était.
+                target.bid = amount
+                ctx.purchases.record(target, amount)
+                ctx.purchases.save()
+                raise
+            ctx.summary["error"] += 1
+            self.say(f"   ÉCHEC : {e}")
+            if e.antibot:
+                antibot_strike(ctx, "bid")
+            return
+        target.bid = amount
+        ctx.purchases.record(target, amount)
+        ctx.purchases.save()  # tout de suite : un plantage ne doit pas faire oublier une mise
+        balance = response.get("bidder_balance")
+        self._log(target, amount, "OK", balance)
+        ctx.summary["bid"] += 1
+        ctx.antibot.pop(ANTIBOT_GROUPS["bid"], None)
+        self.say(f"   OK, solde : {'?' if balance is None else balance}")
+
+    def _log(self, target, amount, result, balance=None):
+        card = target.card
+        self.ctx.journal.write("mise", card.name, card.rarity, "", card.card_id, target.value, price=amount,
+                               result=result, balance=balance, auction_id=target.auction_id)
+
+    def _finish(self, target):
+        self.targets.pop(target.auction_id, None)
+        self.ignored[target.auction_id] = target.end_at  # pas reprise à la prochaine relecture
+        if target.bid is not None and self.ctx.execute:
+            self.results[target.auction_id] = target.end_at + RESULT_DELAY
+
+    def _result(self, aid):
+        """Gagnée ou perdue ? Une carte gagnée recevra buy.tag au prochain tri de la collection."""
+        purchases = self.ctx.purchases
+        entry = purchases.auctions.get(aid)
+        if not entry or entry.get("status") != "bid":
+            self.results.pop(aid, None)
+            return
+        self.results[aid] = time.time() + RESULT_RETRY  # si la lecture échoue ou si l'enchère n'est pas réglée
+        data = self.client.get_auction(aid)
+        auction = data.get("auction", data) if isinstance(data, dict) else None
+        outcome, name = classify_auction(auction), f"{entry.get('name', '')} [{entry.get('rarity', '')}]"
+        if outcome is None:
+            if time.time() - (entry.get("end_at") or 0) > STALE_AFTER:
+                self.say(f"?         {name} : aucun résultat depuis 2 jours, suivi abandonné")
+                purchases.set_status(aid, "gone")
+                purchases.save()
+                self.results.pop(aid, None)
+            return
+        self.results.pop(aid, None)
+        final = auction.get("final_price") or auction.get("current_bid")
+        if outcome == "sold" and auction.get("winner_id") == self.client.user_id:
+            self.say(f"ACHETÉE   {name} pour {final} wikibidous (étiquette « {self.buy['tag']} » au prochain tri)")
+            self.ctx.journal.write("achat", entry.get("name", ""), entry.get("rarity", ""), "", entry.get("card_id", ""),
+                                   entry.get("value"), price=final, auction_id=aid)
+            status = "won"
+        else:
+            self.say(f"perdue    {name}" + (f" : adjugée {final} à un autre joueur" if outcome == "sold" else ""))
+            status = "lost"
+        self.ctx.summary[status] += 1
+        purchases.set_status(aid, status, final_price=final)
+        purchases.save()
+
+
+def plan_bought(ctx, cards, all_cards):
+    """Cartes gagnées aux enchères : on leur pose buy.tag, une étiquette de protection, avant tout le reste."""
+    tag, steps = ctx.cfg["buy"]["tag"], []
+    for aid, entry in ctx.purchases.with_status("won"):
+        card_id = entry.get("card_id")
+        if not any(c.card_id == card_id for c in all_cards):
+            if time.time() - (entry.get("end_at") or 0) > STALE_AFTER:
+                ctx.purchases.set_status(aid, "gone")
+            else:
+                print(f"  {entry.get('name', '')} : pas encore dans la collection, étiquette au prochain passage")
+            continue
+        steps += [(c, "add_tag", tag, entry.get("value")) for c in cards
+                  if c.card_id == card_id and not c.has_any_tag([tag])]
+    return steps
+
+
+def bought_tagged(ctx, cards, all_cards):
+    """Après plan_bought : les achats dont la carte porte maintenant buy.tag sont terminés."""
+    tag = ctx.cfg["buy"]["tag"]
+    for aid, entry in ctx.purchases.with_status("won"):
+        card_id = entry.get("card_id")
+        # Une ligne à plusieurs exemplaires (absente de cards) n'est jamais touchée : rien de plus à faire.
+        if any(c.card_id == card_id for c in all_cards) \
+                and all(c.has_any_tag([tag]) for c in cards if c.card_id == card_id):
+            ctx.purchases.set_status(aid, "tagged")
+    if ctx.execute:
+        ctx.purchases.save()
+
+
 def run_command(ctx, command):
     ctx.run_started = time.time()
+    if command == "boosters" or (command == "tout" and ctx.cfg["packs"]["in_tout"]):
+        print("\n== Boosters ==")
+        open_packs(ctx)
+    if command == "acheter":
+        print("\n== Achats aux enchères ==")
+        ctx.sniper.next_scan = 0  # relecture du marché tout de suite
+        ctx.sniper.wait(0)
+        if not ctx.sniper.targets and not ctx.sniper.results:
+            print(f"  aucune enchère à suivre pour l'instant ({', '.join(ctx.cfg['buy']['keywords'])})")
+        elif ctx.sniper.one_shot:
+            print(f"  {len(ctx.sniper.targets)} enchère(s) suivie(s) : attente de leur fin (Ctrl+C pour quitter)…")
+            ctx.sniper.drain()
+    if command in ("boosters", "acheter"):
+        return
     cards, warning = ctx.client.list_cards()
     ctx.collection_ids = {c.copy_id for c in cards}
     ctx.on_sale = set()  # relu par le bilan à chaque passage (sinon --loop ne relancerait jamais une carte)
@@ -2033,6 +2579,7 @@ def run_command(ctx, command):
     if warning:
         print(f"Attention : {warning}")
     # Une ligne ×2, ×3… : on ne sait pas à quel exemplaire s'appliquent étiquettes et défausse, on n'y touche pas.
+    all_cards = cards
     grouped = [c for c in cards if c.count > 1]
     if grouped:
         print(f"  {len(grouped)} ligne(s) à plusieurs exemplaires laissée(s) de côté (le script n'y touche pas).")
@@ -2042,6 +2589,16 @@ def run_command(ctx, command):
         cards = [c for c in cards if c.count <= 1]
 
     runner = Runner(ctx)
+    tag = ctx.cfg["buy"]["tag"]
+    if tag and ctx.purchases.with_status("won"):
+        print(f"\n== Cartes achetées : étiquette « {tag} » ==")
+        steps = plan_bought(ctx, cards, all_cards)
+        if not steps:
+            print("  rien à faire")
+        elif not runner.run(steps):
+            return
+        bought_tagged(ctx, cards, all_cards)
+        cards = [c for c in cards if c.copy_id not in runner.failed]  # sans sa protection, on n'y touche pas
     phases = {
         "analyser": [("Analyse des prix et étiquettes", plan_analyse)],
         "vendre": [("Ventes aux enchères", plan_sell)],
@@ -2118,6 +2675,18 @@ def choose_account(cfg_file, wanted):
         sys.exit(f"Plusieurs comptes enregistrés ({', '.join(accounts)}) : précisez lequel, "
                  f"ex. « {cmd('tout --compte ' + accounts[0])} ».")
     return accounts[0]
+
+
+def account_user_ids(cfg_file):
+    """Identifiant sur le site de chaque compte enregistré (id -> nom), d'après sa session."""
+    ids = {}
+    for name in known_accounts(cfg_file):
+        try:
+            data = json.loads((account_dir(cfg_file, name) / "session.json").read_text(encoding="utf-8"))
+            ids[jwt_claims(data["session"]["access_token"])["sub"]] = name
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # session illisible : ce compte se signalera lui-même à son prochain lancement
+    return ids
 
 
 def cmd_login(cfg, cfg_file):
@@ -2276,7 +2845,15 @@ def main():
         journal=Journal(config_path(args.config, journal_cfg["file"]), journal_cfg["delimiter"],
                         journal_cfg["enabled"] and args.execute, client.username, args.command),
         state=SalesState(folder / "ventes.json"),
+        purchases=PurchaseState(folder / "achats.json"),
     )
+    keywords = cfg["buy"]["keywords"]
+    if args.command == "acheter" and not keywords:
+        sys.exit(f"buy.keywords est vide : rien à chercher sur le marché. Ajoutez vos mots-clés dans {PERSO_FILE}, "
+                 "ex. buy: { keywords: [\"lyon\"], tag: \"lyon\" } (voir README).")
+    if keywords and (args.command == "acheter" or (args.command == "tout" and args.loop)):
+        ctx.sniper = Sniper(ctx, one_shot=not args.loop, mine=account_user_ids(args.config))
+        client.waiter = ctx.sniper.wait
     mode = "EXÉCUTION RÉELLE" if args.execute else "SIMULATION (rien n'est modifié, ajoutez --execute pour agir)"
     lock = RunLock(folder / ".wikimasters.lock")
     if args.execute:
@@ -2288,10 +2865,10 @@ def main():
         while True:
             # Un bilan par cycle de --loop.
             cycle += 1
-            ctx.summary = new_summary()
-            ctx.journal.lost = ctx.journal.diverted = 0
             ctx.journal.merge_backup()
             print(f"\n=== [{time.strftime('%H:%M:%S')}] {args.command} — {mode} — compte {client.username} ===")
+            if keywords and args.command == "tout" and not args.loop and cycle == 1:
+                print("Achats aux enchères (buy.keywords) : seulement avec --loop, ou avec la commande « acheter ».")
             if args.fresh and cycle == 1:  # les cycles suivants de --loop réutilisent ces prix
                 ctx.cache.not_before = time.time()
                 print("Option --fresh : tous les prix sont relus sur le site (cache ignoré).")
@@ -2324,6 +2901,9 @@ def main():
                           f"({journal_cfg['file']} verrouillé), recopiée(s) au prochain passage.")
                 if telegram and (args.execute or telegram["notify_on_dry_run"]):
                     send_telegram(telegram, telegram_message(client.username, args.command, outcome, summary_text))
+                # Nouveau bilan dès maintenant : les mises faites pendant la pause de --loop iront dans le suivant.
+                ctx.summary = new_summary()
+                ctx.journal.lost = ctx.journal.diverted = 0
 
             if client.session_lost:
                 if client.session_lost != outcome[1]:  # sinon déjà affiché par « ARRÊT »
@@ -2334,7 +2914,12 @@ def main():
             if not args.loop:
                 break
             print(f"\nProchain passage dans {args.loop} minute(s)… (Ctrl+C pour quitter)")
-            time.sleep(args.loop * 60)
+            try:
+                (ctx.sniper.wait if ctx.sniper else time.sleep)(args.loop * 60)
+            except ApiError as e:  # session perdue pendant les achats (les autres erreurs n'arrêtent que la mise)
+                print(f"\nARRÊT : {e}")
+                print_summary(ctx.summary, args.execute)
+                sys.exit(1)
     except KeyboardInterrupt:
         print("\nArrêt demandé par l'utilisateur.")
         if outcome[0] == "interrupted":
@@ -2354,6 +2939,10 @@ def print_summary(summary, execute):
         f"{summary['tag_add']} étiquette(s) posée(s)",
         f"{summary['tag_remove']} retirée(s)",
     ]
+    if summary["pack"]:
+        parts.append(f"{summary['pack']} booster(s) ouvert(s)")
+    if summary["bid"]:
+        parts.append(f"{summary['bid']} mise(s) sur le marché")
     others = [
         f"{len(summary['protect'])} protégée(s)",
         f"{len(summary['skip'] - summary['protect'])} ignorée(s)",
@@ -2362,6 +2951,8 @@ def print_summary(summary, execute):
     ]
     if summary["sold"] or summary["unsold"]:
         others.insert(0, f"ventes passées : {summary['sold']} vendue(s), {summary['unsold']} invendue(s)")
+    if summary["won"] or summary["lost"]:
+        others.insert(0, f"achats : {summary['won']} gagné(s), {summary['lost']} perdu(s)")
     if summary["up_to_date"]:
         others.insert(0, f"{len(summary['up_to_date'])} déjà à jour")
     if summary["read_error"]:

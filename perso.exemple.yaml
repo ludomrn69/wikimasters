@@ -14,6 +14,16 @@
 # discard:
 #   unknown_rarities: ["C", "PC"]
 
+# Boosters ouverts au début de « tout » (sinon : commande « boosters ») :
+# packs:
+#   in_tout: true
+
+# Achats aux enchères (commande « acheter », ou « tout --loop ») : mise à 20 s de la fin, jamais au-dessus
+# du prix moyen. L'étiquette « tag » protège les cartes gagnées : ajoutez-la aussi à protection.tags.
+# buy:
+#   keywords: ["lyon"]
+#   tag: "lyon"
+
 # Notifications Telegram à la fin de chaque passage :
 #   jeton du bot : @BotFather sur Telegram ; votre chat_id : @userinfobot.
 # telegram:

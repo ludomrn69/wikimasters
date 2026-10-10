@@ -4,7 +4,8 @@ Ce script trie automatiquement les cartes de **votre** compte [WikiMasters](http
 
 - il lit le prix moyen de vente de chaque carte et lui pose une **étiquette de prix** (`defausse`, `+5`, `+10`, `+100`, `+500`, `+1000`, ou `inconnu` si la carte ne s'est jamais vendue) ;
 - il **met aux enchères** les cartes qui valent 5 wikicoins ou plus, et relance moins cher celles qui ne trouvent pas preneur ;
-- il **défausse** les cartes qui valent moins de 5, ainsi que les cartes jamais vendues de rareté C, PC ou R (une défausse rapporte 1 wikicoin).
+- il **défausse** les cartes qui valent moins de 5, ainsi que les cartes jamais vendues de rareté C, PC ou R (une défausse rapporte 1 wikicoin) ;
+- sur demande, il **ouvre vos boosters** et **achète aux enchères** les cartes qui vous intéressent (mots-clés), en misant à la dernière seconde sans dépasser leur prix moyen (voir [Boosters et achats](#boosters-et-achats-aux-enchères)).
 
 Il ne touche **jamais** aux cartes protégées : étiquette `garder` ou `favori`, étoile, shiny, rareté SR ou L, échange en cours.
 
@@ -51,10 +52,12 @@ Le premier passage est long : le script lit le prix de chaque carte, avec une pa
 | `./wm analyser` | Pose les étiquettes de prix |
 | `./wm vendre` | Met des cartes aux enchères (5 en même temps au plus, c'est la limite du site) |
 | `./wm defausser` | Défausse les cartes `defausse` et les `inconnu` de rareté C, PC ou R |
+| `./wm boosters` | Ouvre les boosters disponibles |
+| `./wm acheter` | Mise à la dernière seconde sur les enchères du marché qui correspondent à vos mots-clés |
 | `./wm login` | Ajoute un compte, ou le reconnecte |
 | `./wm comptes` | Liste vos comptes enregistrés |
 
-Options, à ajouter à `tout`, `analyser`, `vendre` ou `defausser` :
+Options, à ajouter à `tout`, `analyser`, `vendre`, `defausser`, `boosters` ou `acheter` :
 
 | Option | Effet |
 |---|---|
@@ -65,6 +68,8 @@ Options, à ajouter à `tout`, `analyser`, `vendre` ou `defausser` :
 | `--verbose` | Tout afficher, y compris les cartes protégées. |
 
 ## Ce que fait `tout`, étape par étape
+
+**0. Avant le tri** (seulement si vous les avez activés) : `tout` ouvre les boosters disponibles (`packs.in_tout: true`), puis pose l'étiquette de protection sur les cartes gagnées aux enchères depuis le passage précédent.
 
 **1. Analyser.** Chaque carte non protégée reçoit l'étiquette de sa tranche de prix moyen :
 
@@ -85,6 +90,42 @@ Si le prix d'une carte change de tranche, l'ancienne étiquette est remplacée.
 **3. Défausser.** Par lots de 10 cartes : le prix des 10 cartes est relu sur le site, puis elles sont défaussées, et ainsi de suite. Une carte qui vaut maintenant 5 ou plus est épargnée. Le script fait au plus 200 défausses par passage ; la suite au passage suivant. Le site répond lentement (environ 7 secondes par prix) : comptez environ 40 minutes pour 200 défausses.
 
 **Pour garder une carte**, ajoutez-lui l'étiquette `garder` sur le site. Retirer `defausse` ne suffit pas : le passage suivant la remettrait.
+
+## Boosters et achats aux enchères
+
+Ces deux fonctions sont désactivées par défaut. Activez-les dans `perso.yaml` :
+
+```yaml
+packs:
+  in_tout: true          # « tout » ouvre d'abord les boosters disponibles
+
+buy:
+  keywords: ["lyon"]     # cartes dont le titre ou la catégorie contient « lyon »
+  tag: "lyon"            # étiquette posée sur les cartes gagnées (doit être dans protection.tags)
+
+protection:
+  tags: ["lyon"]
+```
+
+**Boosters.** `./wm boosters --execute` ouvre les boosters disponibles, 10 au plus, espacés d'environ 12 secondes. Si le site demande la vérification anti-robot, le script s'arrête et attend 1 h avant de réessayer (puis 2 h, 4 h…). Passez la vérification à la main sur le site pour reprendre plus tôt.
+
+**Achats.** Toutes les 5 minutes, le script cherche sur le marché les annonces qui se terminent bientôt et dont le titre ou la catégorie contient un mot commençant par un de vos mots-clés (« lyon » trouve « lyonnais » ou « To-Lyon », pas « Elyon »). Pour chacune :
+
+- il ignore les cartes que vous avez déjà, celles déjà trop chères, et celles qui ne se sont jamais vendues (prix inconnu), sauf avec `buy.buy_unknown: true` ;
+- **20 secondes avant la fin**, il mise le minimum accepté par le site (mise actuelle + 10 %, + 1) ;
+- **6 secondes avant la fin**, il revérifie : si quelqu'un l'a dépassé, il remise, toujours sous le plafond ;
+- le plafond est le **prix moyen** de la carte multiplié par `buy.price_factor` (1 par défaut, 5 pour aller jusqu'à 5 fois le prix moyen), et `buy.max_price` peut ajouter une limite absolue. Avec `price_factor: null`, il n'y a plus de plafond lié au prix ;
+- une carte gagnée reçoit l'étiquette `buy.tag` au passage suivant, avant toute analyse : elle n'est donc jamais revendue ni défaussée.
+
+Pour miser à la seconde près, le script doit tourner en continu :
+
+```bash
+./wm tout --execute --loop     # tri + achats entre deux passages (le plus simple)
+./wm acheter --execute --loop  # achats seulement
+./wm acheter                   # simulation : montre sur quoi il miserait, sans miser
+```
+
+Sans `--loop`, `acheter` suit les enchères qui se terminent dans les 10 prochaines minutes, puis s'arrête. `tout` sans `--loop` n'achète rien. Les mises et les achats sont suivis dans `comptes/<nom>/achats.json`.
 
 ## Connexion
 
@@ -161,7 +202,7 @@ Le jeton ne va **jamais** dans `config.yaml` : le script refuse de démarrer s'i
 
 ## Le journal
 
-Chaque action réelle est inscrite dans **`journal.csv`** (date, compte, carte, prix, résultat, solde), qui s'ouvre directement dans Excel ou Numbers. Les ventes terminées y apparaissent avec leur prix final. Si le fichier est ouvert dans Excel pendant un passage, les nouvelles lignes vont dans `journal_secours.csv` et sont recopiées au passage suivant.
+Chaque action réelle est inscrite dans **`journal.csv`** (date, compte, carte, prix, résultat, solde), qui s'ouvre directement dans Excel ou Numbers. Les ventes terminées y apparaissent avec leur prix final, les cartes obtenues dans un booster avec l'action `booster`, les mises sur le marché avec `mise` et les enchères gagnées avec `achat`. Si le fichier est ouvert dans Excel pendant un passage, les nouvelles lignes vont dans `journal_secours.csv` et sont recopiées au passage suivant.
 
 ## Garde-fous
 
@@ -175,6 +216,8 @@ Chaque action réelle est inscrite dans **`journal.csv`** (date, compte, carte, 
 - Les mises en vente sont espacées de 45 secondes (`safety.auction_delay_seconds`) : enchaînées en quelques secondes, elles déclenchent la vérification anti-robot du site.
 - Si le site demande une vérification anti-robot, le script n'insiste pas : ce type d'action attend, le reste continue.
 - Si le serveur du site peine, le script attend, réessaie et ralentit. Une défausse ou une vente n'est renvoyée que si le serveur n'a certainement rien fait.
+- Une mise sur le marché ne dépasse jamais le prix moyen de la carte × `buy.price_factor` (ni `buy.max_price`). Le script mise toujours le minimum accepté, 20 s puis 6 s avant la fin.
+- Une carte gagnée aux enchères reçoit son étiquette de protection avant d'être analysée : le script ne revend pas ce qu'il vient d'acheter.
 - Un résumé s'affiche toujours à la fin, même après une interruption.
 
 ## À savoir
