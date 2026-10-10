@@ -154,6 +154,8 @@ Faites `./wm login` une fois par compte : chacun a son dossier dans `comptes/`, 
 
 Deux comptes peuvent tourner en même temps, dans deux terminaux. Ils sollicitent alors deux fois plus le site : si les erreurs 503 ou 525 reviennent souvent, faites-les tourner l'un après l'autre.
 
+S'ils font tous les deux des achats, ils se partagent les annonces : le premier qui repère une enchère la suit, l'autre la laisse (« suivie par votre compte … »). Ils ne misent donc jamais l'un contre l'autre. Ce partage passe par `comptes/achats_en_cours.json` : les comptes doivent tourner sur le même ordinateur. Une simulation ne réserve rien.
+
 ## Vos réglages : `perso.yaml`
 
 `config.yaml` contient les règles communes : ne le modifiez pas, sinon vos changements entreraient en conflit avec les mises à jour. Mettez vos réglages dans **`perso.yaml`** : copiez `perso.exemple.yaml` sous ce nom, puis décommentez ce que vous voulez changer. Il suffit d'y écrire ce qui change ; tout le reste vient de `config.yaml`. `perso.yaml` n'est jamais envoyé sur GitHub.

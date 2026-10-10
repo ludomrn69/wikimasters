@@ -92,6 +92,8 @@ MAX_SCAN_PAGES = 5
 PERSO_FILE = "perso.yaml"
 # Un dossier par compte : session, suivi des ventes, verrou.
 ACCOUNTS_DIR = "comptes"
+# Dans ACCOUNTS_DIR : enchère du marché -> compte qui la suit, pour que vos comptes ne misent pas l'un contre l'autre.
+CLAIMS_FILE = "achats_en_cours.json"
 # Commande affichée dans les messages : le lanceur (./wm ou wm) la précise.
 CMD = os.environ.get("WM_CMD") or "python wikimasters.py"
 
@@ -1595,6 +1597,87 @@ class RunLock:
             self.held = False
 
 
+class BuyClaims:
+    """comptes/achats_en_cours.json : quel compte suit chaque enchère du marché.
+
+    Vos comptes lancés en même temps repèrent les mêmes annonces et miseraient tous à la même seconde, avant de voir
+    qu'un autre est en tête. Le premier qui repère une annonce la réserve, les autres la laissent. Une réservation
+    tient tant que le passage qui l'a prise tourne encore (au plus 1 h après la fin prévue de l'enchère).
+    """
+
+    KEEP_AFTER_END = 3600
+    LOCK_WAIT = 5  # secondes d'attente au plus du fichier, que l'autre compte tient un instant
+    STALE_LOCK = 30  # verrou plus vieux : laissé par un passage planté, on le reprend
+
+    def __init__(self, path, account):
+        self.path = pathlib.Path(path)
+        self.lock = self.path.with_name(f".{self.path.stem}.lock")
+        self.account = account
+
+    def holder(self, auction_id, end_at, take):
+        """L'autre compte qui suit déjà cette enchère, ou None. take : la réserver pour ce compte si elle est libre."""
+        if not self._acquire():
+            return None  # fichier inaccessible : chaque compte décide seul
+        try:
+            now = time.time()
+            claims = {a: e for a, e in self._read().items() if self._alive(e, now)}
+            other = (claims.get(auction_id) or {}).get("account")
+            if other and other != self.account:
+                return other
+            if take:
+                claims[auction_id] = {"account": self.account, "pid": os.getpid(), "end_at": end_at}
+                self._write(claims)
+            return None
+        finally:
+            try:
+                os.unlink(self.lock)
+            except OSError:
+                pass
+
+    def _alive(self, entry, now):
+        return isinstance(entry, dict) and _is_number(entry.get("end_at")) \
+            and now < entry["end_at"] + self.KEEP_AFTER_END and isinstance(entry.get("pid"), int) \
+            and pid_alive(entry["pid"])
+
+    def _acquire(self):
+        deadline = time.time() + self.LOCK_WAIT
+        while True:
+            try:
+                os.close(os.open(self.lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+                return True
+            except FileExistsError:
+                try:
+                    if time.time() - self.lock.stat().st_mtime > self.STALE_LOCK:
+                        os.unlink(self.lock)
+                        continue
+                except OSError:
+                    continue  # verrou retiré entre-temps : on réessaie
+            except OSError as e:
+                print(f"Attention : {self.path.name} inaccessible ({type(e).__name__}) : "
+                      "vos comptes peuvent miser sur la même enchère.")
+                return False
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def _read(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write(self, claims):
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.stem}.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(claims, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            print(f"Attention : {self.path.name} non enregistré ({type(e).__name__}) : "
+                  "vos comptes peuvent miser sur la même enchère.")
+
+
 @dataclass
 class Offer:
     """Mise en vente prévue : mise de départ, numéro d'essai et enchère invendue qu'elle relance."""
@@ -2218,14 +2301,16 @@ class Sniper:
     quelques secondes avant la fin, sans jamais dépasser le plafond (prix moyen de la carte × buy.price_factor).
 
     Tout se fait pendant les pauses (client.waiter) : celle de --loop entre deux passages, et celles entre deux
-    requêtes d'un passage. Une seule requête à la fois et une seule session, donc rien à partager entre processus.
+    requêtes d'un passage. Une seule requête à la fois et une seule session, donc rien à partager entre processus,
+    sauf avec vos autres comptes : chaque annonce n'est suivie que par l'un d'eux (BuyClaims).
     """
 
-    def __init__(self, ctx, one_shot=False, mine=None):
+    def __init__(self, ctx, one_shot=False, mine=None, claims=None):
         self.ctx, self.client, self.buy = ctx, ctx.client, ctx.cfg["buy"]
         self.one_shot = one_shot  # sans --loop : « acheter » attend la fin des enchères repérées, puis s'arrête
         # Vos autres comptes enregistrés (id -> nom) : on ne surenchérit pas sur eux et on n'achète pas leurs annonces.
         self.mine = {k: v for k, v in (mine or {}).items() if k != self.client.user_id}
+        self.claims = claims  # BuyClaims : une annonce n'est suivie que par un de vos comptes
         self.targets = {}  # auction_id -> Target
         self.ignored = {}  # auction_id -> fin : annonces écartées pour de bon (trop chère, déjà possédée…)
         self.results = {}  # auction_id -> moment de lire le résultat d'une enchère où le script a misé
@@ -2364,6 +2449,8 @@ class Sniper:
         reason, value, ceiling, read = self._reject(auction, info, card), None, None, 0
         quiet = bool(reason)
         if not reason:
+            reason = self._taken(aid, end, take=False)  # suivie par un autre compte : prix même pas lu
+        if not reason:
             cached = self.ctx.cache.get(card)
             if cached is not PriceCache.MISSING:
                 value = cached
@@ -2383,6 +2470,10 @@ class Sniper:
                 reason = "mise actuelle illisible"
             elif ceiling is not None and need > ceiling:
                 reason = f"mise minimale {need} > plafond {ceiling}"
+            else:
+                # Réservée pour ce compte, sauf si un autre l'a prise entre-temps. Pas en simulation : elle
+                # priverait d'achats un compte qui tourne pour de vrai.
+                reason = self._taken(aid, end, take=self.ctx.execute)
         if reason:
             self.ignored[aid] = end
             if self.ctx.verbose or not quiet:
@@ -2414,6 +2505,11 @@ class Sniper:
         if not any(re.search(r"(?<!\w)" + re.escape(norm(k)), text) for k in self.buy["keywords"]):
             return "mot-clé absent du titre et de la catégorie"
         return None
+
+    def _taken(self, aid, end, take):
+        """Raison de laisser l'annonce si un autre de vos comptes la suit déjà, sinon None."""
+        holder = self.claims.holder(aid, end, take) if self.claims else None
+        return f"suivie par votre compte {holder}" if holder else None
 
     def _value(self, card):
         try:
@@ -2864,7 +2960,9 @@ def main():
         sys.exit(f"buy.keywords est vide : rien à chercher sur le marché. Ajoutez vos mots-clés dans {PERSO_FILE}, "
                  "ex. buy: { keywords: [\"lyon\"], tag: \"lyon\" } (voir README).")
     if keywords and (args.command == "acheter" or (args.command == "tout" and args.loop)):
-        ctx.sniper = Sniper(ctx, one_shot=not args.loop, mine=account_user_ids(args.config))
+        mine = account_user_ids(args.config)
+        claims = BuyClaims(config_path(args.config, ACCOUNTS_DIR) / CLAIMS_FILE, folder.name) if len(mine) > 1 else None
+        ctx.sniper = Sniper(ctx, one_shot=not args.loop, mine=mine, claims=claims)
         client.waiter = ctx.sniper.wait
     mode = "EXÉCUTION RÉELLE" if args.execute else "SIMULATION (rien n'est modifié, ajoutez --execute pour agir)"
     lock = RunLock(folder / ".wikimasters.lock")

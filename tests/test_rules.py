@@ -1872,13 +1872,25 @@ class MarketTest(MainHarness, unittest.TestCase):
         output, code = self.run_market("acheter", execute=True)
         self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
 
-    def test_buy_never_outbids_your_other_account(self):
+    def add_other_account(self):
+        """Deuxième compte enregistré, « second » : retourne son identifiant sur le site."""
         other = make_session()
         other_id = "00000000-0000-4000-8000-000000000002"
         claims = {"sub": other_id, "exp": int(time.time()) + 3600, "user_metadata": {"username": "second"}}
         other["access_token"] = f"{b64({'alg': 'HS256'})}.{b64(claims)}.sig"
         (self.dir / "comptes" / "second").mkdir()
         w.SessionStore(self.dir / "comptes" / "second" / "session.json").save(other)
+        return other_id
+
+    def claims_file(self):
+        return self.dir / "comptes" / w.CLAIMS_FILE
+
+    def claim(self, aid, account, pid):
+        end = w.parse_time(self.market.auctions[aid]["end_at"])
+        self.claims_file().write_text(json.dumps({aid: {"account": account, "pid": pid, "end_at": end}}))
+
+    def test_buy_never_outbids_your_other_account(self):
+        other_id = self.add_other_account()
         m = self.market
         m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
         m.add("mk-S", "Gare de Lyon", 300, current=None, value=20, seller_id=other_id)
@@ -1887,6 +1899,42 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual(m.bids, [])
         self.assertIn("votre compte second est en tête", output)
+
+    def test_auction_followed_by_your_other_account_is_left_to_it(self):
+        # Deux comptes lancés ensemble repèrent les mêmes annonces : sans partage, ils miseraient à la même seconde.
+        self.add_other_account()
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.add("mk-B", "Place Bellecour (Lyon)", 300, current=10, value=20)
+        self.claim("mk-A", "second", os.getpid())  # passage du compte second en cours
+        output, code = self.run_market("acheter", execute=True, args=["--compte", "testeur"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-B", 12)])
+        self.assertIn("Rue Émile-Zola (Lyon) [R] valeur=? : suivie par votre compte second", output)
+        self.assertEqual(m.site.gets("card-mk-A"), [])  # prix même pas lu
+        claims = json.loads(self.claims_file().read_text())
+        self.assertEqual({aid: e["account"] for aid, e in claims.items()}, {"mk-A": "second", "mk-B": "testeur"})
+
+    def test_auction_of_a_stopped_run_of_your_other_account_is_taken_over(self):
+        self.add_other_account()
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        stopped = subprocess.Popen([sys.executable, "-c", ""])
+        stopped.wait()
+        self.claim("mk-A", "second", stopped.pid)
+        output, code = self.run_market("acheter", execute=True, args=["--compte", "testeur"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
+        self.assertEqual(json.loads(self.claims_file().read_text())["mk-A"]["account"], "testeur")
+
+    def test_dry_run_reserves_nothing_for_your_other_accounts(self):
+        # Une simulation ne doit pas priver d'achats l'autre compte, qui tourne peut-être pour de vrai.
+        self.add_other_account()
+        self.market.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        output, code = self.run_market("acheter", args=["--compte", "testeur"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("-> MISE 12", output)
+        self.assertFalse(self.claims_file().exists())
 
     def test_buy_dry_run_bids_nothing(self):
         self.standard_market()
