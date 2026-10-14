@@ -23,6 +23,11 @@
 # buy:
 #   keywords: ["lyon"]
 #   tag: "lyon"
+#   accounts: ["moncompte"]   # seuls ces comptes achètent (noms : ./wm comptes) ; sinon tous
+
+# Pas de mise en vente la nuit (config.yaml : de 23:00 à 08:00). null = vendre à toute heure.
+# sell:
+#   night: { start: "00:00", end: "07:00" }
 
 # Notifications Telegram à la fin de chaque passage :
 #   jeton du bot : @BotFather sur Telegram ; votre chat_id : @userinfobot.

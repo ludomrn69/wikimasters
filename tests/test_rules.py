@@ -289,6 +289,17 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(w.tag_changes(self.card(name="Gare de Lyon"), 3, cfg), (["garder", "info"], []))
         self.assertEqual(w.tag_changes(self.card(name="Paris"), 3, cfg), (["defausse", "info"], []))
 
+    def test_night_window_may_cross_midnight(self):
+        def at(hour, minute, night):
+            return w.at_night(time.mktime((2026, 10, 14, hour, minute, 0, 0, 0, -1)), night)
+
+        across = {"start": "23:00", "end": "08:00"}
+        self.assertEqual([at(h, m, across) for h, m in ((22, 59), (23, 0), (0, 0), (7, 59), (8, 0), (12, 0))],
+                         [False, True, True, True, False, False])
+        early = {"start": "1:30", "end": "06:00"}
+        self.assertEqual([at(h, m, early) for h, m in ((1, 29), (1, 30), (5, 59), (6, 0))], [False, True, True, False])
+        self.assertFalse(at(2, 0, None))
+
     def test_round_is_half_up_and_nan_is_unknown(self):
         sell = dict(self.cfg["sell"], rounding="round", price_factor=0.25)
         self.assertEqual((w.start_price(10, sell), w.start_price(14, sell)), (3, 4))  # 2,5 → 3 ; 3,5 → 4
@@ -408,6 +419,20 @@ class ConfigTest(unittest.TestCase):
         self.assert_rejected(lambda c: c["display"].update(verbeux=True), "display.verbeux")
         self.assert_rejected(lambda c: c["safety"].update(pause=2), "safety.pause : clé inconnue")
 
+    def test_night_and_buying_accounts_are_checked(self):
+        night = lambda value: lambda c: c["sell"].update(night=value)  # noqa: E731
+        self.assert_rejected(night({"start": 1380, "end": "08:00"}), "entre guillemets")  # 23:00 sans guillemets
+        self.assert_rejected(night({"start": "25:00", "end": "08:00"}), "sell.night.start")
+        self.assert_rejected(night({"start": "23:00"}), "sell.night.end")
+        self.assert_rejected(night({"debut": "23:00", "end": "08:00"}), "sell.night.debut : clé inconnue")
+        self.assert_rejected(night({"start": "8:00", "end": "08:00"}), "différents")
+        self.assert_rejected(night("23:00-08:00"), "sell.night")
+        self.assert_rejected(lambda c: c["buy"].update(accounts=[]), "buy.accounts")
+        self.assert_rejected(lambda c: c["buy"].update(accounts="moi"), "buy.accounts")
+        cfg = load_cfg()
+        cfg["sell"]["night"], cfg["buy"]["accounts"] = {"start": "23:00", "end": "8:00"}, ["moi"]
+        w.check_config(cfg)
+
     def test_unknown_rarities_need_the_unknown_tag_and_unprotected_rarities(self):
         self.assert_rejected(lambda c: c["discard"].update(unknown_rarities=["C"]), "unknown_tag")
         self.assert_rejected(lambda c: (c["price_tags"].update(unknown_tag="inconnu"),
@@ -472,8 +497,10 @@ class SessionStoreTest(unittest.TestCase):
 
 class ReadSecretTest(unittest.TestCase):
     def test_reads_piped_stdin(self):
-        with mock.patch("sys.stdin", io.StringIO("abc\n")):
+        prompt = io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO("abc\n")), redirect_stderr(prompt):
             self.assertEqual(w.read_secret("x"), "abc\n")
+        self.assertEqual(prompt.getvalue(), "x")  # invite sur stderr : la sortie reste propre
 
     @unittest.skipUnless(hasattr(os, "openpty"), "pas de pseudo-terminal")
     def test_reads_more_than_1024_chars_from_a_terminal(self):
@@ -531,6 +558,7 @@ class MainHarness:
             mock.patch("time.sleep", side_effect=sleep),
             mock.patch.object(w, "keep_awake"),
             redirect_stdout(out),
+            redirect_stderr(io.StringIO()),  # invite « Cookie : » de login
         ]
         if clock:
             patches.append(mock.patch("time.time", side_effect=clock))
@@ -658,6 +686,26 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         site = standard_site(tags={HOTEL: ["defausse"]})
         self.run_main(site, "defausser", execute=True, mutate=lambda c: (
             c["price_tags"].update(unknown_tag="inconnu"), c["discard"].update(unknown_rarities=["R"])))
+        self.assertEqual(site.discards(), [HOTEL])
+
+    def test_unknown_card_sold_since_is_kept_when_max_value_is_null(self):
+        # « inconnu » : jamais vendue lors de l'analyse. Elle a maintenant un prix : sans discard.max_value pour
+        # vérifier qu'il est bas, elle n'est pas défaussée (elle vaut peut-être très cher).
+        hotel = load("collection.json")["collection"][4]["card_id"]
+
+        def rule(max_value):
+            return lambda c: (c["price_tags"].update(unknown_tag="inconnu"),
+                              c["discard"].update(unknown_rarities=["R"], max_value=max_value))
+
+        site = standard_site(tags={HOTEL: ["inconnu"]})
+        site.values[hotel] = 800
+        output, _ = self.run_main(site, "defausser", execute=True, mutate=rule(None))
+        self.assertEqual(site.discards(), [])
+        self.assertIn("valeur=800 : n'est plus « jamais vendue » (relancez analyser)", output)
+
+        site = standard_site(tags={HOTEL: ["inconnu"]})
+        site.values[hotel] = 3
+        self.run_main(site, "defausser", execute=True, mutate=rule(10))  # 3 < 10 : défaussée, comme « defausse »
         self.assertEqual(site.discards(), [HOTEL])
 
     def test_everything_discards_defausse_and_unknown_cards_in_first_pass(self):
@@ -885,6 +933,52 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertEqual(site.sells(), [])
         self.assertEqual(json.loads((self.acc / "ventes.json").read_text())["auctions"], {})
 
+    # --- nuit ---
+
+    NIGHT = {"start": "23:00", "end": "08:00"}
+
+    @staticmethod
+    def clock_at(hour, minute=0):
+        clock = Clock()
+        clock.now = time.mktime((2026, 10, 14, hour, minute, 0, 0, 0, -1))
+        return clock
+
+    def test_nothing_is_listed_at_night_but_sales_are_settled_and_discards_go_on(self):
+        site = standard_site(tags=SORTED)
+        (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"auction-104": {
+            "copy_id": AMPHIBIA, "name": "Amphibia", "price": 45, "attempt": 1, "status": "open"}}}))
+        site.auctions["auction-104"] = {"status": "settled", "winner_id": "x", "final_price": 70}
+        site.pages[0]["collection"] = [i for i in site.pages[0]["collection"] if i["id"] != AMPHIBIA]
+        output, code = self.run_main(site, "tout", execute=True, clock=self.clock_at(2), mutate=lambda c: (
+            c["sell"].update(night=self.NIGHT), c["discard"].update(require_existing_tag=False)))
+        self.assertEqual((code, site.sells()), (0, []))
+        self.assertIn("VENDUE    Amphibia", output)  # le bilan des ventes continue
+        self.assertEqual(site.discards(), [CHACANA])
+        self.assertIn("nuit (23:00-08:00) : aucune mise en vente avant 08:00\n", output)
+        self.assertIn("nuit : aucune mise en vente avant 08:00", output.split("Résumé")[-1])
+
+    def test_no_auction_may_end_at_night(self):
+        night = lambda c: c["sell"].update(night=self.NIGHT)  # noqa: E731
+        site = standard_site(tags=SORTED)
+        output, _ = self.run_main(site, "vendre", execute=True, mutate=night, clock=self.clock_at(22, 45))
+        self.assertEqual(site.sells(), [])
+        self.assertIn("(une enchère lancée maintenant finirait à 23:15)", output)
+        for hour, minute in ((22, 15), (8, 0)):
+            (self.acc / "ventes.json").unlink(missing_ok=True)
+            site = standard_site(tags=SORTED)
+            output, _ = self.run_main(site, "vendre", execute=True, mutate=night, clock=self.clock_at(hour, minute))
+            self.assertEqual(site.sells(), [AMPHIBIA, FACE], (hour, minute))
+            self.assertNotIn("nuit", output)
+
+    def test_sleep_of_the_computer_is_reported_at_the_end_of_the_pass(self):
+        site = standard_site()
+        telegram = {"telegram": {"bot_token": "1:x", "chat_id": 1, "notify_on_dry_run": True}}
+        with mock.patch.object(w, "SLEEPS", [(time.time() - 3600, time.time() + 60)]):
+            output, code = self.run_main(site, "analyser", perso=telegram)
+        self.assertEqual(code, 0)
+        self.assertIn("Attention : l'ordinateur s'est mis en veille (1 h 01 en tout", output)
+        self.assertIn("branché, capot ouvert", site.telegram[-1][1]["text"])
+
     def test_relist_price_is_capped_and_always_lower(self):
         sell = load_cfg()["sell"]
         self.assertEqual(w.relist_price(750, 12, sell), 9)          # plafonnée à la mise normale au prix actuel
@@ -940,7 +1034,10 @@ class EndToEndTest(MainHarness, unittest.TestCase):
     def test_old_journal_format_is_set_aside(self):
         old = self.dir / "j.csv"
         old.write_text("date,ancien\n1,2\n", encoding="utf-8")
-        w.Journal(old, ";", True, "moi", "vendre").write("enchere", name="x")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            w.Journal(old, ";", True, "moi", "vendre").write("enchere", name="x")
+        self.assertIn("ancien format mis de côté", out.getvalue())
         self.assertTrue(any(p.name.startswith("j-ancien-") for p in self.dir.iterdir()))
         self.assertTrue(old.read_text(encoding="utf-8-sig").startswith(";".join(w.JOURNAL_FIELDS)))
 
@@ -983,6 +1080,16 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertIn("VENDUE", output)
         self.assertEqual((self.acc / "ventes.json").read_text(), before)
         self.assertEqual(self.read_journal(), journal_before)  # rien n'est journalisé en dry-run
+
+    def test_unreadable_sales_file_is_left_untouched_by_a_dry_run(self):
+        sales = self.acc / "ventes.json"
+        sales.write_text("{oops", encoding="utf-8")
+        output, _ = self.run_main(standard_site(tags=SORTED), "vendre")
+        self.assertIn("ventes.json illisible, ignoré", output)
+        self.assertEqual(sales.read_text(encoding="utf-8"), "{oops")
+        self.assertFalse((self.acc / "ventes.json.illisible").exists())
+        self.run_main(standard_site(tags=SORTED), "vendre", execute=True)
+        self.assertEqual((self.acc / "ventes.json.illisible").read_text(encoding="utf-8"), "{oops")  # gardé à part
 
     # --- boucle, verrou, --fresh et Telegram ---
 
@@ -1114,7 +1221,13 @@ class EndToEndTest(MainHarness, unittest.TestCase):
 
         site = standard_site(tags=SORTED)
         site.overrides[("GET", "/api/marketplace/mine")] = FakeResponse(200, {})  # réponse inattendue du site
-        with self.assertRaises(KeyError):
+        output, code = self.run_main(site, "vendre", execute=True)
+        self.assertEqual(code, 1)
+        self.assertIn("ARRÊT : places d'enchère illisibles", output)  # arrêt propre, pas un plantage
+        self.assertIn("Arrêt :", site.telegram[-1][1]["text"])
+
+        site = standard_site(tags=SORTED)
+        with mock.patch.object(w, "plan_sell", side_effect=KeyError("bug")), self.assertRaises(KeyError):
             self.run_main(site, "vendre", execute=True)
         self.assertIn("Plantage", site.telegram[-1][1]["text"])
         self.assertIn("KeyError", site.telegram[-1][1]["text"])
@@ -1317,6 +1430,14 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         full = {"collection": [dict(data["collection"][4], id=f"c{n}") for n in range(w.PAGE_SIZE)]}
         output, _ = self.run_main(FakeSite([full, full], {}), "analyser")
         self.assertIn("la pagination n'avance pas", output)
+
+    def test_unexpected_collection_response_stops_cleanly(self):
+        site = standard_site()
+        site.overrides[("GET", "/api/my-collection")] = FakeResponse(200, {"collection": "?"})
+        output, code = self.run_main(site, "tout", execute=True)
+        self.assertEqual(code, 1)
+        self.assertIn("ARRÊT : réponse inattendue sur /api/my-collection", output)
+        self.assertEqual(site.mutations(), [])
 
     def test_duplicate_copy_on_same_page_is_acted_on_once(self):
         site = standard_site(tags={CHACANA: ["defausse"]})
@@ -1613,9 +1734,10 @@ class Market:
         self.rivals = []  # (moment, id, montant) : mises d'un autre joueur
         self.packs, self.pack_replies = 0, []
         self.search_replies = []  # réponses imposées à la recherche, avant les annonces
-        self.bid_replies = []  # réponses imposées aux mises
+        self.bid_replies = []  # réponses imposées aux mises, dans l'ordre (None : mise acceptée normalement)
         self.price_latency = 0  # secondes que met le site à répondre à une lecture de prix
         self.checks = []  # (moment, id) de chaque lecture d'une annonce
+        self.unreadable = set()  # annonces qui répondent 404 une fois terminées
         self.extend = 0  # prolongation (s) d'une enchère après une mise dans ses dernières secondes, comme le site
 
     def add(self, aid, title, end_in, current=None, value=None, category="", rarity="R", **extra):
@@ -1674,9 +1796,12 @@ class Market:
             auction = self.auctions[m.group(1)]
             if not m.group(2):
                 self.checks.append((self.clock.now, m.group(1)))
+                if m.group(1) in self.unreadable and self.clock.now >= w.parse_time(auction["end_at"]):
+                    return FakeResponse(404, {"error": "Enchère introuvable"})
                 return FakeResponse(200, {"auction": copy.deepcopy(auction), "bids": []})
-            if self.bid_replies:
-                return self.bid_replies.pop(0)
+            reply = self.bid_replies.pop(0) if self.bid_replies else None
+            if reply is not None:
+                return reply
             self.bids.append((self.clock.now, m.group(1), body["amount"]))
             self._lands(auction, body["amount"], USER_ID)
             return FakeResponse(200, {"auction_id": m.group(1), "current_bid": body["amount"],
@@ -1927,6 +2052,51 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
         self.assertEqual(json.loads(self.claims_file().read_text())["mk-A"]["account"], "testeur")
 
+    def test_account_left_out_of_buy_accounts_never_bids_but_reads_its_pending_bids(self):
+        self.add_other_account()
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 100, current=12, value=20)
+        m.auctions["mk-A"]["current_bidder_id"] = USER_ID  # mise posée avant que ce compte n'achète plus
+        m.add("mk-B", "Place Bellecour (Lyon)", 150, current=10, value=20)
+        (self.acc / "achats.json").write_text(json.dumps({"auctions": {"mk-A": {
+            "card_id": "card-mk-A", "name": "Rue Émile-Zola (Lyon)", "rarity": "R", "value": 20, "price": 12,
+            "end_at": w.parse_time(m.auctions["mk-A"]["end_at"]), "status": "bid"}}}), encoding="utf-8")
+        start = self.clock.now
+
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock.now - start > 400:
+                raise KeyboardInterrupt
+
+        def mutate(cfg):
+            cfg["buy"].update(keywords=["lyon"], tag="lyon", accounts=["Second"])
+        output, code = self.run_main(m, "tout", execute=True, mutate=mutate, clock=self.clock, sleep=sleep,
+                                     args=["--loop", "2", "--compte", "testeur"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("Achats aux enchères : pas sur ce compte (buy.accounts : second)", output)
+        self.assertEqual(m.bids, [])
+        searches = [u for method, u, *_ in m.site.calls if method == "GET" and u.endswith("/api/marketplace")]
+        self.assertEqual(searches, [])  # marché jamais lu
+        self.assertIn("ACHETÉE   Rue Émile-Zola (Lyon) [R] pour 12", output)
+        self.assertEqual(self.purchases()["mk-A"]["status"], "won")  # buy.tag la protégera
+
+        output, code = self.run_main(m, "acheter", execute=True, mutate=mutate, args=["--compte", "testeur"])
+        self.assertIn("Le compte testeur n'achète pas", str(code))
+        output, code = self.run_main(m, "tout", mutate=lambda c: (mutate(c), c["buy"].update(accounts=["secnod"])),
+                                     args=["--compte", "testeur"])
+        self.assertIn("buy.accounts : compte(s) inconnu(s) secnod", str(code))
+
+    def test_unreadable_auction_after_its_end_does_not_block_the_bot(self):
+        # Relue en boucle, une enchère finie qui ne répond plus figeait tout le script (attente jamais terminée).
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.unreadable.add("mk-A")
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
+        self.assertIn("Rue Émile-Zola (Lyon) [R] : aucun résultat depuis 2 jours, suivi abandonné", output)
+        self.assertEqual(self.purchases(), {})
+
     def test_dry_run_reserves_nothing_for_your_other_accounts(self):
         # Une simulation ne doit pas priver d'achats l'autre compte, qui tourne peut-être pour de vrai.
         self.add_other_account()
@@ -2024,6 +2194,110 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertNotIn(CHACANA, self.market.site.discards())  # sans l'étiquette, elle aurait été défaussée
         self.assertEqual(self.purchases(), {})
 
+    def test_card_whose_bid_result_is_unknown_is_never_sold_or_discarded(self):
+        # Enchère finie pendant que le script ne tournait pas : sans son résultat, la carte gagnée arrivait sans
+        # buy.tag et « tout » la défaussait (Chacana vaut 5, tranche « defausse »).
+        chacana = load("collection.json")["collection"][1]["card_id"]
+
+        def mutate(cfg):
+            cfg["buy"].update(keywords=["lyon"], tag="lyon")
+            cfg["discard"]["require_existing_tag"] = False  # comme config.yaml : défausse dès ce passage
+
+        def won_by_us(ended):
+            self.market.add("mk-Z", "Chacana", -ended, current=4)
+            self.market.auctions["mk-Z"].update(card_id=chacana, current_bidder_id=USER_ID)
+            (self.acc / "achats.json").write_text(json.dumps({"auctions": {"mk-Z": {
+                "card_id": chacana, "name": "Chacana", "rarity": "R", "value": 5, "price": 4,
+                "end_at": self.clock.now - ended, "status": "bid"}}}), encoding="utf-8")
+
+        won_by_us(ended=100)  # réglée par le site : le résultat est lu avant le tri
+        output, code = self.run_main(self.market, "tout", execute=True, mutate=mutate, clock=self.clock,
+                                     sleep=self.sleep)
+        self.assertEqual(code, 0, output)
+        self.assertLess(output.index("ACHETÉE   Chacana [R] pour 4"), output.index("== Cartes achetées"))
+        self.assertIn((CHACANA, LYON_TAG), self.market.site.tag_links())
+        self.assertNotIn(CHACANA, self.market.site.discards())
+        self.assertEqual(self.purchases(), {})
+
+        self.setUp()
+        won_by_us(ended=10)  # pas encore réglée : la carte attend son résultat
+        output, code = self.run_main(self.market, "tout", execute=True, mutate=mutate, clock=self.clock,
+                                     sleep=self.sleep)
+        self.assertEqual(code, 0, output)
+        self.assertIn("résultat pas encore connu, laissée(s) de côté : Chacana.", output)
+        self.assertNotIn(CHACANA, self.market.site.discards())
+        self.assertEqual([link for link in self.market.site.tag_links() if link[0] == CHACANA], [])
+
+    def test_results_are_still_read_during_an_antibot_pause_on_bids(self):
+        # Pendant la pause, plus aucune mise, mais le résultat des mises posées est lu : sinon la carte gagnée
+        # n'aurait pas buy.tag et serait triée (vendue, défaussée) par les passages suivants.
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 100, current=10, value=20)
+        m.add("mk-B", "Olympique lyonnais", 105, current=10, value=20)
+        m.bid_replies = [None, FakeResponse(403, self.ANTIBOT)]  # la 2e mise demande une vérification
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
+        self.assertEqual(len([u for _, u, *_ in m.site.calls if u.endswith("/bid")]), 2)  # on n'insiste pas
+        self.assertIn("achats en pause jusqu'à", output)
+        self.assertIn("ACHETÉE   Rue Émile-Zola (Lyon) [R] pour 12", output)
+        self.assertEqual(self.purchases()["mk-A"]["status"], "won")
+
+    def test_bid_refused_because_of_a_simultaneous_bid_is_raised_at_once(self):
+        # Vu le 12/10/2026 : « Mise trop basse (minimum 43) » à 6 s de la fin, puis enchère perdue sous le plafond.
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        too_low = {"error": "Mise trop basse (minimum 15 wikibidous)", "code": "bid_too_low", "min": 15}
+        m.bid_replies = [FakeResponse(409, too_low)]
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 15)])
+        self.assertIn("dépassé à l'instant : nouvelle mise à 15", output)
+        self.assertIn("ACHETÉE   Rue Émile-Zola (Lyon) [R] pour 15", output)
+        self.assertIn("0 échec(s)", output)
+
+        self.setUp()
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.bid_replies = [FakeResponse(409, dict(too_low, min=21))]  # plafond : 20
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(m.bids, [])
+        self.assertIn("mise minimale 21 > plafond 20, on laisse", output)
+        self.assertEqual(len([u for _, u, *_ in m.site.calls if u.endswith("/bid")]), 1)
+
+    def test_server_outage_during_the_pass_does_not_make_a_bid_late(self):
+        # Les nouvelles tentatives d'une lecture de prix (2, 10, 30, 60 s) se faisaient sans miser : enchère manquée.
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 40, current=10, value=20)
+        down = FakeResponse(503, {"error": "Service Unavailable"})
+        m.site.overrides[("GET", "/sales")] = [None, down, down, down, down, None]  # 2e prix : 4 échecs
+        end, start = w.parse_time(m.auctions["mk-A"]["end_at"]), self.clock.now
+
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock.now - start > 400:
+                raise KeyboardInterrupt
+
+        def mutate(cfg):
+            cfg["buy"].update(keywords=["lyon"], tag="lyon")
+            cfg["safety"]["read_delay_seconds"] = 1
+        output, _ = self.run_main(m, "tout", execute=True, mutate=mutate, clock=self.clock, sleep=sleep,
+                                  args=["--loop", "2"])
+        self.assertIn("erreur 503 sur GET /api/marketplace/cards/", output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
+        self.assertTrue(end - 20 <= m.bids[0][0] < end - w.LAST_CHECK_SECONDS, m.bids[0][0] - end)
+
+    def test_buying_does_not_insist_on_a_failing_server(self):
+        # Une lecture du marché ou une mise n'attend pas 2, 10, 30… s : les autres enchères suivies passeraient.
+        self.standard_market()
+        self.market.search_replies = [FakeResponse(503, {"error": "Service Unavailable"})] * 6
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        searches = [u for method, u, *_ in self.market.site.calls if method == "GET" and u.endswith("/api/marketplace")]
+        self.assertEqual(len(searches), 3)  # un essai et deux nouvelles tentatives, après 1 s puis 3 s
+        self.assertIn("nouvel essai dans 1 s", output)
+        self.assertIn("nouvel essai dans 3 s", output)
+
     def test_tout_without_loop_does_not_buy(self):
         self.standard_market()
         output, code = self.run_market("tout")
@@ -2050,6 +2324,26 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertTrue(end - 20 <= m.bids[0][0] < end - w.LAST_CHECK_SECONDS)
         self.assertIn("ACHETÉE", output)
         self.assertIn("1 mise(s) sur le marché", output)
+
+
+class SleepWatchTest(unittest.TestCase):
+    def test_a_pause_that_lasts_hours_is_a_sleep_of_the_computer(self):
+        clock, naps = Clock(), []
+
+        def sleep(seconds):
+            naps.append(seconds)
+            clock.now += seconds + (3 * 3600 + 600 if len(naps) == 2 else 0)  # 2e pause : 3 h 10 de veille
+            if len(naps) == 4:
+                raise InterruptedError
+
+        with mock.patch.object(w, "SLEEPS", []), mock.patch("time.time", side_effect=clock), \
+                mock.patch("time.sleep", side_effect=sleep):
+            with self.assertRaises(InterruptedError):
+                w.watch_sleep()
+            self.assertEqual(len(w.SLEEPS), 1)
+            start, end = w.SLEEPS[0]
+            self.assertIn("mis en veille (3 h 10 en tout", w.sleep_warning(start - 1))
+            self.assertIsNone(w.sleep_warning(end))  # déjà signalée
 
 
 class PtyMixin:
@@ -2154,6 +2448,22 @@ class SessionRobustnessTest(unittest.TestCase):
             client.auction_slots()
         # Une seule demande de renouvellement malgré l'horloge décalée (pas de boucle).
         self.assertEqual(len([c for c in site.calls if "/auth/" in c[1]]), 1)
+
+    def test_session_renewed_by_another_run_of_the_account_is_reused(self):
+        # Une simulation lancée pendant un --execute renouvelle la session et l'enregistre : renouveler encore
+        # l'ancienne (jeton de renouvellement déjà utilisé) ferait révoquer la session par Supabase.
+        site = standard_site()
+        client = w.WikiMastersClient(self.site_cfg, self.store, session=make_session(exp_offset=60))
+        self.store.save(make_session(refresh="r7"))  # renouvelée par l'autre passage, valable 1 h
+        with mock.patch("requests.Session.request", side_effect=site), mock.patch("time.sleep"):
+            client.auction_slots()
+        self.assertEqual((site.refreshes, client.session["refresh_token"]), (0, "r7"))
+
+        self.store.save(make_session(exp_offset=30, refresh="vieille"))  # expire avant la nôtre : ignorée
+        client = w.WikiMastersClient(self.site_cfg, self.store, session=make_session(exp_offset=60))
+        with mock.patch("requests.Session.request", side_effect=site), mock.patch("time.sleep"):
+            client.auction_slots()
+        self.assertEqual((site.refreshes, client.session["refresh_token"]), (1, "r1"))
 
 
 if __name__ == "__main__":

@@ -76,7 +76,8 @@ auto_tags: []
 # ----------------------------------------------------------------------------
 discard:
   tags: ["defausse"]      # défausse les cartes portant une de ces étiquettes (posées par analyser ou à la main)
-  max_value: 5            # garde-fou : ne défausse jamais une carte dont le prix moyen actuel est >= 5 (null = pas de vérification)
+  max_value: 5            # garde-fou : ne défausse jamais une carte dont le prix moyen actuel est >= 5 (null = pas de vérification ;
+                          # une carte « inconnu » qui s'est vendue depuis n'est alors jamais défaussée)
   unknown_rarities: ["C", "PC", "R"]  # cartes jamais vendues (étiquette « inconnu ») défaussées aussi, pour ces
                                       # raretés ([] = jamais). SR et L sont protégées (protection.rarities).
   max_per_run: 200        # au plus N défausses par passage (la suite au passage suivant)
@@ -99,6 +100,10 @@ sell:
   min_value: 5            # garde-fou : ne vend jamais une carte dont le prix moyen est < 5 (null = pas de vérification)
   fresh_price: false      # true = relire le prix sur le site avant de vendre (sinon : cache de price.cache_hours)
   require_existing_tag: false  # true = ne vendre que les cartes déjà étiquetées au début du passage
+  # La nuit, presque personne n'achète : entre ces deux heures (celles de l'ordinateur), aucune mise en vente ni
+  # relance, et aucune enchère lancée avant ne s'y termine. Boosters, défausses et achats continuent.
+  # Heures entre guillemets ; null = vendre à toute heure.
+  night: { start: "23:00", end: "08:00" }
   # Relance des invendus : une carte revenue sans acheteur est remise en vente moins cher.
   relist:
     enabled: true
@@ -120,7 +125,8 @@ packs:
 # Achats aux enchères (commande « acheter », ou pendant « tout --loop » si keywords n'est pas vide).
 # Le script repère sur le marché les annonces dont le titre ou la catégorie contient un mot-clé, puis mise
 # le minimum quand il reste snipe_seconds secondes, sans jamais dépasser le prix moyen de la carte.
-# Il revérifie quelques secondes avant la fin et remise si quelqu'un l'a dépassé (toujours sous le plafond).
+# Il revérifie quelques secondes avant la fin et remise si quelqu'un l'a dépassé, aussitôt si sa mise est refusée
+# parce qu'un autre joueur vient de miser, et suit l'enchère quand le site la prolonge (toujours sous le plafond).
 # ----------------------------------------------------------------------------
 buy:
   keywords: []            # mots cherchés sur le marché, ex. ["lyon"] ([] = aucun achat), en début de mot :
@@ -133,6 +139,8 @@ buy:
   skip_owned: true        # ignorer les cartes déjà dans votre collection
   snipe_seconds: 20       # mise quand il reste N secondes (10 au moins)
   scan_minutes: 5         # le marché est relu toutes les N minutes
+  accounts: null          # comptes qui achètent, ex. ["moncompte"] (noms : ./wm comptes) ; les autres n'achètent
+                          # rien. null = tous vos comptes
 
 # ----------------------------------------------------------------------------
 # Garde-fous et rythme.

@@ -100,6 +100,7 @@ sell:
   min_value: 10           # garde-fou : ne vend jamais une carte dont le prix moyen est < 10 (null = pas de vérification)
   fresh_price: false      # true = relire le prix sur le site avant de vendre (sinon : cache de price.cache_hours)
   require_existing_tag: false  # true = ne vendre que les cartes déjà étiquetées au début du passage
+  night: null             # vendre à toute heure (les tests de la nuit fixent leurs heures)
   # Relance des invendus : une carte revenue sans acheteur est remise en vente moins cher.
   relist:
     enabled: true
@@ -134,6 +135,7 @@ buy:
   skip_owned: true        # ignorer les cartes déjà dans votre collection
   snipe_seconds: 20       # mise quand il reste N secondes (10 au moins)
   scan_minutes: 5         # le marché est relu toutes les N minutes
+  accounts: null          # tous les comptes achètent
 
 # ----------------------------------------------------------------------------
 # Garde-fous et rythme.

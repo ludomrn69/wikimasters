@@ -3,7 +3,7 @@
 Ce script trie automatiquement les cartes de **votre** compte [WikiMasters](https://www.wiki-masters.com) :
 
 - il lit le prix moyen de vente de chaque carte et lui pose une **étiquette de prix** (`defausse`, `+5`, `+10`, `+100`, `+500`, `+1000`, ou `inconnu` si la carte ne s'est jamais vendue) ;
-- il **met aux enchères** les cartes qui valent 5 wikicoins ou plus, et relance moins cher celles qui ne trouvent pas preneur ;
+- il **met aux enchères** les cartes qui valent 5 wikicoins ou plus, et relance moins cher celles qui ne trouvent pas preneur, sauf la nuit (de 23 h à 8 h), quand presque personne n'achète ;
 - il **défausse** les cartes qui valent moins de 5, ainsi que les cartes jamais vendues de rareté C, PC ou R (une défausse rapporte 1 wikicoin) ;
 - sur demande, il **ouvre vos boosters** et **achète aux enchères** les cartes qui vous intéressent (mots-clés), en misant à la dernière seconde sans dépasser leur prix moyen (voir [Boosters et achats](#boosters-et-achats-aux-enchères)).
 
@@ -42,7 +42,9 @@ Sous Windows, remplacez `./wm` par `.\wm` dans PowerShell (ou `wm` dans l'invite
 
 Commencez **toujours** par une simulation pour vérifier ce que le script compte faire : une défausse est définitive.
 
-Le premier passage est long : le script lit le prix de chaque carte, avec une pause d'environ 2 secondes entre deux lectures (compter environ 2 h pour 3000 cartes). Les prix sont ensuite gardés 24 h, donc les passages suivants vont beaucoup plus vite. Le script empêche l'ordinateur de se mettre en veille pendant qu'il tourne.
+Le premier passage est long : le script lit le prix de chaque carte, avec une pause d'environ 2 secondes entre deux lectures (compter environ 2 h pour 3000 cartes). Les prix sont ensuite gardés 24 h, donc les passages suivants vont beaucoup plus vite.
+
+Le script empêche l'ordinateur de se mettre en veille tout seul, mais **pas quand on ferme le capot sur batterie, ni quand la batterie se vide** : l'ordinateur s'endort, et le script reste figé jusqu'au réveil (ni boosters, ni ventes, ni défausses, ni achats). Pour le laisser tourner la nuit, **branchez l'ordinateur et laissez le capot ouvert** (l'écran peut s'éteindre). Si une veille a eu lieu, le résumé du passage (et Telegram) le signale.
 
 ## Les commandes
 
@@ -87,6 +89,13 @@ Si le prix d'une carte change de tranche, l'ancienne étiquette est remplacée.
 
 **2. Vendre.** Le script fait d'abord le bilan des enchères précédentes (vendue ou invendue). Il relance ensuite les invendus à 80 % de la mise précédente (3 essais au plus), puis remplit les places libres avec des cartes tirées au hasard, à 75 % de leur prix moyen, pour 30 minutes.
 
+**La nuit, il ne vend rien.** De 23 h à 8 h (heure de l'ordinateur), il ne met aucune carte en vente et ne relance aucun invendu, et il ne lance pas d'enchère qui se terminerait dans ce créneau (donc plus rien après 22 h 30 avec des enchères de 30 minutes). Il continue d'ouvrir les boosters, de poser les étiquettes, de défausser et d'acheter. Pour changer les heures, dans `perso.yaml` :
+
+```yaml
+sell:
+  night: { start: "00:00", end: "07:00" }   # heures entre guillemets ; null = vendre à toute heure
+```
+
 **3. Défausser.** Par lots de 10 cartes : le prix des 10 cartes est relu sur le site, puis elles sont défaussées, et ainsi de suite. Une carte qui vaut maintenant 5 ou plus est épargnée. Le script fait au plus 200 défausses par passage ; la suite au passage suivant. Le site répond lentement (environ 7 secondes par prix) : comptez environ 40 minutes pour 200 défausses.
 
 **Pour garder une carte**, ajoutez-lui l'étiquette `garder` sur le site. Retirer `defausse` ne suffit pas : le passage suivant la remettrait.
@@ -114,8 +123,10 @@ protection:
 - il ignore les cartes que vous avez déjà, celles déjà trop chères, et celles qui ne se sont jamais vendues (prix inconnu), sauf avec `buy.buy_unknown: true` ;
 - **20 secondes avant la fin**, il mise le minimum accepté par le site (mise actuelle + 10 %, + 1) ;
 - **6 secondes avant la fin**, il revérifie : si quelqu'un l'a dépassé, il remise, toujours sous le plafond ;
+- si sa mise est refusée parce qu'un autre joueur vient de miser au même instant (« Mise trop basse »), il remise **aussitôt** le nouveau minimum donné par le site (2 fois au plus), toujours sous le plafond ;
+- une mise de dernière minute fait prolonger l'enchère par le site : le script la suit jusqu'à sa vraie fin, et remise à chaque fois que quelqu'un le dépasse ;
 - le plafond est le **prix moyen** de la carte multiplié par `buy.price_factor` (1 par défaut, 5 pour aller jusqu'à 5 fois le prix moyen), et `buy.max_price` peut ajouter une limite absolue. Avec `price_factor: null`, il n'y a plus de plafond lié au prix ;
-- une carte gagnée reçoit l'étiquette `buy.tag` au passage suivant, avant toute analyse : elle n'est donc jamais revendue ni défaussée.
+- une carte gagnée reçoit l'étiquette `buy.tag` au passage suivant, avant toute analyse : elle n'est donc jamais revendue ni défaussée. Tant que le résultat d'une mise n'est pas connu, la carte n'est pas touchée. Ce résultat est lu au début de chaque passage `--execute` (même sans `--loop`), et même pendant une pause anti-robot des achats.
 
 Pour miser à la seconde près, le script doit tourner en continu :
 
@@ -125,7 +136,14 @@ Pour miser à la seconde près, le script doit tourner en continu :
 ./wm acheter                   # simulation : montre sur quoi il miserait, sans miser
 ```
 
-Sans `--loop`, `acheter` suit les enchères qui se terminent dans les 10 prochaines minutes, puis s'arrête. `tout` sans `--loop` n'achète rien. Les mises et les achats sont suivis dans `comptes/<nom>/achats.json`.
+Sans `--loop`, `acheter` suit les enchères qui se terminent dans les 10 prochaines minutes, puis s'arrête. `tout` sans `--loop` n'achète rien (il lit seulement le résultat des mises déjà posées). Les mises et les achats sont suivis dans `comptes/<nom>/achats.json`.
+
+**Un seul compte acheteur.** Avec plusieurs comptes, `buy.accounts` choisit ceux qui achètent ; les autres ne lisent même pas le marché (leurs mises déjà posées sont quand même suivies jusqu'au résultat, pour protéger une carte gagnée) :
+
+```yaml
+buy:
+  accounts: ["moncompte"]   # noms affichés par ./wm comptes ; sans cette ligne, tous vos comptes achètent
+```
 
 ## Connexion
 
@@ -154,7 +172,7 @@ Faites `./wm login` une fois par compte : chacun a son dossier dans `comptes/`, 
 
 Deux comptes peuvent tourner en même temps, dans deux terminaux. Ils sollicitent alors deux fois plus le site : si les erreurs 503 ou 525 reviennent souvent, faites-les tourner l'un après l'autre.
 
-S'ils font tous les deux des achats, ils se partagent les annonces : le premier qui repère une enchère la suit, l'autre la laisse (« suivie par votre compte … »). Ils ne misent donc jamais l'un contre l'autre. Ce partage passe par `comptes/achats_en_cours.json` : les comptes doivent tourner sur le même ordinateur. Une simulation ne réserve rien.
+Pour qu'un seul d'entre eux achète, voir `buy.accounts` dans [Boosters et achats](#boosters-et-achats-aux-enchères). S'ils font tous les deux des achats, ils se partagent les annonces : le premier qui repère une enchère la suit, l'autre la laisse (« suivie par votre compte … »). Ils ne misent donc jamais l'un contre l'autre. Ce partage passe par `comptes/achats_en_cours.json` : les comptes doivent tourner sur le même ordinateur. Une simulation ne réserve rien.
 
 ## Vos réglages : `perso.yaml`
 
@@ -201,6 +219,8 @@ Le jeton ne va **jamais** dans `config.yaml` : le script refuse de démarrer s'i
 | `nouvel essai dans … s` | Le site ne répond pas ou est surchargé (erreurs 503, 525, délai dépassé). Le script attend, réessaie tout seul et ralentit un moment. Rien à faire. |
 | `le site demande une vérification anti-robot` | Le site soupçonne un robot. Le script met ce type d'action en pause (1 h, puis 2 h, 4 h, 8 h si le site insiste) et continue le reste. Pour reprendre plus tôt : ouvrez le site avec ce compte, faites l'action à la main (passez la vérification si elle s'affiche), puis relancez le script. |
 | `permission denied: ./wm` | Lancez `sh wm login`, ou une fois `chmod +x wm`. |
+| `l'ordinateur s'est mis en veille` | Le script était figé pendant la veille (capot fermé sur batterie, batterie vide) : rien n'a été fait pendant ce temps. Branchez l'ordinateur et laissez le capot ouvert. |
+| `Le compte … n'achète pas` ou `buy.accounts : compte(s) inconnu(s)` | Ce compte n'est pas dans `buy.accounts`, ou un nom y est mal écrit : comparez avec `./wm comptes`. |
 
 ## Le journal
 
@@ -210,16 +230,19 @@ Chaque action réelle est inscrite dans **`journal.csv`** (date, compte, carte, 
 
 - Chaque commande est une simulation tant que vous n'ajoutez pas `--execute`.
 - Le prix d'une carte est relu sur le site juste avant de la défausser.
+- Une carte « inconnu » (jamais vendue) qui a trouvé preneur depuis n'est défaussée que si son prix reste sous `discard.max_value` ; avec `max_value: null`, elle est gardée.
 - Une carte qui porte à la fois une étiquette de vente et `defausse` est laissée de côté.
 - Une ligne de la collection qui regroupe plusieurs exemplaires (×2, ×3…) n'est jamais touchée.
 - Une carte déjà en vente n'est pas remise en vente. Une enchère que vous annulez vous-même n'est pas relancée.
 - Deux passages `--execute` ne peuvent pas tourner en même temps sur le même compte.
 - Le script fait une pause entre chaque action et chaque lecture, et il s'arrête après plusieurs échecs d'affilée.
+- Aucune mise en vente la nuit (`sell.night`, de 23 h à 8 h), et aucune enchère ne s'y termine.
 - Les mises en vente sont espacées de 45 secondes (`safety.auction_delay_seconds`) : enchaînées en quelques secondes, elles déclenchent la vérification anti-robot du site.
 - Si le site demande une vérification anti-robot, le script n'insiste pas : ce type d'action attend, le reste continue.
-- Si le serveur du site peine, le script attend, réessaie et ralentit. Une défausse ou une vente n'est renvoyée que si le serveur n'a certainement rien fait.
-- Une mise sur le marché ne dépasse jamais le prix moyen de la carte × `buy.price_factor` (ni `buy.max_price`). Le script mise toujours le minimum accepté, 20 s puis 6 s avant la fin.
-- Une carte gagnée aux enchères reçoit son étiquette de protection avant d'être analysée : le script ne revend pas ce qu'il vient d'acheter.
+- Si le serveur du site peine, le script attend, réessaie et ralentit. Une défausse ou une vente n'est renvoyée que si le serveur n'a certainement rien fait. Pendant ces attentes, les achats continuent de miser ; une mise, elle, n'attend que quelques secondes.
+- Une mise sur le marché ne dépasse jamais le prix moyen de la carte × `buy.price_factor` (ni `buy.max_price`). Le script mise toujours le minimum accepté, 20 s puis 6 s avant la fin, et aussitôt si sa mise est refusée parce qu'un autre joueur vient de miser.
+- Une carte gagnée aux enchères reçoit son étiquette de protection avant d'être analysée, et une carte dont le résultat n'est pas encore connu n'est pas touchée : le script ne revend pas ce qu'il vient d'acheter.
+- Une simulation lancée pendant qu'un `--execute` tourne sur le même compte reprend la session qu'il a renouvelée, au lieu de la renouveler une seconde fois (ce qui la ferait révoquer).
 - Un résumé s'affiche toujours à la fin, même après une interruption.
 
 ## À savoir

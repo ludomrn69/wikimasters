@@ -57,6 +57,9 @@ COOKIE_CHUNK_SIZE = 3180
 GET_RETRY_DELAYS = (2, 10, 30, 60, 90)
 # Nouvelles tentatives pour une écriture (étiquette, défausse, vente) : ~4 min de panne du serveur tolérée.
 WRITE_RETRY_DELAYS = (10, 30, 60, 120)
+# Requêtes des achats : quelques secondes de nouvelles tentatives au plus. Une mise ne peut pas attendre, et une
+# lecture ratée (marché, résultat) est simplement refaite au tour suivant.
+QUICK_RETRY_DELAYS = (1, 3)
 # Réponses qui garantissent que le serveur n'a rien fait : même une défausse ou une vente peut être renvoyée.
 # (429 trop de requêtes, 503 indisponible, 521/522/523/525 Cloudflare n'a pas pu joindre le serveur.)
 NOT_PROCESSED = {429, 503, 521, 522, 523, 525}
@@ -78,6 +81,9 @@ COMMANDS = ("tout", "analyser", "vendre", "defausser", "boosters", "acheter")
 # Achats : après la mise de buy.snipe_seconds, dernière vérification de l'enchère quand il reste ce nombre de
 # secondes (pour répondre à une surenchère de dernière minute).
 LAST_CHECK_SECONDS = 6
+# Mise refusée parce qu'un autre joueur vient de miser (409 « Mise trop basse », avec le nouveau minimum) : ce minimum
+# est remisé aussitôt, toujours sous le plafond, au plus ce nombre de fois de suite.
+TOO_LOW_RETRIES = 2
 # Une mise tardive fait prolonger l'enchère par le site (+60 s, vu le 10/10/2026) : l'enchère suivie est revue
 # ce nombre de secondes après sa fin prévue ; prolongée, tout recommence (mise, vérification) avant la nouvelle fin.
 AFTER_END_SECONDS = 3
@@ -102,14 +108,20 @@ def cmd(args):
     return f"{CMD} {args}"
 
 
+def as_dict(data):
+    """Réponse du site attendue sous forme de dictionnaire : {} si elle est vide ou d'une autre forme."""
+    return data if isinstance(data, dict) else {}
+
+
 class ApiError(Exception):
     """Erreur d'API. fatal=True arrête le passage, sinon seule l'action en cours est abandonnée."""
 
-    def __init__(self, message, fatal=False, status=None, code=None):
+    def __init__(self, message, fatal=False, status=None, code=None, body=None):
         super().__init__(message)
         self.fatal = fatal
         self.status = status
         self.code = code  # code d'erreur renvoyé par le site ou Supabase (ex. "23505")
+        self.body = as_dict(body)  # réponse JSON du site (ex. {"code": "bid_too_low", "min": 43})
 
     @property
     def antibot(self):
@@ -388,7 +400,7 @@ def check_config(cfg):
 
     sell = section("sell", ("tags", "order", "price_factor", "rounding", "min_start_price", "max_start_price",
                             "duration_minutes", "max_auctions", "min_value", "fresh_price", "require_existing_tag",
-                            "relist"))
+                            "relist", "night"))
     sell_tags = str_list(sell, "sell", "tags", allow_empty=False)
     number(sell, "sell", "price_factor", 0, strict=True)
     choice(sell, "sell", "rounding", ["floor", "round", "ceil"])
@@ -417,6 +429,17 @@ def check_config(cfg):
             err("sell.relist.factor doit être <= 1 (une relance ne se fait pas plus cher)")
         number(relist, "sell.relist", "min_start_price", 1, integer=True)
         number(relist, "sell.relist", "max_attempts", 1, integer=True)
+    night = sell.get("night")
+    if night is not None and not isinstance(night, dict):
+        err("sell.night doit valoir { start: \"23:00\", end: \"08:00\" } (ou null)")
+    elif night is not None:
+        unknown_keys(night, "sell.night", ("start", "end"))
+        for key in ("start", "end"):
+            if clock_minutes(night.get(key)) is None:
+                err(f"sell.night.{key} doit être une heure entre guillemets, ex. \"23:00\"")
+        if clock_minutes(night.get("start")) is not None \
+                and clock_minutes(night.get("start")) == clock_minutes(night.get("end")):
+            err("sell.night : start et end doivent être différents")
 
     packs = section("packs", ("in_tout", "max_per_run", "delay_seconds"))
     boolean(packs, "packs", "in_tout")
@@ -424,8 +447,10 @@ def check_config(cfg):
     number(packs, "packs", "delay_seconds", 0)
 
     buy = section("buy", ("keywords", "tag", "price_factor", "max_price", "buy_unknown", "skip_owned",
-                          "snipe_seconds", "scan_minutes"))
+                          "snipe_seconds", "scan_minutes", "accounts"))
     keywords = str_list(buy, "buy", "keywords")
+    if buy.get("accounts") is not None:
+        str_list(buy, "buy", "accounts", allow_empty=False)
     number(buy, "buy", "price_factor", 0, strict=True, allow_none=True)
     number(buy, "buy", "max_price", 1, integer=True, allow_none=True)
     boolean(buy, "buy", "buy_unknown")
@@ -600,6 +625,14 @@ class SessionStore:
         except (OSError, json.JSONDecodeError):
             sys.exit(f"{self.path} est illisible : relancez « {cmd('login')} ».")
         return data.get("session") if isinstance(data, dict) else None
+
+    def peek(self):
+        """Session enregistrée, ou None si le fichier est absent ou illisible (sans arrêter le script)."""
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return as_dict(data).get("session")
 
     def save(self, session):
         """Écriture atomique, droits 600 dès la création, données forcées sur le disque.
@@ -885,6 +918,21 @@ def parse_time(text):
     return stamp + (float("0." + fraction) if fraction else 0.0)
 
 
+def clock_minutes(text):
+    """Heure de la config (ex. "23:00") en minutes depuis minuit, ou None si ce n'est pas une heure."""
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", text.strip()) if isinstance(text, str) else None
+    return int(m[1]) * 60 + int(m[2]) if m else None
+
+
+def at_night(timestamp, night):
+    """Ce moment tombe-t-il dans la nuit de sell.night (heure de l'ordinateur) ? La nuit peut passer minuit."""
+    if not night:
+        return False
+    t = time.localtime(timestamp)
+    now, start, end = t.tm_hour * 60 + t.tm_min, clock_minutes(night["start"]), clock_minutes(night["end"])
+    return start <= now < end if start < end else now >= start or now < end
+
+
 def next_bid(auction):
     """Mise minimale acceptée : la mise de départ s'il n'y a pas encore de mise, sinon la mise actuelle + 10 %
     (arrondi à l'inférieur) + 1, comme le propose le site (relevé dans un HAR : 5 → 6, 27 → 30, 100 → 111)."""
@@ -914,13 +962,12 @@ def show_ceiling(ceiling):
 # --- Client HTTP ------------------------------------------------------------
 
 
-def _json_code(resp):
-    """Code d'erreur PostgreSQL renvoyé par Supabase (ex. "42501"), ou None."""
+def _json_body(resp):
+    """Réponse JSON en dictionnaire, ou {} : on y lit le code d'erreur (ex. "42501" de Supabase, "bid_too_low")."""
     try:
-        body = resp.json()
+        return as_dict(resp.json())
     except ValueError:
-        return None
-    return body.get("code") if isinstance(body, dict) else None
+        return {}
 
 
 class WikiMastersClient:
@@ -937,6 +984,7 @@ class WikiMastersClient:
         self.session_lost = None  # raison si la session ne peut plus être utilisée
         self.slowdown = 1.0  # multiplie toutes les pauses après une erreur du serveur
         self.waiter = None  # remplace time.sleep pendant les pauses : les achats misent pendant ce temps (Sniper)
+        self.quick = False  # requêtes des achats en cours : nouvelles tentatives rapides seulement (QUICK_RETRY_DELAYS)
         self.last_uncertain = False  # la dernière écriture a dû être renvoyée après une tentative peut-être effectuée
         self._tag_ids = None
         self._last_refresh = None
@@ -949,8 +997,9 @@ class WikiMastersClient:
         except (ValueError, KeyError, TypeError):
             sys.exit(f"{store.path} est invalide : relancez « {cmd('login')} ».")
 
-    def _use_session(self, session, save=True, fresh=False):
-        """Adopte une session. Elle est d'abord écrite sur le disque, puis seulement utilisée."""
+    @staticmethod
+    def _session_expiry(session, fresh=False):
+        """(claims du jeton, moment d'expiration) d'une session. ValueError, KeyError ou TypeError si inutilisable."""
         if not isinstance(session, dict) or not isinstance(session.get("refresh_token"), str):
             raise ValueError("session sans jeton de renouvellement")
         claims = jwt_claims(session["access_token"])
@@ -962,20 +1011,44 @@ class WikiMastersClient:
             deadlines.append(time.time() + session["expires_in"])
         if not deadlines:
             raise ValueError("session sans date d'expiration")
+        return claims, min(deadlines)
+
+    def _use_session(self, session, save=True, fresh=False):
+        """Adopte une session. Elle est d'abord écrite sur le disque, puis seulement utilisée."""
+        claims, expires_at = self._session_expiry(session, fresh)
         if save:
             self.store.save(session)  # SessionSaveError remonte : rien n'est adopté si l'écriture échoue
         self.session = session
         self.access_token = session["access_token"]
         self.user_id = claims["sub"]
         self.username = account_name(claims)
-        self.expires_at = min(deadlines)
+        self.expires_at = expires_at
         self.cookies = session_cookies(session, self.ref)
+
+    def _adopt_saved_session(self):
+        """Reprend la session de session.json si un autre passage de ce compte l'a renouvelée entre-temps.
+
+        Une simulation lancée pendant un --execute renouvelle la session de son côté et l'enregistre. Renouveler
+        ensuite l'ancienne, avec un jeton de renouvellement déjà utilisé, ferait révoquer la session par Supabase.
+        """
+        saved = self.store.peek()
+        if not isinstance(saved, dict) or saved.get("refresh_token") == self.session.get("refresh_token"):
+            return
+        try:
+            claims, expires_at = self._session_expiry(saved)
+        except (ValueError, KeyError, TypeError):
+            return  # illisible : on garde la nôtre
+        if claims["sub"] == self.user_id and expires_at > self.expires_at:
+            self._use_session(saved, save=False)
 
     def time_left(self):
         return self.expires_at - time.time()
 
     def refresh(self):
         """Renouvelle la session comme le fait le navigateur (jeton de renouvellement Supabase)."""
+        self._adopt_saved_session()
+        if self.time_left() >= REFRESH_MARGIN:
+            return  # déjà renouvelée par un autre passage de ce compte
         url = f"{self.supabase_url}/auth/v1/token"
         self._last_refresh = time.time()
         for attempt in range(len(REFRESH_RETRY_DELAYS) + 1):
@@ -1058,12 +1131,15 @@ class WikiMastersClient:
         Une lecture est toujours renvoyée. Une écriture ne l'est que si retry le permet :
           "idempotent" : la refaire ne change rien (étiquette déjà posée ou déjà retirée) ;
           "safe"       : seulement si le serveur n'a certainement rien fait (NOT_PROCESSED, connexion impossible).
+        Pendant les achats (self.quick), quelques secondes de nouvelles tentatives au plus.
         """
         what = f"{method} {urlparse(url).path}"
         if method == "GET":
             retry, delays = "idempotent", GET_RETRY_DELAYS
         else:
             delays = WRITE_RETRY_DELAYS if retry else ()
+        if self.quick and delays:
+            delays = QUICK_RETRY_DELAYS
         uncertain = False  # une tentative d'écriture a peut-être été effectuée par le serveur
         for attempt in range(len(delays) + 1):
             self.ensure_fresh()
@@ -1090,13 +1166,24 @@ class WikiMastersClient:
                 uncertain = uncertain or (processed and method != "GET")
                 error = self._status_error(resp, what, self._maybe_done(uncertain))
                 retryable = retry == "idempotent" or not processed
-                wait = max(wait, min(self._retry_after(resp), 300))
+                retry_after = self._retry_after(resp)
+                if self.quick and retry_after > wait:
+                    retryable = False  # le site demande d'attendre plus longtemps : les achats réessaieront plus tard
+                wait = max(wait, min(retry_after, 300))
             self.slowdown = min(MAX_SLOWDOWN, self.slowdown * 2)
             if not retryable or attempt == len(delays):
                 break
             print(f"     {problem} sur {what} : nouvel essai dans {wait:g} s…")
-            time.sleep(wait)
+            self._retry_wait(wait)
         raise error
+
+    def _retry_wait(self, seconds):
+        """Attente avant de renvoyer une requête : les achats continuent de miser pendant ce temps (sans relire le
+        marché), une panne du serveur pendant la lecture des prix ne doit pas faire manquer une fin d'enchère."""
+        if self.waiter:
+            self.waiter(seconds, scan=False)
+        else:
+            time.sleep(seconds)
 
     @staticmethod
     def _maybe_done(uncertain):
@@ -1117,13 +1204,15 @@ class WikiMastersClient:
             setting = "safety.read_delay_seconds" if what.startswith("GET") else "safety.delay_seconds"
             return ApiError(f"trop de requêtes (429) : augmentez {setting} et réessayez plus tard.{maybe_done}",
                             True, 429)
+        body = _json_body(resp) if is_json else {}
         return ApiError(f"erreur {resp.status_code} sur {what}{detail}{maybe_done}", status=resp.status_code,
-                        code=_json_code(resp) if is_json else None)
+                        code=body.get("code"), body=body)
 
     def _parse(self, resp, what, maybe_done):
         is_json = resp.headers.get("content-type", "").startswith("application/json")
         detail = f" : {resp.text[:200]}" if is_json and resp.text else ""
-        code = _json_code(resp) if is_json else None
+        body = _json_body(resp) if is_json else {}
+        code = body.get("code")
         if 300 <= resp.status_code < 400:
             raise ApiError(f"redirection {resp.status_code} sur {what} (session refusée ?)", fatal=True)
         if resp.status_code == 403 and code == ANTIBOT_CODE:
@@ -1148,7 +1237,8 @@ class WikiMastersClient:
                 status=resp.status_code,
             )
         if not resp.ok:
-            raise ApiError(f"erreur {resp.status_code} sur {what}{detail}", status=resp.status_code, code=code)
+            raise ApiError(f"erreur {resp.status_code} sur {what}{detail}", status=resp.status_code, code=code,
+                           body=body)
         if not resp.content:
             return None
         if not is_json:
@@ -1175,7 +1265,10 @@ class WikiMastersClient:
         pages, seen, warning = [], set(), None
         for page in range(MAX_PAGES):
             data = self._api("GET", "/api/my-collection", params={"sort": "rarity", "page": page, "stats": 0})
-            items = data.get("collection", [])
+            items = data.get("collection", []) if isinstance(data, dict) else None
+            if not isinstance(items, list) or not all(isinstance(i, dict) and "id" in i for i in items):
+                raise ApiError("réponse inattendue sur /api/my-collection (le site a-t-il changé ?) : rien n'est fait.",
+                               fatal=True)
             new = []
             for item in items:
                 copy_id = str(item["id"])
@@ -1207,8 +1300,11 @@ class WikiMastersClient:
         return value_from_sales(data, card)
 
     def auction_slots(self):
-        data = self._api("GET", "/api/marketplace/mine")
-        return data["maxConcurrentAuctions"] - data["sellingCount"]
+        data = as_dict(self._api("GET", "/api/marketplace/mine"))
+        most, selling = data.get("maxConcurrentAuctions"), data.get("sellingCount")
+        if not (_is_int(most) and _is_int(selling)):
+            raise ApiError("places d'enchère illisibles sur /api/marketplace/mine (le site a-t-il changé ?)", fatal=True)
+        return most - selling
 
     def discard(self, card):
         return self._api("POST", f"/api/user-cards/{card.copy_id}/discard", retry="safe")
@@ -1426,7 +1522,9 @@ class AuctionFile:
     WHAT = ""  # « suivi des … », pour les messages
     LOST = ""  # conséquence d'un enregistrement raté
 
-    def __init__(self, path):
+    def __init__(self, path, set_aside=True):
+        """set_aside : un fichier illisible est mis de côté avant d'être remplacé. Sinon (simulation, « comptes »),
+        il est seulement ignoré : rien n'est modifié sur le disque."""
         self.path = pathlib.Path(path)
         self.auctions = {}
         if not self.path.exists():
@@ -1438,6 +1536,9 @@ class AuctionFile:
                 raise ValueError
             self.auctions = {str(a): e for a, e in auctions.items() if isinstance(e, dict)}
         except (OSError, ValueError):
+            if not set_aside:
+                print(f"Attention : {self.path.name} illisible, ignoré (il sera mis de côté au prochain --execute).")
+                return
             backup = self.path.with_name(self.path.name + ".illisible")
             try:
                 os.replace(self.path, backup)
@@ -1719,8 +1820,9 @@ def new_summary():
                 "deferred", "pack", "bid", "won", "lost")
     # Ensembles d'exemplaires : une carte vue dans plusieurs phases de « tout » n'est comptée qu'une fois.
     sets = ("protect", "skip", "up_to_date", "read_error")
-    # paused : groupe d'actions -> fin de sa pause anti-robot (voir antibot_strike)
-    return {**{k: 0 for k in counters}, **{k: set() for k in sets}, "paused": {}}
+    # paused : groupe d'actions -> fin de sa pause anti-robot (voir antibot_strike) ; night : fin de la nuit sans
+    # mise en vente (sell.night), si les ventes ont été sautées pour cette raison
+    return {**{k: 0 for k in counters}, **{k: set() for k in sets}, "paused": {}, "night": None}
 
 
 def clock_time(timestamp):
@@ -1979,6 +2081,15 @@ def plan_sell(ctx, cards):
         for auction_id, entry in ctx.state.with_status(status):
             if entry.get("copy_id") not in ctx.collection_ids:
                 ctx.state.set_status(auction_id, "gone")
+    # La nuit, presque personne n'achète : ni mise en vente ni relance, et aucune enchère ne doit s'y terminer.
+    # Le bilan ci-dessus continue ; les invendus seront relancés au matin.
+    night, now = sell.get("night"), time.time()
+    ends = now + 60 * sell["duration_minutes"]
+    if at_night(now, night) or at_night(ends, night):
+        summary["night"] = night["end"]
+        late = "" if at_night(now, night) else f" (une enchère lancée maintenant finirait à {clock_time(ends)})"
+        print(f"  nuit ({night['start']}-{night['end']}) : aucune mise en vente avant {night['end']}{late}")
+        return []
     until = antibot_until(ctx, "auction")
     if until:
         print(f"  mises en vente en pause jusqu'à {clock_time(until)} : le site a demandé une vérification anti-robot")
@@ -2103,6 +2214,12 @@ def plan_discard(ctx, cards):
                 summary["skip"].add(card.copy_id)
                 print(f"  ignorée   {label(card, value)} : jamais vendue, prix inconnu (discard.unknown_rarities)")
                 continue
+            if value is not None and disc["max_value"] is None and not card.has_any_tag(disc["tags"]):
+                # Retenue seulement comme « jamais vendue », mais elle a maintenant un prix : sans discard.max_value
+                # pour vérifier qu'il est bas, elle n'est pas défaussée (elle vaut peut-être cher).
+                summary["skip"].add(card.copy_id)
+                print(f"  ignorée   {label(card, value)} : n'est plus « jamais vendue » (relancez analyser)")
+                continue
             if value is not None and disc["max_value"] is not None and value >= disc["max_value"]:
                 summary["skip"].add(card.copy_id)
                 print(f"  ignorée   {label(card, value)} : vaut maintenant {value:g} (>= {disc['max_value']:g}), "
@@ -2213,11 +2330,11 @@ class Runner:
             self._log(card, kind, arg, value, "OK")
             return "OK"
         if kind == "discard":
-            balance = (self.client.discard(card) or {}).get("balance")
+            balance = as_dict(self.client.discard(card)).get("balance")
             self._log(card, kind, arg, value, "OK", balance=balance)
             return f"OK, solde : {'?' if balance is None else balance}"
         duration = self.cfg["sell"]["duration_minutes"]
-        response = self.client.create_auction(card, arg.price, duration) or {}
+        response = as_dict(self.client.create_auction(card, arg.price, duration))
         auction_id = response.get("auction_id")
         # D'abord clore les anciens invendus de cet exemplaire : le site pourrait redonner le même identifiant.
         self.ctx.state.close_copy(card.copy_id)
@@ -2261,7 +2378,7 @@ def open_packs(ctx):
             delay = packs["delay_seconds"]
             client.pause(random.uniform(delay * 0.8, delay * 1.5))  # un rythme trop régulier ferait robot
         try:
-            data = client.open_pack() or {}
+            data = as_dict(client.open_pack())
         except ApiError as e:
             ctx.journal.write("booster", result=f"ECHEC : {e}")
             if e.fatal:
@@ -2305,9 +2422,12 @@ class Sniper:
     sauf avec vos autres comptes : chaque annonce n'est suivie que par l'un d'eux (BuyClaims).
     """
 
-    def __init__(self, ctx, one_shot=False, mine=None, claims=None):
+    def __init__(self, ctx, one_shot=False, mine=None, claims=None, market=True):
         self.ctx, self.client, self.buy = ctx, ctx.client, ctx.cfg["buy"]
         self.one_shot = one_shot  # sans --loop : « acheter » attend la fin des enchères repérées, puis s'arrête
+        # False : ce compte n'achète pas (buy.accounts). Le marché n'est jamais lu ; seul le résultat des mises déjà
+        # posées l'est, pour que buy.tag protège une carte gagnée.
+        self.market = market
         # Vos autres comptes enregistrés (id -> nom) : on ne surenchérit pas sur eux et on n'achète pas leurs annonces.
         self.mine = {k: v for k, v in (mine or {}).items() if k != self.client.user_id}
         self.claims = claims  # BuyClaims : une annonce n'est suivie que par un de vos comptes
@@ -2327,27 +2447,30 @@ class Sniper:
 
     def wait(self, seconds, scan=True):
         """Remplace time.sleep : attend `seconds` secondes en traitant les enchères qui arrivent à échéance."""
-        deadline = time.time() + seconds
+        deadline, scan = time.time() + seconds, scan and self.market
         if self.busy:
             time.sleep(seconds)
             return
         while True:
-            if self._paused():
-                time.sleep(max(0.0, deadline - time.time()))
-                return
-            self._run_due(scan)
+            # Vérification anti-robot demandée sur une mise : ni mise ni lecture du marché, mais le résultat des mises
+            # déjà posées est toujours lu (sinon une carte gagnée n'aurait pas buy.tag pour la protéger).
+            bidding = not self._paused()
+            if bidding:
+                self._run_due(scan)
+            else:
+                self.read_results()
             now = time.time()
             # Vérification imminente : on l'attend, plutôt que de laisser partir une requête qui la retarderait.
-            soon = self._next_check() <= now + CHECK_MARGIN
+            soon = bidding and self._next_check() <= now + CHECK_MARGIN
             if now >= deadline and not soon:
                 return
-            until = self._next_event(scan) if soon else min(deadline, self._next_event(scan))
-            time.sleep(max(0.0, until - now))
+            due = self._next_event(scan and bidding, checks=bidding)
+            time.sleep(max(0.0, (due if soon else min(deadline, due)) - now))
 
     def drain(self):
         """Sans --loop : attend la fin des enchères repérées, et leur résultat, sans relire le marché."""
-        while not self._paused():
-            due = self._next_event(scan=False)
+        while True:
+            due = self._next_event(scan=False, checks=not self._paused())
             if due == math.inf:
                 return
             self.wait(max(0.0, due - time.time()), scan=False)
@@ -2374,14 +2497,22 @@ class Sniper:
             time.sleep(max(0.0, due - now))
             self._checks_due()
 
-    def _next_event(self, scan):
-        times = [self._due(t) for t in self.targets.values()] + list(self.results.values())
-        return min(times + ([self.next_scan] if scan else []), default=math.inf)
+    def _next_event(self, scan, checks=True):
+        times = list(self.results.values())
+        if checks:
+            times += [self._due(t) for t in self.targets.values()]
+        if scan:
+            times.append(self.next_scan)
+        return min(times, default=math.inf)
 
     def _run_due(self, scan):
         if scan and time.time() >= self.next_scan:
             self._guarded(self.scan)
         self._checks_due()
+        self.read_results()
+
+    def read_results(self):
+        """Lit le résultat (gagnée ou perdue) des enchères où le script a misé, une fois leur heure venue."""
         for aid, at in sorted(self.results.items(), key=lambda x: x[1]):
             if at <= time.time():
                 self._guarded(self._result, aid)
@@ -2396,17 +2527,25 @@ class Sniper:
     def _guarded(self, action, *args):
         """Une erreur n'arrête pas les achats (sauf session perdue) : elle est affichée, la suite continue."""
         was_busy, self.busy = self.busy, True
+        was_quick, self.client.quick = self.client.quick, True  # une mise n'attend pas : nouvelles tentatives rapides
         try:
             action(*args)
         except ApiError as e:
             if e.antibot:
-                antibot_strike(self.ctx, "bid")
+                self._stand_down()
             elif e.fatal and self.client.session_lost:
                 raise
             else:
                 self.say(f"ÉCHEC : {e}")
         finally:
-            self.busy = was_busy
+            self.busy, self.client.quick = was_busy, was_quick
+
+    def _stand_down(self):
+        """Vérification anti-robot demandée : plus aucune mise pendant la pause. Les enchères suivies sont laissées ;
+        celles où le script a déjà misé attendent leur résultat, lu même pendant la pause."""
+        antibot_strike(self.ctx, "bid")
+        for target in list(self.targets.values()):
+            self._finish(target)
 
     # --- marché ---
 
@@ -2420,7 +2559,7 @@ class Sniper:
         for keyword in self.buy["keywords"]:
             for page in range(1, MAX_SCAN_PAGES + 1):
                 self._clear_ahead()
-                data = self.client.search_auctions(keyword, page) or {}
+                data = as_dict(self.client.search_auctions(keyword, page))
                 self.client.pause(self.ctx.cfg["safety"]["read_delay_seconds"])
                 auctions = [a for a in data.get("auctions") or [] if isinstance(a, dict)]
                 ends = [parse_time(a.get("end_at")) for a in auctions]
@@ -2525,7 +2664,14 @@ class Sniper:
         """Suivie jusqu'à sa vraie fin : une mise de dernière minute (la nôtre ou une autre) la fait prolonger."""
         stage = target.stage
         target.stage = min(stage + 1, 2)  # avancé d'abord : un échec ne la refait pas en boucle
-        data = self.client.get_auction(target.auction_id)
+        try:
+            data = self.client.get_auction(target.auction_id)
+        except ApiError:
+            if stage >= 2:
+                # Déjà finie, plus rien à miser : la relire sans fin bloquerait tout le script (attente jamais
+                # terminée). Le résultat d'une mise posée sera lu plus tard, toutes les 5 minutes.
+                self._finish(target)
+            raise
         auction = data.get("auction", data) if isinstance(data, dict) else {}
         end, now = parse_time(auction.get("end_at")) or target.end_at, time.time()
         if auction.get("status") != "active" or end <= now:
@@ -2564,21 +2710,33 @@ class Sniper:
             target.bid = amount
             ctx.summary["bid"] += 1
             return
-        try:
-            response = self.client.bid(target.auction_id, amount) or {}
-        except ApiError as e:
-            self._log(target, amount, f"ECHEC : {e}")
-            if e.fatal:
-                # Mise peut-être partie : on lira le résultat de l'enchère comme si elle l'était.
-                target.bid = amount
-                ctx.purchases.record(target, amount)
-                ctx.purchases.save()
-                raise
-            ctx.summary["error"] += 1
-            self.say(f"   ÉCHEC : {e}")
-            if e.antibot:
-                antibot_strike(ctx, "bid")
-            return
+        for attempt in range(TOO_LOW_RETRIES + 1):
+            try:
+                response = as_dict(self.client.bid(target.auction_id, amount))
+                break
+            except ApiError as e:
+                self._log(target, amount, f"ECHEC : {e}")
+                if e.fatal:
+                    # Mise peut-être partie : on lira le résultat de l'enchère comme si elle l'était.
+                    target.bid = amount
+                    ctx.purchases.record(target, amount)
+                    ctx.purchases.save()
+                    raise
+                # Un autre joueur a misé au même instant : le site refuse la mise et donne le nouveau minimum.
+                minimum = e.body.get("min") if e.code == "bid_too_low" else None
+                if _is_int(minimum) and target.ceiling is not None and minimum > target.ceiling:
+                    self.say(f"   dépassé à l'instant : mise minimale {minimum} > plafond {target.ceiling}, on laisse")
+                    self._finish(target)
+                    return
+                if _is_int(minimum) and minimum > amount and attempt < TOO_LOW_RETRIES:
+                    self.say(f"   dépassé à l'instant : nouvelle mise à {minimum}")
+                    amount = minimum
+                    continue
+                ctx.summary["error"] += 1
+                self.say(f"   ÉCHEC : {e}")
+                if e.antibot:
+                    self._stand_down()
+                return
         target.bid = amount
         ctx.purchases.record(target, amount)
         ctx.purchases.save()  # tout de suite : un plantage ne doit pas faire oublier une mise
@@ -2607,11 +2765,17 @@ class Sniper:
             self.results.pop(aid, None)
             return
         self.results[aid] = time.time() + RESULT_RETRY  # si la lecture échoue ou si l'enchère n'est pas réglée
-        data = self.client.get_auction(aid)
+        stale = time.time() - (entry.get("end_at") or 0) > STALE_AFTER
+        try:
+            data = self.client.get_auction(aid)
+        except ApiError as e:
+            if e.fatal or not stale:
+                raise
+            data = None  # illisible depuis 2 jours : suivi abandonné ci-dessous
         auction = data.get("auction", data) if isinstance(data, dict) else None
         outcome, name = classify_auction(auction), f"{entry.get('name', '')} [{entry.get('rarity', '')}]"
         if outcome is None:
-            if time.time() - (entry.get("end_at") or 0) > STALE_AFTER:
+            if stale:
                 self.say(f"?         {name} : aucun résultat depuis 2 jours, suivi abandonné")
                 purchases.set_status(aid, "gone")
                 purchases.save()
@@ -2680,6 +2844,10 @@ def run_command(ctx, command):
             ctx.sniper.drain()
     if command in ("boosters", "acheter"):
         return
+    if ctx.sniper:
+        # Résultat des mises dont l'enchère est finie, avant de lire la collection : une carte gagnée y reçoit buy.tag
+        # avant d'être triée.
+        ctx.sniper.read_results()
     cards, warning = ctx.client.list_cards()
     ctx.collection_ids = {c.copy_id for c in cards}
     ctx.on_sale = set()  # relu par le bilan à chaque passage (sinon --loop ne relancerait jamais une carte)
@@ -2695,6 +2863,14 @@ def run_command(ctx, command):
             for card in grouped:
                 print(f"  groupée   {card.name} [{card.rarity}] ×{card.count}")
         cards = [c for c in cards if c.count <= 1]
+    # Mise posée dont le résultat n'est pas encore connu : gagnée, la carte est peut-être déjà là, sans buy.tag pour la
+    # protéger. On n'y touche pas avant son résultat, sinon elle pourrait être vendue ou défaussée.
+    pending = {e.get("card_id") for _, e in ctx.purchases.with_status("bid")}
+    held = [c for c in cards if c.card_id in pending]
+    if held:
+        print(f"  {len(held)} carte(s) misée(s) aux enchères, résultat pas encore connu, laissée(s) de côté : "
+              f"{', '.join(c.name for c in held)}.")
+        cards = [c for c in cards if c.card_id not in pending]
 
     runner = Runner(ctx)
     tag = ctx.cfg["buy"]["tag"]
@@ -2797,6 +2973,22 @@ def account_user_ids(cfg_file):
     return ids
 
 
+def buying_accounts(cfg, cfg_file):
+    """Comptes enregistrés qui achètent aux enchères : ceux de buy.accounts, ou tous si null.
+
+    Un nom inconnu arrête le script : avec une faute de frappe, aucun compte n'achèterait sans rien dire.
+    """
+    accounts, wanted = known_accounts(cfg_file), cfg["buy"].get("accounts")
+    if wanted is None:
+        return accounts
+    folded = {a.casefold(): a for a in accounts}
+    unknown = [a for a in wanted if a.casefold() not in folded]
+    if unknown:
+        sys.exit(f"buy.accounts : compte(s) inconnu(s) {', '.join(unknown)} (comptes enregistrés : "
+                 f"{', '.join(accounts) or 'aucun'}). Corrigez {PERSO_FILE}.")
+    return [folded[a.casefold()] for a in wanted]
+
+
 def cmd_login(cfg, cfg_file):
     print(LOGIN_STEPS)
     raw = read_secret("Cookie : ")
@@ -2839,7 +3031,7 @@ def cmd_accounts(cfg_file):
         return
     print("Comptes :")
     for folder in folders:
-        state = SalesState(folder / "ventes.json")
+        state = SalesState(folder / "ventes.json", set_aside=False)
         session = "" if (folder / "session.json").is_file() else f"   (pas de session : « {cmd('login')} »)"
         print(f"  {folder.name:<24} {len(state.with_status('open'))} enchère(s) suivie(s){session}")
     if len(known_accounts(cfg_file)) > 1:
@@ -2847,10 +3039,13 @@ def cmd_accounts(cfg_file):
 
 
 def keep_awake():
-    """Empêche la mise en veille pendant le passage : une veille coupe le réseau et arrête le script."""
+    """Empêche la mise en veille pendant le passage : une veille coupe le réseau et fige le script.
+
+    Rien ne l'empêche quand on ferme le capot sur batterie, ni quand la batterie se vide : watch_sleep le repère.
+    """
     if sys.platform == "darwin" and shutil.which("caffeinate"):
-        try:  # caffeinate s'arrête tout seul à la fin de ce processus
-            subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())],
+        try:  # caffeinate s'arrête tout seul à la fin de ce processus ; -s : aussi la veille système, sur secteur
+            subprocess.Popen(["caffeinate", "-i", "-s", "-w", str(os.getpid())],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
@@ -2861,6 +3056,35 @@ def keep_awake():
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)  # ES_CONTINUOUS | SYSTEM_REQUIRED
         except (AttributeError, OSError):
             pass
+    threading.Thread(target=watch_sleep, daemon=True).start()
+
+
+# Mises en veille de l'ordinateur pendant que le script tournait : (début, fin). Il y était figé : ni boosters, ni
+# ventes, ni défausses, ni mises (vu du 10 au 13/10/2026 : capot fermé sur batterie, script figé presque 3 jours).
+SLEEPS = []
+SLEEP_STEP, SLEEP_GAP = 30, 300
+
+
+def watch_sleep():
+    """Fil de fond : une pause de SLEEP_STEP secondes qui dure bien plus longtemps = l'ordinateur était en veille."""
+    last = time.time()
+    while True:
+        time.sleep(SLEEP_STEP)
+        now = time.time()
+        if now - last > SLEEP_STEP + SLEEP_GAP:
+            SLEEPS.append((last, now))
+        last = now
+
+
+def sleep_warning(since):
+    """Avertissement si l'ordinateur s'est mis en veille depuis ce moment, sinon None."""
+    gaps = [(start, end) for start, end in SLEEPS if end > since]
+    if not gaps:
+        return None
+    asleep = int(sum(end - start for start, end in gaps)) // 60
+    return (f"l'ordinateur s'est mis en veille ({asleep // 60} h {asleep % 60:02d} en tout, entre "
+            f"{clock_time(gaps[0][0])} et {clock_time(gaps[-1][1])}) : le script était figé pendant ce temps "
+            "(ni boosters, ni ventes, ni défausses, ni mises). Laissez l'ordinateur branché, capot ouvert.")
 
 
 def telegram_settings(cfg):
@@ -2952,17 +3176,28 @@ def main():
         # Le journal n'enregistre que les actions réelles : rien en simulation.
         journal=Journal(config_path(args.config, journal_cfg["file"]), journal_cfg["delimiter"],
                         journal_cfg["enabled"] and args.execute, client.username, args.command),
-        state=SalesState(folder / "ventes.json"),
-        purchases=PurchaseState(folder / "achats.json"),
+        state=SalesState(folder / "ventes.json", set_aside=args.execute),
+        purchases=PurchaseState(folder / "achats.json", set_aside=args.execute),
     )
     keywords = cfg["buy"]["keywords"]
     if args.command == "acheter" and not keywords:
         sys.exit(f"buy.keywords est vide : rien à chercher sur le marché. Ajoutez vos mots-clés dans {PERSO_FILE}, "
                  "ex. buy: { keywords: [\"lyon\"], tag: \"lyon\" } (voir README).")
-    if keywords and (args.command == "acheter" or (args.command == "tout" and args.loop)):
+    buyers = buying_accounts(cfg, args.config) if keywords else []
+    buys = folder.name in buyers
+    if args.command == "acheter" and not buys:
+        sys.exit(f"Le compte {folder.name} n'achète pas : buy.accounts ({PERSO_FILE}) ne nomme que "
+                 f"{', '.join(buyers)}.")
+    sniping = bool(keywords) and (args.command == "acheter" or (args.command == "tout" and bool(args.loop)))
+    # Mises déjà posées dont le résultat reste à lire : les achats tournent aussi pour ça, sans lire le marché, pour
+    # que la carte gagnée reçoive buy.tag avant d'être triée.
+    pending = args.execute and bool(ctx.purchases.with_status("bid"))
+    if sniping or pending:
         mine = account_user_ids(args.config)
-        claims = BuyClaims(config_path(args.config, ACCOUNTS_DIR) / CLAIMS_FILE, folder.name) if len(mine) > 1 else None
-        ctx.sniper = Sniper(ctx, one_shot=not args.loop, mine=mine, claims=claims)
+        # Plusieurs comptes qui achètent : chaque annonce n'est suivie que par l'un d'eux.
+        claims = BuyClaims(config_path(args.config, ACCOUNTS_DIR) / CLAIMS_FILE, folder.name) \
+            if len(buyers) > 1 else None
+        ctx.sniper = Sniper(ctx, one_shot=not args.loop, mine=mine, claims=claims, market=buys and sniping)
         client.waiter = ctx.sniper.wait
     mode = "EXÉCUTION RÉELLE" if args.execute else "SIMULATION (rien n'est modifié, ajoutez --execute pour agir)"
     lock = RunLock(folder / ".wikimasters.lock")
@@ -2970,15 +3205,18 @@ def main():
         lock.acquire()
     keep_awake()
 
-    outcome, cycle = ("ok", None), 0
+    outcome, cycle, reported = ("ok", None), 0, time.time()
     try:
         while True:
             # Un bilan par cycle de --loop.
             cycle += 1
             ctx.journal.merge_backup()
             print(f"\n=== [{time.strftime('%H:%M:%S')}] {args.command} — {mode} — compte {client.username} ===")
-            if keywords and args.command == "tout" and not args.loop and cycle == 1:
-                print("Achats aux enchères (buy.keywords) : seulement avec --loop, ou avec la commande « acheter ».")
+            if keywords and args.command == "tout" and cycle == 1:
+                if not buys:
+                    print(f"Achats aux enchères : pas sur ce compte (buy.accounts : {', '.join(buyers)}).")
+                elif not args.loop:
+                    print("Achats aux enchères (buy.keywords) : seulement avec --loop, ou avec la commande « acheter ».")
             if args.fresh and cycle == 1:  # les cycles suivants de --loop réutilisent ces prix
                 ctx.cache.not_before = time.time()
                 print("Option --fresh : tous les prix sont relus sur le site (cache ignoré).")
@@ -3004,6 +3242,10 @@ def main():
                 raise
             finally:
                 summary_text = print_summary(ctx.summary, args.execute)
+                asleep, reported = sleep_warning(reported), time.time()
+                if asleep:
+                    print(f"Attention : {asleep}")
+                    summary_text += f"\nAttention : {asleep}"
                 if ctx.journal.lost:
                     print(f"Attention : {ctx.journal.lost} ligne(s) non écrite(s) dans le journal ({journal_cfg['file']}).")
                 if ctx.journal.diverted:
@@ -3069,6 +3311,8 @@ def print_summary(summary, execute):
         others.append(f"{len(summary['read_error'])} prix illisible(s)")
     if summary["deferred"]:
         others.append(f"{summary['deferred']} action(s) reportée(s) au prochain passage")
+    if summary["night"]:
+        others.append(f"nuit : aucune mise en vente avant {summary['night']}")
     for group, until in summary["paused"].items():
         others.append(f"{group} en pause jusqu'à {clock_time(until)} (vérification anti-robot demandée par le site)")
     summary_text = f"Résumé ({verb}) : {', '.join(parts)} | {', '.join(others)}"
