@@ -50,7 +50,7 @@ Le script empêche l'ordinateur de se mettre en veille tout seul, mais **pas qua
 
 | Commande | Ce qu'elle fait |
 |---|---|
-| `./wm tout` | Les trois étapes ci-dessous, à la suite |
+| `./wm tout` | Les trois étapes ci-dessous (vente et défausse des cartes déjà étiquetées, analyse, puis vente et défausse des nouvelles) |
 | `./wm analyser` | Pose les étiquettes de prix |
 | `./wm vendre` | Met des cartes aux enchères (5 en même temps au plus, c'est la limite du site) |
 | `./wm defausser` | Défausse les cartes `defausse` et les `inconnu` de rareté C, PC ou R |
@@ -73,6 +73,8 @@ Options, à ajouter à `tout`, `analyser`, `vendre`, `defausser`, `boosters` ou 
 
 **0. Avant le tri** (seulement si vous les avez activés) : `tout` ouvre les boosters disponibles (`packs.in_tout: true`), puis pose l'étiquette de protection sur les cartes gagnées aux enchères depuis le passage précédent.
 
+**L'ordre du passage.** `tout` vend (étape 2) et défausse (étape 3) d'abord les cartes **déjà étiquetées** par les passages précédents, puis analyse (étape 1) la collection, puis vend et défausse les cartes qui viennent de recevoir leur étiquette. Les ventes et les défausses commencent donc tout de suite, même quand l'analyse doit relire le prix de toute la collection (une heure ou plus quand les prix gardés ont expiré). Les limites (5 ventes, 200 défausses par passage) valent pour le passage entier. Une carte qu'une règle `auto_tags` va protéger n'est jamais vendue ni défaussée, même avant l'analyse.
+
 **1. Analyser.** Chaque carte non protégée reçoit l'étiquette de sa tranche de prix moyen :
 
 | Prix moyen | Étiquette | Ensuite |
@@ -87,13 +89,20 @@ Options, à ajouter à `tout`, `analyser`, `vendre`, `defausser`, `boosters` ou 
 
 Si le prix d'une carte change de tranche, l'ancienne étiquette est remplacée.
 
-**2. Vendre.** Le script fait d'abord le bilan des enchères précédentes (vendue ou invendue). Il relance ensuite les invendus à 80 % de la mise précédente (3 essais au plus), puis remplit les places libres avec des cartes tirées au hasard, à 75 % de leur prix moyen, pour 30 minutes.
+**2. Vendre.** Le script fait d'abord le bilan des enchères précédentes (vendue ou invendue). Il relance ensuite les invendus à 80 % de la mise précédente (3 essais au plus), puis remplit les places libres avec des cartes tirées au hasard, à 75 % de leur prix moyen, pour 30 minutes. Seul le prix des cartes tirées est lu : la vente n'attend pas la relecture des centaines d'autres.
 
 **La nuit, il ne vend rien.** De 23 h à 8 h (heure de l'ordinateur), il ne met aucune carte en vente et ne relance aucun invendu, et il ne lance pas d'enchère qui se terminerait dans ce créneau (donc plus rien après 22 h 30 avec des enchères de 30 minutes). Il continue d'ouvrir les boosters, de poser les étiquettes, de défausser et d'acheter. Pour changer les heures, dans `perso.yaml` :
 
 ```yaml
 sell:
   night: { start: "00:00", end: "07:00" }   # heures entre guillemets ; null = vendre à toute heure
+```
+
+**La nuit, il peut aussi défausser les invendues bon marché** au lieu de les relancer au matin : les cartes mises aux enchères sans trouver d'acheteur (même plusieurs fois) qui valent moins de `night_max_value` (prix relu sur le site juste avant). Les cartes jamais mises en vente ne sont pas touchées : elles attendent leur tour. Désactivé par défaut ; dans `perso.yaml` :
+
+```yaml
+discard:
+  night_max_value: 10   # la nuit, défausser les invendues qui valent moins de 10 (null = jamais)
 ```
 
 **3. Défausser.** Par lots de 10 cartes : le prix des 10 cartes est relu sur le site, puis elles sont défaussées, et ainsi de suite. Une carte qui vaut maintenant 5 ou plus est épargnée. Le script fait au plus 200 défausses par passage ; la suite au passage suivant. Le site répond lentement (environ 7 secondes par prix) : comptez environ 40 minutes pour 200 défausses.
@@ -116,7 +125,7 @@ protection:
   tags: ["lyon"]
 ```
 
-**Boosters.** `./wm boosters --execute` ouvre les boosters disponibles, 10 au plus, espacés d'environ 12 secondes. Si le site demande la vérification anti-robot, le script s'arrête et attend 1 h avant de réessayer (puis 2 h, 4 h…). Passez la vérification à la main sur le site pour reprendre plus tôt.
+**Boosters.** `./wm boosters --execute` ouvre les boosters disponibles, 10 au plus, espacés d'environ 12 secondes. Si le site répond « Plus de paquets disponibles » (il en annonce parfois plus qu'il n'en accorde), le script arrête d'ouvrir des boosters et continue le passage. Si le site demande la vérification anti-robot, le script s'arrête et attend 1 h avant de réessayer (puis 2 h, 4 h…). Passez la vérification à la main sur le site pour reprendre plus tôt.
 
 **Achats.** Toutes les 5 minutes, le script cherche sur le marché les annonces qui se terminent bientôt et dont le titre ou la catégorie contient un mot commençant par un de vos mots-clés (« lyon » trouve « lyonnais » ou « To-Lyon », pas « Elyon »). Pour chacune :
 
@@ -216,7 +225,10 @@ Le jeton ne va **jamais** dans `config.yaml` : le script refuse de démarrer s'i
 | `Plusieurs comptes enregistrés` | Ajoutez `--compte NOM` (voir `./wm comptes`). |
 | `Un autre passage --execute est actif` | Un autre terminal fait déjà tourner ce compte. Attendez qu'il finisse, ou arrêtez-le. |
 | `Configuration invalide` | Le message dit quel réglage corriger dans `perso.yaml`. |
-| `nouvel essai dans … s` | Le site ne répond pas ou est surchargé (erreurs 503, 525, délai dépassé). Le script attend, réessaie tout seul et ralentit un moment. Rien à faire. |
+| `nouvel essai dans … s` | Le site ne répond pas ou est surchargé (erreurs 500, 503, 525, délai dépassé). Le script attend, réessaie tout seul et ralentit un moment. Rien à faire. Une erreur isolée corrigée au premier nouvel essai n'est pas affichée : elle est seulement comptée dans le résumé (`requête(s) renvoyée(s)`). |
+| `PLANTAGE` | Un bug, ou une réponse du site que le script ne sait pas lire. Avec `--loop`, seul le passage en cours (ou l'enchère concernée, pendant les achats) est abandonné : le script continue et réessaie au passage suivant. Sans `--loop`, il s'arrête. Copiez le message (il dit où ça a planté) pour le faire corriger. |
+| `places d'enchère illisibles` | Le site, surchargé, n'a pas donné le nombre de places d'enchère libres. Les ventes attendent le passage suivant, le reste continue. Si ça dure plusieurs heures, le site a peut-être changé : signalez-le. |
+| `enchère retirée du site` | Le site supprime les enchères terminées au bout de quelques minutes. Le résultat est alors déduit de la collection : carte revenue = invendue (achat : carte arrivée = gagnée), sinon vendue (achat : perdue). Le prix final n'est plus connu. |
 | `le site demande une vérification anti-robot` | Le site soupçonne un robot. Le script met ce type d'action en pause (1 h, puis 2 h, 4 h, 8 h si le site insiste) et continue le reste. Pour reprendre plus tôt : ouvrez le site avec ce compte, faites l'action à la main (passez la vérification si elle s'affiche), puis relancez le script. |
 | `permission denied: ./wm` | Lancez `sh wm login`, ou une fois `chmod +x wm`. |
 | `l'ordinateur s'est mis en veille` | Le script était figé pendant la veille (capot fermé sur batterie, batterie vide) : rien n'a été fait pendant ce temps. Branchez l'ordinateur et laissez le capot ouvert. |

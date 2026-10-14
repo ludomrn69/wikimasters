@@ -2,7 +2,7 @@
 """Bot WikiMasters : trie les cartes de votre collection selon config.yaml (et vos réglages de perso.yaml).
 
     ./wm login        ajoute un compte (cookie du navigateur, voir README)
-    ./wm tout         analyser, puis vendre, puis defausser
+    ./wm tout         vendre et défausser les cartes déjà étiquetées, analyser, puis traiter les nouvelles
     ./wm analyser     lit les prix moyens et pose les étiquettes de prix (defausse, +5, +10…)
     ./wm vendre       met aux enchères les cartes étiquetées à vendre (places libres)
     ./wm defausser    défausse les cartes « defausse » (et les « inconnu » des raretés choisies)
@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unicodedata
 from dataclasses import dataclass, field
 from numbers import Real
@@ -92,6 +93,9 @@ AFTER_END_SECONDS = 3
 CHECK_MARGIN = 10
 # Résultat d'une enchère où le script a misé : lu une minute après sa fin, puis toutes les 5 minutes.
 RESULT_DELAY, RESULT_RETRY = 60, 300
+# Enchère retirée du site avant la lecture de son résultat (404) : déduit de la collection lue au moins ce nombre de
+# secondes après sa fin (le temps que le site rende la carte, au vendeur ou au gagnant).
+SETTLE_GRACE = 120
 # Pages du marché lues au plus par mot-clé et par relecture (triées par fin la plus proche).
 MAX_SCAN_PAGES = 5
 # Réglages personnels (et jeton Telegram) par-dessus config.yaml, à côté de lui et jamais envoyés sur GitHub.
@@ -382,7 +386,7 @@ def check_config(cfg):
             err(f"{where}.color doit être un texte, ex. \"#22c55e\"")
 
     disc = section("discard", ("tags", "max_value", "unknown_rarities", "max_per_run", "fresh_price",
-                               "require_existing_tag"))
+                               "require_existing_tag", "night_max_value"))
     disc_tags = str_list(disc, "discard", "tags", allow_empty=False)
     number(disc, "discard", "max_value", 0, allow_none=True)
     unknown_rarities = str_list(disc, "discard", "unknown_rarities")
@@ -395,6 +399,7 @@ def check_config(cfg):
             err(f"discard.unknown_rarities contient {rarity}, qui est protégée (protection.rarities) : "
                 "retirez-la de l'une des deux listes")
     number(disc, "discard", "max_per_run", 0, integer=True)
+    number(disc, "discard", "night_max_value", 0, allow_none=True)
     boolean(disc, "discard", "fresh_price")
     boolean(disc, "discard", "require_existing_tag")
 
@@ -440,6 +445,9 @@ def check_config(cfg):
         if clock_minutes(night.get("start")) is not None \
                 and clock_minutes(night.get("start")) == clock_minutes(night.get("end")):
             err("sell.night : start et end doivent être différents")
+    if disc.get("night_max_value") is not None and night is None:
+        err("discard.night_max_value demande sell.night (les heures de la nuit, ex. { start: \"23:00\", end: "
+            "\"08:00\" }) : c'est la nuit que les invendues sont défaussées")
 
     packs = section("packs", ("in_tout", "max_per_run", "delay_seconds"))
     boolean(packs, "packs", "in_tout")
@@ -851,6 +859,18 @@ def protection_reason(card, prot):
     return None
 
 
+def auto_protection(card, value, cfg):
+    """Étiquette de protection que « analyser » poserait sur cette carte (auto_tags), sinon None.
+
+    « tout » vend et défausse les cartes déjà étiquetées avant l'analyse : une règle qui va les protéger compte déjà.
+    """
+    protecting = {norm(t) for t in cfg["protection"]["tags"]}
+    for rule in cfg.get("auto_tags", []):
+        if norm(rule["tag"]) in protecting and matches(card, value, rule.get("when", {})):
+            return rule["tag"]
+    return None
+
+
 def band_for(value, bands):
     for band in bands:
         lo, hi = band.get("from"), band.get("below")
@@ -986,6 +1006,7 @@ class WikiMastersClient:
         self.waiter = None  # remplace time.sleep pendant les pauses : les achats misent pendant ce temps (Sniper)
         self.quick = False  # requêtes des achats en cours : nouvelles tentatives rapides seulement (QUICK_RETRY_DELAYS)
         self.last_uncertain = False  # la dernière écriture a dû être renvoyée après une tentative peut-être effectuée
+        self.retried = 0  # requêtes renvoyées après une erreur passagère du site (résumé du passage)
         self._tag_ids = None
         self._last_refresh = None
 
@@ -1143,7 +1164,7 @@ class WikiMastersClient:
         uncertain = False  # une tentative d'écriture a peut-être été effectuée par le serveur
         for attempt in range(len(delays) + 1):
             self.ensure_fresh()
-            wait = delays[attempt] if attempt < len(delays) else 0
+            wait, resp = delays[attempt] if attempt < len(delays) else 0, None
             try:
                 resp = self.http.request(
                     method, url, timeout=20, allow_redirects=False, headers=headers_fn(), **kwargs
@@ -1173,7 +1194,12 @@ class WikiMastersClient:
             self.slowdown = min(MAX_SLOWDOWN, self.slowdown * 2)
             if not retryable or attempt == len(delays):
                 break
-            print(f"     {problem} sur {what} : nouvel essai dans {wait:g} s…")
+            self.retried += 1
+            # Le site renvoie souvent une erreur 500 isolée (vu le 14/10/2026) que le 1er nouvel essai d'une lecture
+            # corrige : pas affichée (comptée dans le résumé). Celle d'une action, une erreur qui se répète ou un 429
+            # (trop rapide) le sont.
+            if attempt or method != "GET" or resp is not None and resp.status_code == 429:
+                print(f"     {problem} sur {what} : nouvel essai dans {wait:g} s…")
             self._retry_wait(wait)
         raise error
 
@@ -1221,6 +1247,10 @@ class WikiMastersClient:
             hint = f" {ANTIBOT_HINT}" if what.startswith("GET") else ""
             raise ApiError(f"le site demande une vérification anti-robot (« Vérification anti-bot requise ») sur "
                            f"{what}.{hint}", fatal=what.startswith("GET"), status=403, code=code)
+        if resp.status_code == 403 and "packs_remaining" in body:
+            # « Plus de paquets disponibles » (vu le 14/10/2026) : le compteur lu juste avant annonçait plus de
+            # boosters que le site n'en accorde. Rien à voir avec la session : seuls les boosters s'arrêtent.
+            raise ApiError(f"plus de booster disponible sur {what}{detail}", status=403, code="no_packs", body=body)
         if resp.status_code == 403 and code == "42501":
             # Session valide mais règle d'accès Supabase refusée : en pratique, l'exemplaire a quitté la collection
             # pendant le passage. Seule cette carte est abandonnée ; si tout est refusé, max_consecutive_errors arrête.
@@ -1300,11 +1330,22 @@ class WikiMastersClient:
         return value_from_sales(data, card)
 
     def auction_slots(self):
-        data = as_dict(self._api("GET", "/api/marketplace/mine"))
-        most, selling = data.get("maxConcurrentAuctions"), data.get("sellingCount")
-        if not (_is_int(most) and _is_int(selling)):
-            raise ApiError("places d'enchère illisibles sur /api/marketplace/mine (le site a-t-il changé ?)", fatal=True)
-        return most - selling
+        """Places d'enchère libres, ou None si le site ne les donne pas.
+
+        Surchargé, le site répond parfois sans ces champs (vu le 14/10/2026, au milieu d'erreurs 500) : relu deux
+        fois, puis None (les ventes attendent le passage suivant, le reste continue).
+        """
+        for wait in GET_RETRY_DELAYS[:2] + (None,):
+            data = as_dict(self._api("GET", "/api/marketplace/mine"))
+            most, selling = data.get("maxConcurrentAuctions"), data.get("sellingCount")
+            if _is_int(most) and _is_int(selling):
+                return most - selling
+            if wait is not None:
+                self.retried += 1
+                self._retry_wait(wait)
+        print(f"  places d'enchère illisibles sur /api/marketplace/mine (champs reçus : {', '.join(sorted(data)) or 'aucun'}"
+              ") : le site est surchargé, ou a changé si ça dure")
+        return None
 
     def discard(self, card):
         return self._api("POST", f"/api/user-cards/{card.copy_id}/discard", retry="safe")
@@ -1580,8 +1621,9 @@ class SalesState(AuctionFile):
         return max(found, key=lambda x: x[0])[1:] if found else None
 
     def close_copy(self, copy_id, status="relisted"):
-        """Clôt les anciennes entrées « invendue » d'un exemplaire qui vient d'être remis en vente."""
-        for aid, entry in self.with_status("unsold"):
+        """Clôt les anciennes entrées « invendue » d'un exemplaire qui vient d'être remis en vente (ou défaussé :
+        « abandonnée » aussi, sinon follow_returned_copies passerait son suivi à un autre exemplaire de la carte)."""
+        for aid, entry in self.with_status("unsold") + self.with_status("abandoned"):
             if entry.get("copy_id") == copy_id:
                 entry["status"] = status
 
@@ -1596,11 +1638,12 @@ class SalesState(AuctionFile):
 class PurchaseState(AuctionFile):
     """achats.json : enchères du marché où le script a misé, jusqu'au résultat puis à l'étiquette posée sur la carte.
 
-    Statuts : bid (mise posée, résultat pas encore lu), won (gagnée : buy.tag reste à poser sur la carte) ;
+    Statuts : bid (mise posée, résultat pas encore lu), vanished (enchère retirée du site avant la lecture du
+    résultat : déduit de la collection, voir settle_vanished), won (gagnée : buy.tag reste à poser sur la carte) ;
     les autres (lost, tagged, gone) sont terminés et retirés du fichier à l'enregistrement.
     """
 
-    KEPT = ("bid", "won")
+    KEPT = ("bid", "vanished", "won")
     WHAT = "suivi des achats"
     LOST = "le résultat des mises et l'étiquette des cartes gagnées seront incomplets"
 
@@ -1800,6 +1843,7 @@ class Context:
     state: SalesState
     run_started: float = 0.0  # début du passage : « prix relu » = lu depuis ce moment
     collection_ids: set = field(default_factory=set)  # tous les exemplaires de la collection, lignes groupées comprises
+    collection: list = field(default_factory=list)  # ces mêmes exemplaires (Card)
     on_sale: set = field(default_factory=set)  # exemplaires dont l'enchère est confirmée en cours
     # Vérification anti-robot demandée par le site : groupe d'actions -> {"until": fin de la pause, "strikes": n}.
     # Gardé d'un cycle de --loop à l'autre ; relancer le script la lève (après une vérification faite à la main).
@@ -1817,12 +1861,19 @@ FINAL_ACTIONS = ("discard", "auction")
 
 def new_summary():
     counters = ("tag_add", "tag_remove", "discard", "auction", "relist", "sold", "unsold", "no_slot", "error",
-                "deferred", "pack", "bid", "won", "lost")
+                "deferred", "pack", "bid", "won", "lost", "retried")
     # Ensembles d'exemplaires : une carte vue dans plusieurs phases de « tout » n'est comptée qu'une fois.
     sets = ("protect", "skip", "up_to_date", "read_error")
     # paused : groupe d'actions -> fin de sa pause anti-robot (voir antibot_strike) ; night : fin de la nuit sans
     # mise en vente (sell.night), si les ventes ont été sautées pour cette raison
     return {**{k: 0 for k in counters}, **{k: set() for k in sets}, "paused": {}, "night": None}
+
+
+def crash_report(e):
+    """Plantage (bug, ou réponse du site que le script ne sait pas lire) : quoi et où, pour pouvoir le corriger.
+    Le message d'une erreur réseau n'est jamais affiché : il peut contenir les en-têtes, donc le cookie."""
+    what = type(e).__name__ if isinstance(e, requests.RequestException) else f"{type(e).__name__}: {e}"
+    return what + "\n" + "".join(traceback.format_tb(e.__traceback__)[-3:]).rstrip()
 
 
 def clock_time(timestamp):
@@ -1945,16 +1996,20 @@ def plan_analyse(ctx, cards):
     return steps
 
 
-def filter_candidates(ctx, cards, tags_for, other_tags, what, require_existing=False):
+def filter_candidates(ctx, cards, tags_for, other_tags, what, require_existing=False, tagged=None):
     """Exemplaires portant une des étiquettes tags_for(carte), hors protections et étiquettes contradictoires.
 
     require_existing : l'étiquette devait déjà être sur le site au début du passage (pas posée à l'instant par
     « analyser » dans « tout ») : vous avez ainsi le temps de la vérifier avant une action irréversible.
+    tagged : "before" = seulement les cartes qui portaient déjà l'étiquette au début du passage, "during" =
+    seulement celles qui l'ont reçue pendant ce passage, None = toutes (voir TOUT_PHASES).
     """
     out, waiting = [], 0
     for card in cards:
         tags = tags_for(card)
         if not card.has_any_tag(tags):
+            continue
+        if tagged is not None and card.has_any_tag(tags, initial_only=True) != (tagged == "before"):
             continue
         if require_existing and not card.has_any_tag(tags, initial_only=True):
             ctx.summary["skip"].add(card.copy_id)
@@ -1979,7 +2034,8 @@ def filter_candidates(ctx, cards, tags_for, other_tags, what, require_existing=F
     return out
 
 
-SOLD_OR_FINISHED = ("settled", "sold", "expired", "unsold", "completed", "finished", "closed")
+SOLD_OR_FINISHED = ("settled", "sold", "expired", "unsold", "completed", "finished", "closed", "settled_sold",
+                    "settled_unsold")  # « settled_unsold » : invendue, vu sur le site le 14/10/2026
 CANCELLED = ("cancelled", "canceled", "annulee", "annulée")
 # Une enchère « open » dont on n'a aucune nouvelle au-delà de ce délai après sa fin est abandonnée.
 STALE_AFTER = 2 * 86400
@@ -2005,30 +2061,41 @@ def settle_sales(ctx):
     if not opened:
         return
     print(f"  bilan de {len(opened)} enchère(s) lancée(s) précédemment…")
+    taken = {e.get("copy_id") for e in ctx.state.auctions.values()}
     for auction_id, entry in opened:
         name, rarity = entry.get("name", ""), entry.get("rarity", "")
-        auction = None
+        auction, vanished = None, False
         try:
             data = ctx.client.get_auction(auction_id)
             auction = data.get("auction", data) if isinstance(data, dict) else None
         except ApiError as e:
             if e.fatal:
                 raise
-            print(f"  ÉCHEC     bilan de l'enchère {name} : {e}")
+            vanished = e.status == 404  # « Enchère introuvable » : retirée du site une fois finie (vu le 14/10/2026)
+            if not vanished:
+                print(f"  ÉCHEC     bilan de l'enchère {name} : {e}")
         finally:
             ctx.client.pause(ctx.cfg["safety"]["read_delay_seconds"])
         outcome = classify_auction(auction)
         back = entry.get("copy_id") in ctx.collection_ids
         status = auction.get("status") if isinstance(auction, dict) else None
+        ended = (entry.get("listed_at") or 0) + 60 * (entry.get("duration") or 0)
         if outcome is None and status == "active":
             ctx.on_sale.add(entry.get("copy_id"))  # confirmé en cours par le site : ne pas la remettre en vente
             continue
+        if vanished and ended + SETTLE_GRACE <= ctx.run_started:
+            # Résultat déduit de la collection : la carte invendue y revient, souvent sous un nouvel exemplaire
+            # (voir follow_returned_copies) ; sinon elle a été vendue, à un prix que le site ne donne plus.
+            returned = next((c for c in ctx.collection
+                             if c.card_id == entry.get("card_id") and c.copy_id not in taken), None)
+            if returned:
+                taken.add(returned.copy_id)
+            outcome = "unsold" if back or returned else "sold"
         if outcome is None:
             if back:
                 # Une carte en vente disparaît de la collection : si elle est revenue, l'enchère est finie sans vente.
                 outcome = "unsold"
             else:
-                ended = (entry.get("listed_at") or 0) + 60 * (entry.get("duration") or 0)
                 if time.time() - ended > STALE_AFTER:
                     print(f"  ?         {name} : aucune nouvelle de l'enchère depuis 2 jours, suivi abandonné")
                     ctx.state.set_status(auction_id, "gone")
@@ -2037,7 +2104,12 @@ def settle_sales(ctx):
                 continue
         common = dict(name=name, rarity=rarity, copy_id=entry.get("copy_id", ""), card_id=entry.get("card_id", ""),
                       value=entry.get("value"), duration=entry.get("duration"), auction_id=auction_id)
-        if outcome == "sold":
+        if outcome == "sold" and vanished:
+            print(f"  VENDUE    {name} [{rarity}] : prix inconnu, enchère retirée du site (mise de départ "
+                  f"{entry.get('price')})")
+            written = ctx.journal.write("vendue", result="OK (déduit de la collection, prix inconnu)", **common)
+            new_status, extra, counter = "sold", {}, "sold"
+        elif outcome == "sold":
             final = auction.get("final_price") or auction.get("current_bid") or auction.get("effective_bid")
             print(f"  VENDUE    {name} [{rarity}] : {final} wikicoins (mise de départ {entry.get('price')})")
             written = ctx.journal.write("vendue", price=final, **common)
@@ -2058,6 +2130,25 @@ def settle_sales(ctx):
         ctx.state.save()  # tout de suite : un plantage ensuite ne doit pas faire journaliser deux fois
 
 
+def follow_returned_copies(ctx):
+    """Une carte invendue revient dans la collection sous un NOUVEL identifiant d'exemplaire (vu le 14/10/2026 :
+    42 invendues sur 43, aucune relancée). Le suivi (invendue, abandonnée) passe sur cet exemplaire, sinon la carte
+    ne serait jamais relancée moins cher. Sans exemplaire de cette carte (échangée, défaussée…) : plus rien à suivre.
+    """
+    taken = {e.get("copy_id") for e in ctx.state.auctions.values()}
+    entries = ctx.state.with_status("unsold") + ctx.state.with_status("abandoned")
+    for auction_id, entry in sorted(entries, key=lambda x: -(x[1].get("listed_at") or 0)):  # la plus récente d'abord
+        if entry.get("copy_id") in ctx.collection_ids:
+            continue
+        back = sorted((c for c in ctx.collection if c.card_id == entry.get("card_id") and c.copy_id not in taken),
+                      key=lambda c: c.count > 1)  # une ligne groupée n'est jamais vendue : en dernier recours
+        if back:
+            entry["copy_id"] = back[0].copy_id
+            taken.add(back[0].copy_id)
+        else:
+            ctx.state.set_status(auction_id, "gone")
+
+
 def relist_price(previous, value, sell):
     """Mise d'une relance : moins que la précédente, jamais plus que la mise normale au prix actuel."""
     relist = sell["relist"]
@@ -2070,108 +2161,141 @@ def relist_price(previous, value, sell):
     return max(price, relist["min_start_price"])
 
 
-def plan_sell(ctx, cards):
-    """Mises aux enchères : relances des invendus, puis cartes étiquetées à vendre, dans les places libres."""
+def plan_sell(ctx, cards, tagged=None):
+    """Mises aux enchères : relances des invendus, puis cartes étiquetées à vendre, dans les places libres.
+
+    tagged : voir filter_candidates. Le bilan des enchères précédentes n'est fait qu'une fois par passage.
+    Au hasard (sell.order: random), seuls les prix des cartes tirées sont lus : la vente commence tout de suite,
+    même quand les prix gardés ont expiré et que toute la collection est à relire.
+    """
     cfg, summary = ctx.cfg, ctx.summary
     sell = cfg["sell"]
     relist = sell["relist"]
-    settle_sales(ctx)
-    # Invendus dont la carte n'est plus dans la collection (échangée, défaussée…) : plus rien à suivre.
-    for status in ("unsold", "abandoned"):
-        for auction_id, entry in ctx.state.with_status(status):
-            if entry.get("copy_id") not in ctx.collection_ids:
-                ctx.state.set_status(auction_id, "gone")
+    if tagged != "during":
+        settle_sales(ctx)
+        follow_returned_copies(ctx)
     # La nuit, presque personne n'achète : ni mise en vente ni relance, et aucune enchère ne doit s'y terminer.
     # Le bilan ci-dessus continue ; les invendus seront relancés au matin.
     night, now = sell.get("night"), time.time()
     ends = now + 60 * sell["duration_minutes"]
     if at_night(now, night) or at_night(ends, night):
+        if summary["night"] is None:  # sinon déjà dit plus haut dans ce passage
+            late = "" if at_night(now, night) else f" (une enchère lancée maintenant finirait à {clock_time(ends)})"
+            print(f"  nuit ({night['start']}-{night['end']}) : aucune mise en vente avant {night['end']}{late}")
         summary["night"] = night["end"]
-        late = "" if at_night(now, night) else f" (une enchère lancée maintenant finirait à {clock_time(ends)})"
-        print(f"  nuit ({night['start']}-{night['end']}) : aucune mise en vente avant {night['end']}{late}")
         return []
     until = antibot_until(ctx, "auction")
     if until:
         print(f"  mises en vente en pause jusqu'à {clock_time(until)} : le site a demandé une vérification anti-robot")
         return []
     candidates = filter_candidates(ctx, cards, lambda card: sell["tags"], cfg["discard"]["tags"], "à vendre",
-                                   sell["require_existing_tag"])
+                                   sell["require_existing_tag"], tagged)
     for card in [c for c in candidates if c.copy_id in ctx.on_sale]:
         candidates.remove(card)
         summary["skip"].add(card.copy_id)
         print(f"  ignorée   {card.name} [{card.rarity}] : déjà en vente")
+    if not candidates:
+        return []
+    # sell.max_auctions vaut pour tout le passage, même quand « tout » vend en deux étapes.
+    quota = sell["max_auctions"] - summary["auction"]
     # Pas de place libre : inutile de lire des centaines de prix pour rien.
-    if candidates and min(ctx.client.auction_slots(), sell["max_auctions"]) <= 0:
+    slots = ctx.client.auction_slots() if quota > 0 else 0
+    if slots is None:
+        summary["no_slot"] += len(candidates)
+        print(f"  {len(candidates)} carte(s) à vendre : ventes au prochain passage")
+        return []
+    room = min(slots, quota)
+    if room <= 0:
         summary["no_slot"] += len(candidates)
         print(f"  {len(candidates)} carte(s) à vendre, mais aucune place d'enchère libre : rien à faire maintenant")
         return []
-    values = read_values(ctx.client, candidates, cfg, ctx.cache, ctx.run_started if sell["fresh_price"] else 0)
-    count_read_errors(candidates, values, summary)
 
-    relists, fresh = [], []
-    for card in candidates:
-        value = values.get(card.card_id)
+    def make_offer(card, value):
+        """(carte, valeur, Offer) si elle est à vendre maintenant, sinon None (raison affichée)."""
         if value is FAILED:
-            continue
+            return None
+        protecting = auto_protection(card, value, cfg)
+        if protecting:
+            summary["protect"].add(card.copy_id)
+            print(f"  PROTÉGÉE  {label(card, value)} : « analyser » va lui poser « {protecting} » (auto_tags)")
+            return None
         if value is None:
             summary["skip"].add(card.copy_id)
             print(f"  ignorée   {label(card, value)} : jamais vendue, prix inconnu")
-            continue
+            return None
         if sell["min_value"] is not None and value < sell["min_value"]:
             summary["skip"].add(card.copy_id)
             print(f"  ignorée   {label(card, value)} : vaut moins de {sell['min_value']:g} (relancez analyser)")
-            continue
+            return None
         if ctx.state.latest_for(card.copy_id, "abandoned"):
             summary["skip"].add(card.copy_id)
             print(f"  ignorée   {label(card, value)} : invendue {relist['max_attempts']} fois, on ne la remet plus en vente"
                   " (retirez-la de ventes.json pour réessayer)")
-            continue
+            return None
         previous = ctx.state.latest_for(card.copy_id, "unsold") if relist["enabled"] else None
-        if previous:
-            auction_id, entry = previous
-            attempt = int(entry.get("attempt", 1)) + 1
-            if attempt > relist["max_attempts"]:
-                summary["skip"].add(card.copy_id)
-                ctx.state.set_status(auction_id, "abandoned")
-                print(f"  ignorée   {label(card, value)} : invendue {attempt - 1} fois (sell.relist.max_attempts)")
-                continue
-            relists.append((card, value, Offer(relist_price(entry["price"], value, sell), attempt, auction_id)))
-        else:
-            fresh.append((card, value, Offer(start_price(value, sell), 1)))
+        if not previous:
+            return card, value, Offer(start_price(value, sell), 1)
+        auction_id, entry = previous
+        attempt = int(entry.get("attempt", 1)) + 1
+        if attempt > relist["max_attempts"]:
+            summary["skip"].add(card.copy_id)
+            ctx.state.set_status(auction_id, "abandoned")
+            print(f"  ignorée   {label(card, value)} : invendue {attempt - 1} fois (sell.relist.max_attempts)")
+            return None
+        return card, value, Offer(relist_price(entry["price"], value, sell), attempt, auction_id)
 
+    since = ctx.run_started if sell["fresh_price"] else 0
     if sell["order"] == "random":
         # Tirage fixe pour la journée : le dry-run montre les mêmes cartes que le --execute qui suit.
-        fresh.sort(key=lambda o: o[0].copy_id)
-        random.Random(f"{ctx.client.user_id}:{time.strftime('%Y-%m-%d')}").shuffle(fresh)
-    elif sell["order"] == "tags":
-        rank = {norm(t): i for i, t in enumerate(sell["tags"])}
-        fresh.sort(key=lambda o: (min(rank.get(norm(t), len(rank)) for t in o[0].tags), -o[1]))
+        candidates.sort(key=lambda c: c.copy_id)
+        random.Random(f"{ctx.client.user_id}:{time.strftime('%Y-%m-%d')}").shuffle(candidates)
+        relaunch = {c.copy_id for c in candidates if relist["enabled"] and ctx.state.latest_for(c.copy_id, "unsold")}
+        candidates.sort(key=lambda c: (c.copy_id in relaunch) != relist["first"])  # relances d'abord (ou à la fin)
+        offers, unread = [], candidates
+        while unread and len(offers) < room:
+            batch, unread = unread[:room - len(offers)], unread[room - len(offers):]
+            values = read_values(ctx.client, batch, cfg, ctx.cache, since, quiet=True)
+            count_read_errors(batch, values, summary)
+            offers += [o for o in (make_offer(c, values.get(c.card_id)) for c in batch) if o]
+        relaunches = sum(1 for o in offers if o[2].relaunches) + sum(1 for c in unread if c.copy_id in relaunch)
     else:
-        fresh.sort(key=lambda o: -o[1])
-    offers = relists + fresh if relist["first"] else fresh + relists
+        values = read_values(ctx.client, candidates, cfg, ctx.cache, since)
+        count_read_errors(candidates, values, summary)
+        offers = [o for o in (make_offer(c, values.get(c.card_id)) for c in candidates) if o]
+        relists, fresh = [o for o in offers if o[2].relaunches], [o for o in offers if not o[2].relaunches]
+        if sell["order"] == "tags":
+            rank = {norm(t): i for i, t in enumerate(sell["tags"])}
+            fresh.sort(key=lambda o: (min(rank.get(norm(t), len(rank)) for t in o[0].tags), -o[1]))
+        else:
+            fresh.sort(key=lambda o: -o[1])
+        offers, unread, relaunches = relists + fresh if relist["first"] else fresh + relists, [], len(relists)
 
     # Relu après la lecture des prix, qui peut durer : des enchères ont pu se terminer entre-temps.
     slots = ctx.client.auction_slots()
-    room = max(0, min(slots, sell["max_auctions"]))
-    print(f"  {len(offers)} carte(s) à vendre dont {len(relists)} relance(s), {slots} place(s) d'enchère libre(s) "
-          f"→ {min(room, len(offers))} vente(s)")
-    chosen, waiting = offers[:room], offers[room:]
+    room = 0 if slots is None else max(0, min(slots, quota))  # illisibles : toutes attendent le passage suivant
+    free = "?" if slots is None else slots
+    print(f"  {len(offers) + len(unread)} carte(s) à vendre dont {relaunches} relance(s), {free} place(s) d'enchère "
+          f"libre(s) → {min(room, len(offers))} vente(s)")
+    chosen = offers[:room]
+    waiting = [label(card, value) for card, value, _ in offers[room:]] + [f"{c.name} [{c.rarity}]" for c in unread]
     summary["no_slot"] += len(waiting)
     limit = len(waiting) if ctx.verbose else cfg.get("display", {}).get("waiting_shown", 5)
-    for card, value, _ in waiting[:limit]:
-        print(f"  en attente d'une place : {label(card, value)}")
+    for shown in waiting[:limit]:
+        print(f"  en attente d'une place : {shown}")
     if len(waiting) > limit:
         print(f"  … et {len(waiting) - limit} autre(s) en attente (--verbose pour tout voir)")
     return [(card, "auction", offer, value) for card, value, offer in chosen]
 
 
-def plan_discard(ctx, cards):
+def plan_discard(ctx, cards, tagged=None):
     """Défausses : cartes « defausse », et cartes jamais vendues (« inconnu ») des raretés de discard.unknown_rarities.
+    La nuit (sell.night), aussi les invendues (mises aux enchères sans trouver d'acheteur) qui valent moins de
+    discard.night_max_value : elles ne seront pas relancées au matin.
 
     Générateur de lots de DISCARD_BATCH cartes : le prix de chaque lot est relu sur le site (sauf
     discard.fresh_price: false) juste avant de le défausser. Les défausses commencent donc tout de suite, et le prix
     vérifié date d'une minute, pas du début de la relecture. Seules les cartes nécessaires pour remplir
-    discard.max_per_run sont lues, la suite attend le passage suivant.
+    discard.max_per_run sont lues, la suite attend le passage suivant. tagged : voir filter_candidates.
     """
     cfg, summary = ctx.cfg, ctx.summary
     until = antibot_until(ctx, "discard")
@@ -2188,10 +2312,29 @@ def plan_discard(ctx, cards):
         return disc["tags"]
 
     candidates = filter_candidates(ctx, cards, tags_for, cfg["sell"]["tags"], "à défausser",
-                                   disc["require_existing_tag"])
+                                   disc["require_existing_tag"], tagged)
     candidates.sort(key=lambda c: not c.has_any_tag(disc["tags"]))  # « defausse » d'abord, puis « inconnu »
+    night = cfg["sell"].get("night")
+    cap = disc["night_max_value"] if at_night(time.time(), night) else None
+    by_night = {}  # invendues retenues pour la nuit : exemplaire -> prix gardé (pour défausser les moins chères d'abord)
+    if cap is not None:
+        follow_returned_copies(ctx)  # une invendue revient sous un nouvel exemplaire (déjà fait par « tout »)
+        unsold = {e.get("copy_id") for status in ("unsold", "abandoned") for _, e in ctx.state.with_status(status)}
+        taken = {c.copy_id for c in candidates}
+        # Étiquetées à vendre seulement : une invendue étiquetée « defausse » suit les règles de jour, ci-dessus.
+        returned = [c for c in cards
+                    if c.copy_id in unsold and c.copy_id not in taken and not c.has_any_tag(tags_for(c))]
+        for card in filter_candidates(ctx, returned, lambda c: cfg["sell"]["tags"], [], "à vendre", tagged=tagged):
+            known = ctx.cache.get(card)
+            if not (_is_number(known) and known >= cap):  # valait déjà cap ou plus : gardée, prix même pas relu
+                by_night[card.copy_id] = known if _is_number(known) else 0
+                candidates.append(card)
+        candidates.sort(key=lambda c: by_night.get(c.copy_id, -1))  # tri stable : règles de jour d'abord
+        if by_night or tagged != "during":
+            print(f"  nuit ({night['start']}-{night['end']}) : invendues à moins de {cap:g} défaussées aussi "
+                  f"(discard.night_max_value) : {len(by_night)} carte(s)")
     since = ctx.run_started if disc["fresh_price"] else 0
-    limit = disc["max_per_run"]
+    limit = max(0, disc["max_per_run"] - summary["discard"])  # pour tout le passage, même en deux étapes (« tout »)
     if candidates and limit:
         fresh = " ; prix relu sur le site juste avant" if since else ""
         print(f"  {len(candidates)} carte(s) à défausser, {min(len(candidates), limit)} au plus ce passage, "
@@ -2201,6 +2344,12 @@ def plan_discard(ctx, cards):
         if antibot_until(ctx, "discard"):  # vérification anti-robot demandée pendant ce passage
             summary["deferred"] += len(rest)
             return
+        if by_night and not at_night(time.time(), night):
+            # Le jour s'est levé pendant le passage : les ventes reprennent, ces invendues seront relancées.
+            print(f"  fin de la nuit : {sum(1 for c in rest if c.copy_id in by_night)} invendue(s) gardée(s), "
+                  "relancées dans la journée")
+            rest, by_night = [c for c in rest if c.copy_id not in by_night], {}
+            continue
         size = min(DISCARD_BATCH, limit - planned)
         batch, rest = rest[:size], rest[size:]
         values = read_values(ctx.client, batch, cfg, ctx.cache, since, quiet=True)
@@ -2209,6 +2358,20 @@ def plan_discard(ctx, cards):
         for card in batch:
             value = values.get(card.card_id)
             if value is FAILED:
+                continue
+            protecting = auto_protection(card, value, cfg)
+            if protecting:
+                summary["protect"].add(card.copy_id)
+                print(f"  PROTÉGÉE  {label(card, value)} : « analyser » va lui poser « {protecting} » (auto_tags)")
+                continue
+            if card.copy_id in by_night:
+                if value is None or value >= cap:
+                    summary["skip"].add(card.copy_id)
+                    worth = "jamais vendue" if value is None else f"vaut {value:g}"
+                    print(f"  ignorée   {label(card, value)} : invendue, mais {worth} (pas moins de {cap:g}, "
+                          "discard.night_max_value) : relancée dans la journée")
+                    continue
+                steps.append((card, "discard", None, value))
                 continue
             if value is None and norm(card.rarity) not in unknown_rarities:
                 summary["skip"].add(card.copy_id)
@@ -2231,8 +2394,8 @@ def plan_discard(ctx, cards):
         yield steps
     if rest:
         summary["deferred"] += len(rest)
-        print(f"  {len(rest)} autre(s) carte(s) à défausser : {limit} au plus par passage (discard.max_per_run), "
-              "la suite au prochain passage")
+        print(f"  {len(rest)} autre(s) carte(s) à défausser : {disc['max_per_run']} au plus par passage "
+              "(discard.max_per_run), la suite au prochain passage")
 
 
 class Runner:
@@ -2331,6 +2494,7 @@ class Runner:
             return "OK"
         if kind == "discard":
             balance = as_dict(self.client.discard(card)).get("balance")
+            self.ctx.state.close_copy(card.copy_id, "gone")  # invendue défaussée la nuit : plus rien à relancer
             self._log(card, kind, arg, value, "OK", balance=balance)
             return f"OK, solde : {'?' if balance is None else balance}"
         duration = self.cfg["sell"]["duration_minutes"]
@@ -2380,6 +2544,11 @@ def open_packs(ctx):
         try:
             data = as_dict(client.open_pack())
         except ApiError as e:
+            if e.code == "no_packs":
+                regen = parse_time(e.body.get("next_regen_at"))
+                print("  plus de booster disponible pour l'instant"
+                      + (f" (prochain vers {clock_time(regen)})" if regen else ""))
+                return
             ctx.journal.write("booster", result=f"ECHEC : {e}")
             if e.fatal:
                 raise
@@ -2537,6 +2706,12 @@ class Sniper:
                 raise
             else:
                 self.say(f"ÉCHEC : {e}")
+        except Exception as e:
+            # Bug ou réponse imprévue : seule cette enchère est laissée, les achats continuent. Relire le marché ou un
+            # résultat est déjà reprogrammé ; une enchère suivie serait revérifiée aussitôt, sans fin.
+            self.say(f"PLANTAGE (achats continués) : {crash_report(e)}")
+            if action == self._check:
+                self._finish(*args)
         finally:
             self.busy, self.client.quick = was_busy, was_quick
 
@@ -2559,6 +2734,8 @@ class Sniper:
         for keyword in self.buy["keywords"]:
             for page in range(1, MAX_SCAN_PAGES + 1):
                 self._clear_ahead()
+                if self._paused():  # vérification anti-robot demandée sur une mise de _clear_ahead
+                    return
                 data = as_dict(self.client.search_auctions(keyword, page))
                 self.client.pause(self.ctx.cfg["safety"]["read_delay_seconds"])
                 auctions = [a for a in data.get("auctions") or [] if isinstance(a, dict)]
@@ -2573,6 +2750,8 @@ class Sniper:
         read = 0
         for auction, end in new:
             self._clear_ahead()  # lire un prix prend du temps : les mises à faire bientôt passent avant
+            if self._paused():  # plus aucune mise pendant la pause : inutile de repérer d'autres annonces
+                break
             read += self._consider(auction, end)
         if read:
             self.ctx.cache.save()
@@ -2634,7 +2813,7 @@ class Sniper:
             return "déjà dans votre collection"
         # Deux annonces de la même carte : on n'en suit qu'une, pour ne pas l'acheter deux fois.
         if any(t.card.card_id == card.card_id for t in self.targets.values()) \
-                or any(e.get("card_id") == card.card_id for status in ("bid", "won")
+                or any(e.get("card_id") == card.card_id for status in ("bid", "vanished", "won")
                        for _, e in self.ctx.purchases.with_status(status)):
             return "même carte déjà suivie ou achetée"
         # Le site cherche peut-être plus large : on vérifie que le mot-clé est bien dans le titre ou la catégorie.
@@ -2666,15 +2845,20 @@ class Sniper:
         target.stage = min(stage + 1, 2)  # avancé d'abord : un échec ne la refait pas en boucle
         try:
             data = self.client.get_auction(target.auction_id)
-        except ApiError:
-            if stage >= 2:
+        except ApiError as e:
+            if stage >= 2 or e.status == 404:
                 # Déjà finie, plus rien à miser : la relire sans fin bloquerait tout le script (attente jamais
                 # terminée). Le résultat d'une mise posée sera lu plus tard, toutes les 5 minutes.
                 self._finish(target)
+            if e.status == 404:
+                return  # « Enchère introuvable » : retirée du site une fois finie (vu le 14/10/2026), c'est tout
             raise
         auction = data.get("auction", data) if isinstance(data, dict) else {}
         end, now = parse_time(auction.get("end_at")) or target.end_at, time.time()
         if auction.get("status") != "active" or end <= now:
+            if auction.get("status") != "active" and end > now and stage < 2:
+                self.say(f"terminée  {label(target.card, target.value)} : plus en cours avant la fin prévue "
+                         f"(statut « {auction.get('status')} » sur le site), on laisse")
             self._finish(target)
             return
         if end > target.end_at + 1:
@@ -2769,6 +2953,13 @@ class Sniper:
         try:
             data = self.client.get_auction(aid)
         except ApiError as e:
+            if e.status == 404:
+                # « Enchère introuvable » : le site retire les enchères finies (vu le 14/10/2026, 25 min après la fin).
+                # La relire toutes les 5 minutes n'y changerait rien : le résultat est déduit de la collection.
+                self.results.pop(aid, None)
+                purchases.set_status(aid, "vanished")
+                purchases.save()
+                return
             if e.fatal or not stale:
                 raise
             data = None  # illisible depuis 2 jours : suivi abandonné ci-dessous
@@ -2797,6 +2988,33 @@ class Sniper:
         self.ctx.summary[status] += 1
         purchases.set_status(aid, status, final_price=final)
         purchases.save()
+
+
+def settle_vanished(ctx, all_cards):
+    """Mises dont l'enchère a été retirée du site avant la lecture du résultat : gagnée si la carte est maintenant dans
+    la collection, perdue sinon. Le script ne mise que sur des cartes absentes de la collection (buy.skip_owned) ;
+    sans ce réglage, une carte déjà possédée est comptée gagnée et reçoit buy.tag, ce qui la protège sans risque.
+    """
+    owned, changed = {c.card_id for c in all_cards}, False
+    for aid, entry in ctx.purchases.with_status("vanished"):
+        if (entry.get("end_at") or 0) + SETTLE_GRACE > ctx.run_started:
+            continue  # collection lue trop tôt après la fin : au prochain passage
+        name, price = f"{entry.get('name', '')} [{entry.get('rarity', '')}]", entry.get("price")
+        common = (entry.get("name", ""), entry.get("rarity", ""), "", entry.get("card_id", ""), entry.get("value"))
+        if entry.get("card_id") in owned:
+            print(f"  ACHETÉE   {name} : dans la collection (enchère retirée du site, notre dernière mise : {price})")
+            ctx.journal.write("achat", *common, price=price, auction_id=aid, result="OK (déduit de la collection)")
+            status = "won"
+        else:
+            print(f"  perdue    {name} : pas dans la collection (enchère retirée du site)")
+            ctx.journal.write("perdue", *common, auction_id=aid,
+                              result=f"notre dernière mise : {price} (déduit de la collection)")
+            status = "lost"
+        ctx.summary[status] += 1
+        ctx.purchases.set_status(aid, status)
+        changed = True
+    if changed and ctx.execute:
+        ctx.purchases.save()
 
 
 def plan_bought(ctx, cards, all_cards):
@@ -2828,6 +3046,18 @@ def bought_tagged(ctx, cards, all_cards):
         ctx.purchases.save()
 
 
+# « tout » vend et défausse d'abord les cartes déjà étiquetées : ça commence tout de suite, même quand l'analyse doit
+# relire les prix de toute la collection (une heure ou plus quand les prix gardés ont expiré). Les cartes étiquetées
+# pendant l'analyse sont vendues et défaussées juste après (s'il reste des places et si require_existing_tag le permet).
+TOUT_PHASES = [
+    ("Ventes aux enchères", lambda ctx, cards: plan_sell(ctx, cards, tagged="before")),
+    ("Défausses", lambda ctx, cards: plan_discard(ctx, cards, tagged="before")),
+    ("Analyse des prix et étiquettes", plan_analyse),
+    ("Ventes aux enchères (nouvelles étiquettes)", lambda ctx, cards: plan_sell(ctx, cards, tagged="during")),
+    ("Défausses (nouvelles étiquettes)", lambda ctx, cards: plan_discard(ctx, cards, tagged="during")),
+]
+
+
 def run_command(ctx, command):
     ctx.run_started = time.time()
     if command == "boosters" or (command == "tout" and ctx.cfg["packs"]["in_tout"]):
@@ -2849,11 +3079,12 @@ def run_command(ctx, command):
         # avant d'être triée.
         ctx.sniper.read_results()
     cards, warning = ctx.client.list_cards()
-    ctx.collection_ids = {c.copy_id for c in cards}
+    ctx.collection, ctx.collection_ids = cards, {c.copy_id for c in cards}
     ctx.on_sale = set()  # relu par le bilan à chaque passage (sinon --loop ne relancerait jamais une carte)
     print(f"{len(cards)} exemplaire(s) dans la collection.")
     if warning:
         print(f"Attention : {warning}")
+    settle_vanished(ctx, cards)
     # Une ligne ×2, ×3… : on ne sait pas à quel exemplaire s'appliquent étiquettes et défausse, on n'y touche pas.
     all_cards = cards
     grouped = [c for c in cards if c.count > 1]
@@ -2865,7 +3096,7 @@ def run_command(ctx, command):
         cards = [c for c in cards if c.count <= 1]
     # Mise posée dont le résultat n'est pas encore connu : gagnée, la carte est peut-être déjà là, sans buy.tag pour la
     # protéger. On n'y touche pas avant son résultat, sinon elle pourrait être vendue ou défaussée.
-    pending = {e.get("card_id") for _, e in ctx.purchases.with_status("bid")}
+    pending = {e.get("card_id") for status in ("bid", "vanished") for _, e in ctx.purchases.with_status(status)}
     held = [c for c in cards if c.card_id in pending]
     if held:
         print(f"  {len(held)} carte(s) misée(s) aux enchères, résultat pas encore connu, laissée(s) de côté : "
@@ -2887,8 +3118,7 @@ def run_command(ctx, command):
         "analyser": [("Analyse des prix et étiquettes", plan_analyse)],
         "vendre": [("Ventes aux enchères", plan_sell)],
         "defausser": [("Défausses", plan_discard)],
-        "tout": [("Analyse des prix et étiquettes", plan_analyse), ("Ventes aux enchères", plan_sell),
-                 ("Défausses", plan_discard)],
+        "tout": TOUT_PHASES,
     }[command]
     try:
         for n, (title, plan) in enumerate(phases):
@@ -3015,7 +3245,7 @@ def cmd_login(cfg, cfg_file):
         sys.exit(f"Session enregistrée, mais le site la refuse : {e}")
     if client.session_lost:
         sys.exit(f"Session refusée : {client.session_lost}")
-    print(f"Compte {client.username} enregistré ({slots} place(s) d'enchère libre(s)).")
+    print(f"Compte {client.username} enregistré ({'?' if slots is None else slots} place(s) d'enchère libre(s)).")
     others = [a for a in known_accounts(cfg_file) if a != folder.name]
     option = f" --compte {folder.name}" if others else ""
     print(f"Simulation (rien n'est modifié) : {cmd('tout' + option)}")
@@ -3239,8 +3469,13 @@ def main():
                 raise
             except Exception as e:
                 outcome = ("crash", type(e).__name__)
-                raise
+                if not args.loop:
+                    raise
+                # Avec --loop, un plantage n'arrête que ce passage : le suivant réessaie, comme après une erreur du site.
+                print(f"\nPLANTAGE : {crash_report(e)}")
+                print("Le script continue : le prochain passage réessaiera (copiez ce message pour le faire corriger).")
             finally:
+                ctx.summary["retried"], client.retried = client.retried, 0
                 summary_text = print_summary(ctx.summary, args.execute)
                 asleep, reported = sleep_warning(reported), time.time()
                 if asleep:
@@ -3266,12 +3501,16 @@ def main():
             if not args.loop:
                 break
             print(f"\nProchain passage dans {args.loop} minute(s)… (Ctrl+C pour quitter)")
+            deadline = time.time() + args.loop * 60
             try:
                 (ctx.sniper.wait if ctx.sniper else time.sleep)(args.loop * 60)
             except ApiError as e:  # session perdue pendant les achats (les autres erreurs n'arrêtent que la mise)
                 print(f"\nARRÊT : {e}")
                 print_summary(ctx.summary, args.execute)
                 sys.exit(1)
+            except Exception as e:  # plantage des achats : la pause se finit sans eux, le passage suivant a lieu
+                print(f"\n[achats] PLANTAGE : {crash_report(e)}")
+                time.sleep(max(0.0, deadline - time.time()))
     except KeyboardInterrupt:
         print("\nArrêt demandé par l'utilisateur.")
         if outcome[0] == "interrupted":
@@ -3311,6 +3550,8 @@ def print_summary(summary, execute):
         others.append(f"{len(summary['read_error'])} prix illisible(s)")
     if summary["deferred"]:
         others.append(f"{summary['deferred']} action(s) reportée(s) au prochain passage")
+    if summary["retried"]:
+        others.append(f"{summary['retried']} requête(s) renvoyée(s) après une erreur passagère du site")
     if summary["night"]:
         others.append(f"nuit : aucune mise en vente avant {summary['night']}")
     for group, until in summary["paused"].items():

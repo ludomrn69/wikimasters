@@ -427,10 +427,16 @@ class ConfigTest(unittest.TestCase):
         self.assert_rejected(night({"debut": "23:00", "end": "08:00"}), "sell.night.debut : clé inconnue")
         self.assert_rejected(night({"start": "8:00", "end": "08:00"}), "différents")
         self.assert_rejected(night("23:00-08:00"), "sell.night")
+        self.assert_rejected(lambda c: c["discard"].update(night_max_value=10),
+                             "discard.night_max_value demande sell.night")
+        self.assert_rejected(lambda c: (c["sell"].update(night={"start": "23:00", "end": "08:00"}),
+                                        c["discard"].update(night_max_value="10")),
+                             "discard.night_max_value doit être un nombre")
         self.assert_rejected(lambda c: c["buy"].update(accounts=[]), "buy.accounts")
         self.assert_rejected(lambda c: c["buy"].update(accounts="moi"), "buy.accounts")
         cfg = load_cfg()
         cfg["sell"]["night"], cfg["buy"]["accounts"] = {"start": "23:00", "end": "8:00"}, ["moi"]
+        cfg["discard"]["night_max_value"] = 10
         w.check_config(cfg)
 
     def test_unknown_rarities_need_the_unknown_tag_and_unprotected_rarities(self):
@@ -604,6 +610,34 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertEqual(site.tag_unlinks(), [(f"eq.{FACE}", "eq.t-+100")])
         self.assertIn((FACE, "t-+10"), site.tag_links())
 
+    def test_outdated_price_tag_is_kept_when_remove_outdated_is_false(self):
+        site = standard_site(tags={FACE: ["+100"]})
+        self.run_main(site, "analyser", execute=True, mutate=lambda c: c["price_tags"].update(remove_outdated=False))
+        self.assertEqual(site.tag_unlinks(), [])
+        self.assertIn((FACE, "t-+10"), site.tag_links())
+
+    def test_waiting_shown_and_verbose(self):
+        site = standard_site(selling=4, tags=SORTED)
+        quiet = lambda c: c["display"].update(waiting_shown=0)  # noqa: E731
+        output, _ = self.run_main(site, "vendre", mutate=quiet)
+        self.assertNotIn("en attente d'une place : Face", output)
+        self.assertIn("… et 1 autre(s) en attente (--verbose pour tout voir)", output)
+        output, _ = self.run_main(site, "tout", mutate=quiet, args=["--verbose"])
+        self.assertIn("en attente d'une place : Face visible de la Lune [R] valeur=12", output)
+        self.assertIn("PROTÉGÉE  Forest Hills (Queens) (étiquette lyon)", output)  # carte protégée, à l'analyse
+        self.assertNotIn("--verbose pour", output)
+
+    def test_sell_fresh_price_reads_the_price_again(self):
+        site = standard_site(tags={AMPHIBIA: ["+10"]})
+        amphibia = load("collection.json")["collection"][3]["card_id"]
+        keep = lambda c: c["price"].update(cache_hours=6)  # noqa: E731
+        self.run_main(site, "analyser", mutate=keep)  # prix gardés : Amphibia vaut 60
+        site.values[amphibia] = 100
+        output, _ = self.run_main(site, "vendre", mutate=keep)
+        self.assertIn("ENCHÈRE départ=45", output)  # prix gardé
+        self.run_main(site, "vendre", execute=True, mutate=lambda c: (keep(c), c["sell"].update(fresh_price=True)))
+        self.assertEqual(site.sell_bodies(), [{"card_id": AMPHIBIA, "base_amount": 75, "duration_minutes": 30}])
+
     def test_analyse_can_tag_protected_cards_without_unprotecting_them(self):
         site = standard_site()
         self.run_main(site, "tout", execute=True, mutate=lambda c: c["price_tags"].update(tag_protected=True))
@@ -635,6 +669,23 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertGreater(last_mine, max(i for i, u in enumerate(urls) if "/sales" in u))
         self.assertEqual(len(site.sells()), 1)  # 4 enchères en cours au moment de vendre : 1 place
 
+    def test_unreadable_auction_slots_postpone_sales_only(self):
+        # Vu le 14/10/2026 : surchargé, le site répond sans le nombre de places. Tout le passage s'arrêtait.
+        site = standard_site(tags=SORTED)
+        site.overrides[("GET", "/api/marketplace/mine")] = FakeResponse(200, {"auctions": []})
+        output, code = self.run_main(site, "tout", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual((site.sells(), site.discards()), ([], [CHACANA]))
+        self.assertIn("places d'enchère illisibles sur /api/marketplace/mine (champs reçus : auctions)", output)
+        self.assertNotIn("ARRÊT", output)
+        self.assertEqual(len(site.gets("/mine")), 3)  # relue deux fois avant d'abandonner
+
+        site = standard_site(tags=SORTED)
+        site.overrides[("GET", "/api/marketplace/mine")] = [FakeResponse(200, {}), None]
+        output, _ = self.run_main(site, "vendre", execute=True)
+        self.assertEqual(site.sells(), [AMPHIBIA, FACE])
+        self.assertNotIn("illisibles", output)
+
     def test_sell_without_free_slot_reads_no_price(self):
         site = standard_site(selling=5, tags=SORTED)
         output, _ = self.run_main(site, "vendre", execute=True)
@@ -644,7 +695,8 @@ class EndToEndTest(MainHarness, unittest.TestCase):
     def test_sell_random_order(self):
         site = standard_site(tags=SORTED)
         # Mélange simulé qui met la moins chère en premier : prouve que l'ordre ne suit plus le prix.
-        with mock.patch("random.Random.shuffle", side_effect=lambda items: items.sort(key=lambda o: o[1])) as shuffle:
+        cheapest_first = lambda cards: cards.sort(key=lambda c: site.values[c.card_id])  # noqa: E731
+        with mock.patch("random.Random.shuffle", side_effect=cheapest_first) as shuffle:
             self.run_main(site, "vendre", execute=True, mutate=lambda c: c["sell"].update(order="random"))
         self.assertTrue(shuffle.called)
         self.assertEqual(site.sells(), [FACE, AMPHIBIA])
@@ -798,6 +850,56 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.run_main(site, "tout", execute=True)
         self.assertEqual(site.discards(), [CHACANA])
 
+    def test_everything_sells_and_discards_tagged_cards_before_the_analysis(self):
+        # Prix gardés expirés : l'analyse relit toute la collection (une heure ou plus). Les cartes déjà étiquetées
+        # n'attendent pas : vendues et défaussées d'abord, puis celles étiquetées par l'analyse.
+        site = standard_site(tags={CHACANA: ["defausse"], AMPHIBIA: ["+10"]})
+        output, code = self.run_main(site, "tout", execute=True)
+        self.assertEqual(code, 0, output)
+        kinds = ["tag" if "/rest/v1/" in u else "sell" if u.endswith("/api/marketplace") else "discard"
+                 for m, u, b in site.mutations()]
+        self.assertEqual(kinds, ["sell", "discard", "tag", "sell"])
+        self.assertEqual((site.sells(), site.discards()), ([AMPHIBIA, FACE], [CHACANA]))
+        self.assertLess(output.index("== Défausses =="), output.index("== Analyse des prix et étiquettes =="))
+        self.assertIn("== Ventes aux enchères (nouvelles étiquettes) ==", output)
+
+    def test_everything_shares_limits_between_both_steps(self):
+        site = standard_site(tags={CHACANA: ["defausse"], AMPHIBIA: ["+10"]})
+        new = copy.deepcopy(site.pages[0]["collection"][1])
+        new.update(id="cheap-new", card_id="cheap-card-new", tags=[])  # « defausse » posée par l'analyse
+        site.pages[0]["collection"].append(new)
+        site.values["cheap-card-new"] = 2
+        output, code = self.run_main(site, "tout", execute=True, mutate=lambda c: (
+            c["discard"].update(max_per_run=1, require_existing_tag=False), c["sell"].update(max_auctions=1)))
+        self.assertEqual(code, 0, output)
+        self.assertEqual((site.sells(), site.discards()), ([AMPHIBIA], [CHACANA]))
+        self.assertIn("1 autre(s) carte(s) à défausser : 1 au plus par passage", output)
+        self.assertIn("1 carte(s) à vendre, mais aucune place d'enchère libre", output)  # Face visible, étiquetée +10
+
+    def test_random_sale_reads_only_the_prices_it_needs(self):
+        site = standard_site(selling=3)
+        base = site.pages[0]["collection"][3]
+        for n in range(12):
+            item = copy.deepcopy(base)
+            item.update(id=f"sale-{n}", card_id=f"sale-card-{n}", tags=[{"id": "t-+10", "name": "+10"}])
+            site.pages[0]["collection"].append(item)
+            site.values[f"sale-card-{n}"] = 60
+        output, code = self.run_main(site, "vendre", execute=True, mutate=lambda c: c["sell"].update(order="random"))
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(site.sells()), 2)  # 2 places libres
+        self.assertEqual(len(site.gets("/sales")), 2)  # pas les 12 prix
+        self.assertIn("12 carte(s) à vendre dont 0 relance(s), 2 place(s) d'enchère libre(s) → 2 vente(s)", output)
+        self.assertIn("10 en attente d'une place d'enchère", output)
+
+    def test_cards_auto_tags_will_protect_are_never_sold_or_discarded(self):
+        site = standard_site(tags={CHACANA: ["defausse"], AMPHIBIA: ["+10"]})
+        rules = [{"tag": "garder", "when": {"name_contains": "Chacana"}}, {"tag": "garder", "when": {"min_value": 50}}]
+        output, code = self.run_main(site, "defausser", execute=True, mutate=lambda c: c.update(auto_tags=rules))
+        self.assertIn("PROTÉGÉE  Chacana [R] valeur=5 : « analyser » va lui poser « garder » (auto_tags)", output)
+        output, code = self.run_main(site, "vendre", execute=True, mutate=lambda c: c.update(auto_tags=rules))
+        self.assertIn("« analyser » va lui poser « garder » (auto_tags)", output)
+        self.assertEqual((code, site.sells(), site.discards()), (0, [], []))
+
     def test_everything_can_discard_in_same_run_if_configured(self):
         site = standard_site()
         self.run_main(site, "tout", execute=True, mutate=lambda c: c["discard"].update(require_existing_tag=False))
@@ -874,6 +976,24 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertEqual(list(state), ["auction-103-3"])
         self.assertEqual((state["auction-103-3"]["attempt"], state["auction-103-3"]["status"]), (2, "open"))
 
+    def test_unsold_card_back_under_a_new_copy_id_is_relisted_cheaper(self):
+        # Vu le 14/10/2026 : une carte invendue revient dans la collection sous un NOUVEL identifiant d'exemplaire.
+        # Le suivi la cherchait sous l'ancien, la croyait partie, et ne la relançait jamais moins cher.
+        site = standard_site(tags={FACE: ["+10"]})
+        self.run_main(site, "vendre", execute=True)
+        site.auctions["auction-103"] = {"status": "settled_unsold", "winner_id": None,
+                                        "settled_at": "2026-10-14T19:27:23+00:00"}
+        face = next(i for i in site.pages[0]["collection"] if i["id"] == FACE)
+        face.update(id="face-retour", tags=[])  # revenue sans étiquette : l'analyse de « tout » la lui remet
+        output, code = self.run_main(site, "tout", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("INVENDUE  Face visible de la Lune [R] (mise de départ 9, essai 1)", output)
+        self.assertIn({"card_id": "face-retour", "base_amount": 7, "duration_minutes": 30}, site.sell_bodies())  # 9 × 0,8
+        self.assertIn("relance 2", output)
+        state = json.loads((self.acc / "ventes.json").read_text())["auctions"]
+        relaunched = [e for e in state.values() if e["copy_id"] == "face-retour"]
+        self.assertEqual([(e["attempt"], e["status"]) for e in relaunched], [(2, "open")])
+
     def test_relist_with_reused_auction_id_keeps_tracking(self):
         site = standard_site(tags={FACE: ["+10"]})
         (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"auction-103": {
@@ -909,6 +1029,31 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         output, _ = self.run_main(site, "vendre", execute=True)
         self.assertIn("INVENDUE  Face visible", output)
         self.assertEqual(site.sell_bodies(), [{"card_id": FACE, "base_amount": 7, "duration_minutes": 30}])
+
+    def test_vanished_auction_is_settled_from_the_collection(self):
+        # Vu le 14/10/2026 : le site retire les enchères finies (404 « Enchère introuvable »). La carte revenue, même
+        # sous un nouvel exemplaire, est invendue ; sinon vendue, à un prix inconnu. Plus d'ÉCHEC à chaque passage.
+        site = standard_site(tags={FACE: ["+10"]})
+        entry = {"rarity": "R", "price": 9, "attempt": 1, "listed_at": 0, "duration": 30, "status": "open"}
+        (self.acc / "ventes.json").write_text(json.dumps({"auctions": {
+            "auction-1": dict(entry, copy_id="parti", card_id="carte-partie", name="Partie"),
+            "auction-2": dict(entry, copy_id="ancien-face", card_id="dd1bca63-409e-4f4c-baa5-f09398edd4cd",
+                              name="Face visible de la Lune"),
+            "auction-3": dict(entry, copy_id="recent", card_id="carte-recente", name="Récente", listed_at=time.time(),
+                              duration=0),  # finie à l'instant : la collection lue ne le dit peut-être pas encore
+        }}))
+        for aid in ("auction-1", "auction-2", "auction-3"):
+            site.overrides[("GET", f"/api/marketplace/{aid}")] = FakeResponse(404, {"error": "Enchère introuvable"})
+        output, code = self.run_main(site, "vendre", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("ÉCHEC", output)
+        self.assertIn("VENDUE    Partie [R] : prix inconnu, enchère retirée du site", output)
+        self.assertIn("INVENDUE  Face visible de la Lune [R]", output)
+        self.assertEqual(site.sells(), [FACE])  # relancée moins cher sous son nouvel exemplaire
+        self.assertLess(site.sell_bodies()[0]["base_amount"], 9)
+        state = json.loads((self.acc / "ventes.json").read_text(encoding="utf-8"))["auctions"]
+        self.assertEqual(state["auction-3"]["status"], "open")
+        self.assertIn("déduit de la collection, prix inconnu", (self.dir / "journal.csv").read_text(encoding="utf-8-sig"))
 
     def test_unsettled_or_unknown_status_waits(self):
         for auction in ({"status": "ended", "winner_id": None, "settled_at": None}, {"status": "pending"}, [1, 2]):
@@ -956,6 +1101,35 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertEqual(site.discards(), [CHACANA])
         self.assertIn("nuit (23:00-08:00) : aucune mise en vente avant 08:00\n", output)
         self.assertIn("nuit : aucune mise en vente avant 08:00", output.split("Résumé")[-1])
+
+    def test_unsold_cards_under_the_night_cap_are_discarded_at_night_only(self):
+        # La nuit, rien ne se vend : une invendue qui vaut moins de discard.night_max_value est défaussée au lieu d'être
+        # relancée au matin. Une carte jamais mise en vente attend son tour, même bon marché.
+        site = standard_site(tags={FACE: ["+10"], AMPHIBIA: ["+10"]})
+        never = dict(copy.deepcopy(site.pages[0]["collection"][2]), id="jamais-vendue")  # Face (12) jamais en vente
+        site.pages[0]["collection"].append(never)
+        entry = {"rarity": "R", "price": 9, "attempt": 1, "listed_at": 0, "duration": 30}
+        state = {"auctions": {
+            "auction-1": dict(entry, copy_id=FACE, card_id=never["card_id"], name="Face", status="unsold"),
+            "auction-2": dict(entry, copy_id=AMPHIBIA, card_id="amphibia", name="Amphibia", status="abandoned"),
+        }}
+        night = lambda c: (c["sell"].update(night=self.NIGHT), c["discard"].update(night_max_value=15))  # noqa: E731
+        (self.acc / "ventes.json").write_text(json.dumps(state))
+        output, code = self.run_main(site, "tout", execute=True, mutate=night, clock=self.clock_at(2))
+        self.assertEqual(code, 0, output)
+        self.assertEqual((site.discards(), site.sells()), ([FACE], []))
+        self.assertIn("invendues à moins de 15 défaussées aussi (discard.night_max_value) : 2 carte(s)", output)
+        self.assertIn("Amphibia (série télévisée d'animation) [R] valeur=60 : invendue, mais vaut 60", output)
+        remaining = json.loads((self.acc / "ventes.json").read_text(encoding="utf-8"))["auctions"]
+        self.assertEqual(list(remaining), ["auction-2"])  # la défaussée n'a plus de suivi de vente
+
+        # Le jour, la même invendue est relancée, pas défaussée.
+        (self.acc / "ventes.json").write_text(json.dumps(state))
+        site = standard_site(tags={FACE: ["+10"], AMPHIBIA: ["+10"]})
+        output, _ = self.run_main(site, "tout", execute=True, mutate=night, clock=self.clock_at(14))
+        self.assertEqual(site.discards(), [])
+        self.assertIn(FACE, site.sells())
+        self.assertNotIn("night_max_value", output)
 
     def test_no_auction_may_end_at_night(self):
         night = lambda c: c["sell"].update(night=self.NIGHT)  # noqa: E731
@@ -1220,10 +1394,10 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertNotIn("✅", site.telegram[-1][1]["text"])
 
         site = standard_site(tags=SORTED)
-        site.overrides[("GET", "/api/marketplace/mine")] = FakeResponse(200, {})  # réponse inattendue du site
+        site.overrides[("GET", "/api/my-collection")] = FakeResponse(200, {"collection": "?"})  # réponse inattendue
         output, code = self.run_main(site, "vendre", execute=True)
         self.assertEqual(code, 1)
-        self.assertIn("ARRÊT : places d'enchère illisibles", output)  # arrêt propre, pas un plantage
+        self.assertIn("ARRÊT : réponse inattendue sur /api/my-collection", output)  # arrêt propre, pas un plantage
         self.assertIn("Arrêt :", site.telegram[-1][1]["text"])
 
         site = standard_site(tags=SORTED)
@@ -1396,7 +1570,8 @@ class EndToEndTest(MainHarness, unittest.TestCase):
     def test_skipped_phases_are_announced(self):
         site = standard_site()
         output, _ = self.run_main(site, "tout", execute=True, mutate=lambda c: c["safety"].update(max_actions_per_run=1))
-        self.assertIn("Étape(s) non lancée(s) pour cette raison : Ventes aux enchères, Défausses", output)
+        self.assertIn("Étape(s) non lancée(s) pour cette raison : Ventes aux enchères (nouvelles étiquettes), "
+                      "Défausses (nouvelles étiquettes)", output)
 
     def test_value_outside_bands_is_not_called_never_sold(self):
         site = standard_site()
@@ -1453,6 +1628,9 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         output, _ = self.run_main(site, "analyser")
         self.assertIn("defausse : 1, +10 : 2", output)
         self.assertNotIn("ÉCHEC", output)
+        # Erreur 500 isolée (fréquente sur le site) : pas affichée, seulement comptée dans le résumé.
+        self.assertNotIn("nouvel essai", output)
+        self.assertIn("1 requête(s) renvoyée(s) après une erreur passagère du site", output)
 
     def test_unknown_card_404_is_treated_as_never_sold(self):
         site = standard_site()
@@ -1599,6 +1777,34 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertIn("en pause jusqu'à", output)
         self.assertEqual(code, 0)
 
+    def test_crash_with_loop_is_reported_and_the_next_pass_retries(self):
+        # Avec --loop, un plantage (bug, réponse imprévue) n'arrête plus le script : le passage suivant réessaie.
+        site, clock = standard_site(tags=SORTED), Clock()
+        real, calls, cycles = w.plan_sell, [], []
+
+        def plan_sell(ctx, cards, tagged=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyError("bug")
+            return real(ctx, cards, tagged)
+
+        def sleep(seconds):
+            if seconds == 60:  # pause de --loop 1
+                cycles.append(len(site.sells()))
+                clock.now += 60
+                if len(cycles) == 2:
+                    raise KeyboardInterrupt
+
+        perso = {"telegram": {"bot_token": "1:x", "chat_id": 1}}
+        with mock.patch.object(w, "plan_sell", plan_sell):
+            output, code = self.run_main(site, "vendre", execute=True, args=["--loop", "1"], sleep=sleep, clock=clock,
+                                         perso=perso)
+        self.assertEqual((code, cycles), (0, [0, 2]))  # rien au 1er passage, les ventes au 2e
+        self.assertIn("PLANTAGE : KeyError: 'bug'", output)
+        self.assertIn("in plan_sell", output)  # où, pour pouvoir le corriger
+        self.assertIn("le prochain passage réessaiera", output)
+        self.assertIn("Plantage", site.telegram[0][1]["text"])
+
     def test_antibot_check_on_a_read_stops_and_says_what_to_do(self):
         site = standard_site(tags=SORTED)
         site.overrides[("GET", "/api/marketplace/mine")] = FakeResponse(403, self.ANTIBOT)
@@ -1738,6 +1944,8 @@ class Market:
         self.price_latency = 0  # secondes que met le site à répondre à une lecture de prix
         self.checks = []  # (moment, id) de chaque lecture d'une annonce
         self.unreadable = set()  # annonces qui répondent 404 une fois terminées
+        self.vanish = {}  # id -> secondes après la fin pendant lesquelles l'annonce répond 404 (puis à nouveau lisible)
+        self.withdrawn = {}  # id -> moment où l'annonce cesse d'être en cours, avant sa fin (statut « cancelled »)
         self.extend = 0  # prolongation (s) d'une enchère après une mise dans ses dernières secondes, comme le site
 
     def add(self, aid, title, end_in, current=None, value=None, category="", rarity="R", **extra):
@@ -1755,6 +1963,9 @@ class Market:
 
     def _update(self):
         now = self.clock.now
+        for aid, at in self.withdrawn.items():
+            if at <= now and self.auctions[aid]["status"] == "active":
+                self.auctions[aid]["status"] = "cancelled"
         for at, aid, amount in [r for r in self.rivals if r[0] <= now]:
             self.rivals.remove((at, aid, amount))
             self._lands(self.auctions[aid], amount, "rival")
@@ -1796,7 +2007,10 @@ class Market:
             auction = self.auctions[m.group(1)]
             if not m.group(2):
                 self.checks.append((self.clock.now, m.group(1)))
-                if m.group(1) in self.unreadable and self.clock.now >= w.parse_time(auction["end_at"]):
+                end = w.parse_time(auction["end_at"])
+                if m.group(1) in self.unreadable and self.clock.now >= end:
+                    return FakeResponse(404, {"error": "Enchère introuvable"})
+                if end <= self.clock.now < end + self.vanish.get(m.group(1), 0):
                     return FakeResponse(404, {"error": "Enchère introuvable"})
                 return FakeResponse(200, {"auction": copy.deepcopy(auction), "bids": []})
             reply = self.bid_replies.pop(0) if self.bid_replies else None
@@ -1908,6 +2122,24 @@ class MarketTest(MainHarness, unittest.TestCase):
         rows = self.journal_rows()
         self.assertTrue(any("booster;Route 566;C;u1;c1" in r for r in rows), rows)
         self.assertGreaterEqual(self.slept, 1)  # pause entre deux boosters
+
+    def test_no_more_packs_stops_the_boosters_only(self):
+        # Vu le 14/10/2026 : 10 boosters annoncés, mais le 2e refusé (403) et tout le passage arrêté (« session
+        # refusée »). Ni ventes ni défausses jusqu'au cycle suivant, qui s'arrêtait de la même façon.
+        self.market.packs = 10
+        regen = iso(self.clock.now + 600)
+        self.market.pack_replies = [
+            FakeResponse(200, {"cards": [{"id": "c1", "wikipedia_title": "Route 566", "rarity": "C"}]}),
+            FakeResponse(403, {"error": "Plus de paquets disponibles", "packs_remaining": 0, "next_regen_at": regen}),
+        ]
+        output, code = self.run_market("tout", execute=True, packs={"in_tout": True})
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"plus de booster disponible pour l'instant (prochain vers {w.clock_time(w.parse_time(regen))})",
+                      output)
+        self.assertNotIn("ARRÊT", output)
+        self.assertIn("== Défausses (nouvelles étiquettes) ==", output)  # le passage est allé jusqu'au bout
+        self.assertIn("1 booster(s) ouvert(s)", output)
+        self.assertIn("0 échec(s)", output)
 
     def test_packs_dry_run_opens_nothing_and_tout_opens_them_first(self):
         self.market.packs = 2
@@ -2094,8 +2326,75 @@ class MarketTest(MainHarness, unittest.TestCase):
         output, code = self.run_market("acheter", execute=True)
         self.assertEqual(code, 0, output)
         self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
-        self.assertIn("Rue Émile-Zola (Lyon) [R] : aucun résultat depuis 2 jours, suivi abandonné", output)
+        self.assertNotIn("ÉCHEC", output)
+        self.assertEqual(self.purchases()["mk-A"]["status"], "vanished")  # plus relue toutes les 5 minutes
+        # 20 s et 6 s avant la fin, juste après, puis une seule lecture du résultat
+        self.assertEqual(len([c for c in m.checks if c[1] == "mk-A"]), 4)
+
+    def test_crash_on_one_auction_does_not_stop_buying(self):
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.add("mk-B", "Gare de Lyon", 400, current=10, value=20)
+        real = w.Sniper._bid
+
+        def bid(sniper, target, *a, **kw):
+            if target.auction_id == "mk-A":
+                raise ZeroDivisionError("bug")
+            return real(sniper, target, *a, **kw)
+
+        with mock.patch.object(w.Sniper, "_bid", bid):
+            output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("[achats] PLANTAGE (achats continués) : ZeroDivisionError: bug", output)
+        self.assertEqual([aid for _, aid, _ in m.bids], ["mk-B"])
+        self.assertEqual(len([c for c in m.checks if c[1] == "mk-A"]), 1)  # laissée, pas revérifiée sans fin
+
+    def test_vanished_purchase_is_settled_from_the_collection(self):
+        # Le site retire les enchères finies (404) : gagnée si la carte est arrivée dans la collection, perdue sinon.
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.add("mk-B", "Gare de Lyon", 400, current=10, value=20)
+        m.unreadable.update({"mk-A", "mk-B"})
+        self.run_market("acheter", execute=True)
+        self.assertEqual({a: e["status"] for a, e in self.purchases().items()}, {"mk-A": "vanished", "mk-B": "vanished"})
+        won = copy.deepcopy(m.site.pages[0]["collection"][1])
+        won.update(id="copy-won", card_id="card-mk-A", tags=[],
+                   card=dict(won["card"], id="card-mk-A", wikipedia_title="Rue Émile-Zola (Lyon)"))
+        m.site.pages[0]["collection"].append(won)
+        self.clock.now += 600
+        output, code = self.run_market("tout", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("ACHETÉE   Rue Émile-Zola (Lyon) [R] : dans la collection (enchère retirée du site", output)
+        self.assertIn("perdue    Gare de Lyon [R] : pas dans la collection (enchère retirée du site)", output)
+        self.assertIn(("copy-won", LYON_TAG), m.site.tag_links())  # buy.tag la protège
         self.assertEqual(self.purchases(), {})
+        self.assertTrue(any(";achat;" in r and "déduit de la collection" in r for r in self.journal_rows()))
+
+    def test_auction_missing_just_after_its_end_is_not_an_error(self):
+        # Vu le 14/10/2026 : « Enchère introuvable » (404) 3 s après la fin, puis gagnée à la lecture du résultat.
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.vanish["mk-A"] = 30
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("ÉCHEC", output)
+        self.assertIn("ACHETÉE   Rue Émile-Zola (Lyon) [R] pour 12", output)
+
+    def test_auction_withdrawn_before_its_end_is_reported(self):
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.withdrawn["mk-A"] = self.clock.now + 200
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(m.bids, [])
+        self.assertIn("terminée  Rue Émile-Zola (Lyon) [R] valeur=20 : plus en cours avant la fin prévue "
+                      "(statut « cancelled » sur le site), on laisse", output)
+
+    def test_owned_cards_are_followed_when_skip_owned_is_false(self):
+        self.market.add("mk-B", "Gare de Lyon", 200, owned=True, value=50)
+        output, code = self.run_market("acheter", buy={"skip_owned": False})
+        self.assertEqual(code, 0, output)
+        self.assertIn("repérée   Gare de Lyon [R] valeur=50", output)
 
     def test_dry_run_reserves_nothing_for_your_other_accounts(self):
         # Une simulation ne doit pas priver d'achats l'autre compte, qui tourne peut-être pour de vrai.
@@ -2243,6 +2542,21 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertIn("ACHETÉE   Rue Émile-Zola (Lyon) [R] pour 12", output)
         self.assertEqual(self.purchases()["mk-A"]["status"], "won")
 
+    def test_market_scan_stops_after_an_antibot_check_on_a_bid(self):
+        # Vu le 14/10/2026 : la mise demandée pendant une relecture du marché déclenche la vérification, et la
+        # relecture continuait de repérer des annonces (et de lire leur prix) pendant la pause.
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 60, current=10, value=20)
+        m.add("mk-B", "Olympique lyonnais", 200, current=10, value=20)
+        m.add("mk-C", "Musée de Lyon", 250, current=10, value=20)
+        m.price_latency = 30  # la mise sur mk-A tombe pendant la lecture des prix
+        m.bid_replies = [FakeResponse(403, self.ANTIBOT)]
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("achats en pause jusqu'à", output)
+        self.assertNotIn("repérée   Olympique lyonnais", output)
+        self.assertEqual(len(m.site.gets("/api/marketplace/cards/")), 1)
+
     def test_bid_refused_because_of_a_simultaneous_bid_is_raised_at_once(self):
         # Vu le 12/10/2026 : « Mise trop basse (minimum 43) » à 6 s de la fin, puis enchère perdue sous le plafond.
         m = self.market
@@ -2295,8 +2609,9 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertEqual(code, 0, output)
         searches = [u for method, u, *_ in self.market.site.calls if method == "GET" and u.endswith("/api/marketplace")]
         self.assertEqual(len(searches), 3)  # un essai et deux nouvelles tentatives, après 1 s puis 3 s
-        self.assertIn("nouvel essai dans 1 s", output)
+        self.assertNotIn("nouvel essai dans 1 s", output)  # erreur isolée : seulement comptée dans le résumé
         self.assertIn("nouvel essai dans 3 s", output)
+        self.assertIn("2 requête(s) renvoyée(s) après une erreur passagère du site", output)
 
     def test_tout_without_loop_does_not_buy(self):
         self.standard_market()

@@ -84,6 +84,7 @@ discard:
   fresh_price: true       # relire le prix sur le site juste avant de défausser (au lieu du cache)
   require_existing_tag: true  # ne défausser que si « defausse » était déjà là au début du passage :
                               # dans « tout », les cartes qu'analyser vient d'étiqueter attendent le passage suivant
+  night_max_value: null   # la nuit (sell.night), défausser aussi les invendues qui valent moins de N
 
 # ----------------------------------------------------------------------------
 # Ventes aux enchères (commande « vendre »).

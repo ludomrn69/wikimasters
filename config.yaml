@@ -84,6 +84,10 @@ discard:
   fresh_price: true       # prix relu sur le site pendant le passage, juste avant de défausser (au lieu du cache)
   require_existing_tag: false  # true = ne défausser qu'au passage suivant celui qui a posé « defausse »
                                # (pour avoir le temps de vérifier) ; false = dès le premier passage
+  # La nuit (sell.night), rien ne se vend : les invendues (mises aux enchères sans trouver d'acheteur) qui valent
+  # moins de night_max_value sont défaussées au lieu d'être relancées au matin, les moins chères d'abord, prix relu
+  # sur le site juste avant. Les cartes jamais mises en vente attendent leur tour.
+  night_max_value: null   # ex. 10 (null = la nuit ne change rien aux défausses)
 
 # ----------------------------------------------------------------------------
 # Ventes aux enchères (commande « vendre »).
