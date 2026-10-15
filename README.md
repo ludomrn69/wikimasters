@@ -89,7 +89,7 @@ Options, à ajouter à `tout`, `analyser`, `vendre`, `defausser`, `boosters` ou 
 
 Si le prix d'une carte change de tranche, l'ancienne étiquette est remplacée.
 
-**2. Vendre.** Le script fait d'abord le bilan des enchères précédentes (vendue ou invendue). Il relance ensuite les invendus à 80 % de la mise précédente (3 essais au plus), puis remplit les places libres avec des cartes tirées au hasard, à 75 % de leur prix moyen, pour 30 minutes. Seul le prix des cartes tirées est lu : la vente n'attend pas la relecture des centaines d'autres.
+**2. Vendre.** Le script fait d'abord le bilan des enchères précédentes (vendue ou invendue). Il relance ensuite les invendus à 80 % de la mise précédente (3 essais au plus), puis remplit les places libres avec des cartes tirées au hasard, à 75 % de leur prix moyen (`sell.price_factor`), pour 30 minutes (`sell.duration_minutes` ; `sell.long_duration` donne plus de temps aux cartes chères, par exemple 30 min à partir de 100). Seul le prix des cartes tirées est lu : la vente n'attend pas la relecture des centaines d'autres. Avec `--loop`, quand des cartes attendent une place, le passage suivant a lieu dès qu'une enchère du script se termine (1 minute après sa fin, le temps que le site la règle) au lieu d'attendre 15 minutes.
 
 **La nuit, il ne vend rien.** De 23 h à 8 h (heure de l'ordinateur), il ne met aucune carte en vente et ne relance aucun invendu, et il ne lance pas d'enchère qui se terminerait dans ce créneau (donc plus rien après 22 h 30 avec des enchères de 30 minutes). Il continue d'ouvrir les boosters, de poser les étiquettes, de défausser et d'acheter. Avec `--loop`, dès qu'un passage de nuit n'a plus rien fait (ni défausse, ni étiquette), le passage suivant n'a lieu qu'à la fin de la nuit au lieu de revenir toutes les 15 minutes ; les achats, eux, continuent toute la nuit, et une carte gagnée reçoit sa protection au début de ce passage, avant tout tri. Pour changer les heures, dans `perso.yaml` :
 
@@ -130,8 +130,8 @@ protection:
 **Achats.** Toutes les 5 minutes, le script cherche sur le marché les annonces qui se terminent bientôt et dont le titre ou la catégorie contient un mot commençant par un de vos mots-clés (« lyon » trouve « lyonnais » ou « To-Lyon », pas « Elyon »). Pour chacune :
 
 - il ignore les cartes que vous avez déjà, celles déjà trop chères, et celles qui ne se sont jamais vendues (prix inconnu), sauf avec `buy.buy_unknown: true` ;
-- **20 secondes avant la fin**, il mise le minimum accepté par le site (mise actuelle + 10 %, + 1) ;
-- **6 secondes avant la fin**, il revérifie : si quelqu'un l'a dépassé, il remise, toujours sous le plafond ;
+- **20 secondes avant la fin** (`buy.snipe_seconds`), il mise le minimum accepté par le site (mise actuelle + 10 %, + 1). Avec `buy.bid_on_sight: true`, cette première mise part **dès que l'annonce est repérée** (au moins 15 secondes entre deux mises) : quand le site met 30 secondes à répondre, une mise à 20 secondes de la fin arrive souvent trop tard (« Cette enchère est terminée ») ;
+- **6 secondes avant la fin** (`buy.last_check_seconds`, par exemple 30 quand le site est lent), il revérifie : si quelqu'un l'a dépassé, il remise, toujours sous le plafond ;
 - si sa mise est refusée parce qu'un autre joueur vient de miser au même instant (« Mise trop basse »), il remise **aussitôt** le nouveau minimum donné par le site (2 fois au plus), toujours sous le plafond ;
 - une mise de dernière minute fait prolonger l'enchère par le site : le script la suit jusqu'à sa vraie fin, et remise à chaque fois que quelqu'un le dépasse ;
 - le plafond est le **prix moyen** de la carte multiplié par `buy.price_factor` (1 par défaut, 5 pour aller jusqu'à 5 fois le prix moyen), et `buy.max_price` peut ajouter une limite absolue. Avec `price_factor: null`, il n'y a plus de plafond lié au prix ;
@@ -235,7 +235,7 @@ Chaque réglage possible est expliqué en commentaire dans `config.yaml`. Le scr
 
 ## Notifications Telegram (facultatif)
 
-À la fin de chaque passage `--execute`, le script peut vous envoyer le résumé sur Telegram : bilan, arrêt sur erreur, interruption ou plantage.
+Le script vous écrit sur Telegram **seulement quand il faut agir** : aussitôt quand le site demande une vérification anti-robot (avec l'heure de reprise et quoi faire), et à la fin d'un passage arrêté par une erreur, un plantage ou une mise en veille (une seule fois pour un même problème, même s'il dure des heures). En plus, s'il est réglé, un bilan de la journée par compte (ventes, défausses, achats, solde).
 
 1. Créez un bot avec [@BotFather](https://t.me/BotFather) et notez son jeton. Obtenez votre identifiant avec [@userinfobot](https://t.me/userinfobot).
 2. Ajoutez dans `perso.yaml` :
@@ -245,6 +245,8 @@ Chaque réglage possible est expliqué en commentaire dans `config.yaml`. Le scr
      bot_token: "123456789:AAH..."
      chat_id: "123456789"
      notify_on_dry_run: false   # true = aussi pour les simulations
+     daily_report: "22:00"      # bilan de la journée, une fois par jour après cette heure (null = jamais)
+     every_pass: false          # true = un bilan à chaque passage, comme avant
    ```
 
 Le jeton ne va **jamais** dans `config.yaml` : le script refuse de démarrer s'il l'y trouve. Si votre jeton a fuité, régénérez-le avec `/revoke` dans BotFather.

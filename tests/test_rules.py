@@ -703,6 +703,44 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertEqual(site.sells(), [AMPHIBIA, FACE])
         self.assertNotIn("illisibles", output)
 
+    def test_valuable_cards_get_longer_auctions_unless_they_would_end_at_night(self):
+        site = standard_site(tags=SORTED)
+        longer = lambda c: c["sell"].update(duration_minutes=10, long_duration={"from_value": 50, "minutes": 30})  # noqa: E731
+        output, _ = self.run_main(site, "vendre", execute=True, mutate=longer)
+        self.assertEqual([(b["card_id"], b["duration_minutes"]) for b in site.sell_bodies()],
+                         [(AMPHIBIA, 30), (FACE, 10)])
+        self.assertIn("départ=45 30 min", output)
+        state = json.loads((self.acc / "ventes.json").read_text(encoding="utf-8"))["auctions"]
+        self.assertEqual(sorted(e["duration"] for e in state.values()), [10, 30])
+
+        # 22 h 40 : une enchère de 30 min finirait la nuit (23 h), une de 10 min non.
+        (self.acc / "ventes.json").unlink()
+        site = standard_site(tags=SORTED)
+        clock = Clock()
+        clock.now = time.mktime((2026, 10, 14, 22, 40, 0, 0, 0, -1))
+        output, _ = self.run_main(site, "vendre", execute=True, clock=clock, mutate=lambda c: (
+            longer(c), c["sell"].update(night={"start": "23:00", "end": "08:00"})))
+        self.assertEqual(site.sells(), [FACE])
+        self.assertIn("une enchère de 30 min finirait à 23:10, pendant la nuit (sell.night) : vendue au matin", output)
+
+    def test_loop_comes_back_when_an_auction_frees_its_slot(self):
+        # 5 places prises par nos enchères de 10 min et des cartes en attente : le passage suivant a lieu dès que la
+        # première se termine (+ 1 min de réglage), pas 15 minutes plus tard.
+        site, clock, pauses = standard_site(selling=4, tags=SORTED), Clock(), []
+
+        def sleep(seconds):
+            clock.now += seconds
+            if seconds >= 120:
+                pauses.append(seconds)
+                raise KeyboardInterrupt
+
+        output, code = self.run_main(site, "vendre", execute=True, args=["--loop"], sleep=sleep, clock=clock,
+                                     mutate=lambda c: c["sell"].update(duration_minutes=10))
+        self.assertEqual((code, site.sells()), (0, [AMPHIBIA]))  # Face attend une place
+        self.assertIn("Une place d'enchère se libère vers", output)
+        self.assertLess(pauses[0], 15 * 60)
+        self.assertGreaterEqual(pauses[0], w.MIN_LOOP_SECONDS)
+
     def test_sell_without_free_slot_reads_no_price(self):
         site = standard_site(selling=5, tags=SORTED)
         output, _ = self.run_main(site, "vendre", execute=True)
@@ -1434,6 +1472,9 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.run_main(site, "analyser", perso={"telegram": {"bot_token": "123:secret", "chat_id": 42}})
         self.assertEqual(site.telegram, [])  # simulation : notify_on_dry_run vaut false
         self.run_main(site, "analyser", execute=True)
+        self.assertEqual(site.telegram, [])  # passage sans problème : pas de message (sauf telegram.every_pass)
+        self.run_main(site, "analyser", execute=True,
+                      perso={"telegram": {"bot_token": "123:secret", "chat_id": 42, "every_pass": True}})
         url, body = site.telegram[-1]
         self.assertIn("/bot123:secret/sendMessage", url)
         self.assertEqual((body["chat_id"], body["parse_mode"]), ("42", "HTML"))
@@ -1448,6 +1489,7 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.run_main(site, "analyser", execute=True, sleep=interrupt)
         self.assertIn("Interrompu", site.telegram[-1][1]["text"])
         self.assertNotIn("✅", site.telegram[-1][1]["text"])
+        (self.dir / "perso.yaml").write_text(yaml.safe_dump({"telegram": {"bot_token": "123:secret", "chat_id": 42}}))
 
         site = standard_site(tags=SORTED)
         site.overrides[("GET", "/api/my-collection")] = FakeResponse(200, {"collection": "?"})  # réponse inattendue
@@ -1813,6 +1855,54 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertIn("vérification anti-robot : mises en vente en pause jusqu'à", output)
         self.assertIn("mises en vente en pause jusqu'à", output.split("Résumé")[-1])
         self.assertNotIn("login", output)
+
+    TELEGRAM = {"telegram": {"bot_token": "1:x", "chat_id": 1}}
+
+    def test_antibot_pause_is_announced_on_telegram_at_once(self):
+        site = standard_site(tags=SORTED)
+        site.overrides[("POST", "/api/marketplace")] = FakeResponse(403, self.ANTIBOT)
+        output, code = self.run_main(site, "vendre", execute=True, perso=self.TELEGRAM)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(site.telegram), 1)  # l'alerte, pas de bilan (passage sans erreur)
+        text = site.telegram[0][1]["text"]
+        self.assertIn("🛑 Mises en vente en pause jusqu'à", text)
+        self.assertIn("faites l'action à la main", text)
+
+    def test_same_problem_is_reported_once_in_loop(self):
+        site, clock, pauses = standard_site(tags=SORTED), Clock(), []
+        site.overrides[("GET", "/api/my-collection")] = FakeResponse(200, {"collection": "?"})  # à chaque passage
+
+        def sleep(seconds):
+            clock.now += seconds
+            if seconds >= 600:
+                pauses.append(seconds)
+                if len(pauses) == 3:
+                    raise KeyboardInterrupt
+
+        output, code = self.run_main(site, "tout", execute=True, args=["--loop"], sleep=sleep, clock=clock,
+                                     perso=self.TELEGRAM)
+        self.assertEqual(output.count("ARRÊT : réponse inattendue"), 3)
+        self.assertEqual(len(site.telegram), 1)
+
+    def test_daily_report_is_sent_once_after_its_time(self):
+        clock, pauses = Clock(), []
+        clock.now = time.mktime((2026, 10, 16, 21, 50, 0, 0, 0, -1))
+        site = standard_site(tags=SORTED)
+
+        def sleep(seconds):
+            clock.now += seconds
+            if seconds >= 120:
+                pauses.append(seconds)
+                if len(pauses) == 4:
+                    raise KeyboardInterrupt
+
+        perso = {"telegram": {"bot_token": "1:x", "chat_id": 1, "daily_report": "22:00"}}
+        output, code = self.run_main(site, "vendre", execute=True, args=["--loop"], sleep=sleep, clock=clock,
+                                     perso=perso)
+        self.assertEqual(code, 0, output)
+        reports = [b["text"] for _, b in site.telegram if "Bilan du 16/10" in b["text"]]
+        self.assertEqual(len(reports), 1)  # pas avant 22:00, puis une seule fois
+        self.assertIn("2 enchère(s) lancée(s)", reports[0])
 
     def test_antibot_pause_lasts_across_loop_cycles_then_is_retried(self):
         site, clock = standard_site(tags=SORTED), Clock()
@@ -2646,6 +2736,30 @@ class MarketTest(MainHarness, unittest.TestCase):
         pause = output.index("prochain passage à 07:00")
         self.assertGreater(output.index("-> MISE 12       Rue Émile-Zola (Lyon)"), pause)  # misée pendant la pause
         self.assertEqual([aid for _, aid, _ in self.market.bids], ["mk-A"])
+
+    def test_bid_on_sight_bids_at_once_then_answers_an_outbid_at_last_check(self):
+        # Vu le 15/10/2026 : mises à 7 s puis 3 s de la fin refusées (« Cette enchère est terminée ») quand le site
+        # met longtemps à répondre. Avec buy.bid_on_sight, la première mise part dès que l'annonce est repérée
+        # (espacées de SIGHT_SPACING), et une surenchère trouve sa réponse à buy.last_check_seconds de la fin.
+        m, start = self.market, self.clock.now
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.add("mk-B", "Gare de Lyon", 400, current=10, value=20)
+        m.rivals.append((start + 100, "mk-A", 20))
+        buy = {"bid_on_sight": True, "snipe_seconds": 60, "last_check_seconds": 30, "price_factor": 5}
+        output, code = self.run_market("acheter", execute=True, buy=buy)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12), ("mk-B", 12), ("mk-A", 23)])
+        first_a, first_b, again_a = (at - start for at, _, _ in m.bids)
+        self.assertLess(first_a, 10)  # tout de suite, pas 60 s avant la fin
+        self.assertGreaterEqual(first_b - first_a, w.SIGHT_SPACING)
+        self.assertAlmostEqual(again_a, 300 - 30, delta=5)
+
+    def test_last_check_must_come_after_the_bid(self):
+        cfg = load_cfg()
+        cfg["buy"].update(snipe_seconds=20, last_check_seconds=20)
+        with self.assertRaises(SystemExit) as ctx:
+            w.check_config(cfg)
+        self.assertIn("buy.last_check_seconds doit être plus petit que buy.snipe_seconds", str(ctx.exception.code))
 
     def test_each_account_may_search_its_own_keywords_and_names(self):
         # Les recherches (et les mises) réparties entre vos comptes : buy.by_account remplace les mots-clés et les

@@ -101,6 +101,8 @@ sell:
   min_start_price: 1      # mise de départ minimale
   max_start_price: null   # mise de départ maximale (null = pas de plafond)
   duration_minutes: 30    # durée : 10, 30, 60, 180, 360 ou 720 (10 min, 30 min, 1 h, 3 h, 6 h, 12 h)
+  long_duration: null     # ex. { from_value: 100, minutes: 30 } : enchères plus longues pour les cartes qui valent
+                          # au moins from_value (null = toutes durent duration_minutes)
   max_auctions: 5         # enchères lancées au plus par passage (le site en autorise 5 en même temps)
   min_value: 5            # garde-fou : ne vend jamais une carte dont le prix moyen est < 5 (null = pas de vérification)
   fresh_price: false      # true = relire le prix sur le site avant de vendre (sinon : cache de price.cache_hours)
@@ -150,6 +152,8 @@ buy:
   buy_unknown: false      # true = acheter aussi les cartes jamais vendues (prix inconnu), plafonnées par max_price
   skip_owned: true        # ignorer les cartes déjà dans votre collection
   snipe_seconds: 20       # mise quand il reste N secondes (10 au moins)
+  last_check_seconds: 6   # dernière vérification (et surenchère si dépassé) quand il reste N secondes
+  bid_on_sight: false     # true = première mise dès que l'annonce est repérée, sans attendre snipe_seconds
   scan_minutes: 5         # le marché est relu toutes les N minutes
   accounts: null          # comptes qui achètent, ex. ["moncompte"] (noms : ./wm comptes) ; les autres n'achètent
                           # rien. null = tous vos comptes
@@ -185,4 +189,7 @@ display:
 # (voir perso.exemple.yaml), JAMAIS dans ce fichier : sans eux, pas de notification.
 telegram:
   notify_on_dry_run: false   # true = notifier aussi les simulations (false = seulement les passages --execute)
+  every_pass: false          # true = un bilan à chaque passage ; false = seulement quand il faut agir : vérification
+                             # anti-robot (aussitôt), arrêt, plantage, mise en veille (une fois par problème)
+  daily_report: null         # ex. "22:00" : bilan de la journée de chaque compte, une fois par jour après cette heure
 

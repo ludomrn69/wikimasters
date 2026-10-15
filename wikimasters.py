@@ -79,9 +79,12 @@ ANTIBOT_GROUPS = {"auction": "mises en vente", "discard": "défausses", "add_tag
 REFRESH_RETRY_DELAYS = (1, 3)
 MAYBE_DONE = "L'action a peut-être été effectuée : vérifiez sur le site."
 COMMANDS = ("tout", "analyser", "vendre", "defausser", "boosters", "acheter")
-# Achats : après la mise de buy.snipe_seconds, dernière vérification de l'enchère quand il reste ce nombre de
-# secondes (pour répondre à une surenchère de dernière minute).
+# Achats : une annonce qui finit dans moins de ce nombre de secondes n'est plus suivie (trop tard pour miser). La
+# dernière vérification, pour répondre à une surenchère, a lieu à buy.last_check_seconds de la fin.
 LAST_CHECK_SECONDS = 6
+# buy.bid_on_sight : les mises sur les annonces repérées à la même relecture partent espacées d'au moins ce nombre de
+# secondes (des mises enchaînées déclenchent la vérification anti-robot du site).
+SIGHT_SPACING = 15
 # Mise refusée parce qu'un autre joueur vient de miser (409 « Mise trop basse », avec le nouveau minimum) : ce minimum
 # est remisé aussitôt, toujours sous le plafond, au plus ce nombre de fois de suite.
 TOO_LOW_RETRIES = 2
@@ -404,7 +407,8 @@ def check_config(cfg):
     boolean(disc, "discard", "require_existing_tag")
 
     sell = section("sell", ("tags", "order", "price_factor", "rounding", "min_start_price", "max_start_price",
-                            "duration_minutes", "max_auctions", "min_value", "fresh_price", "require_existing_tag",
+                            "duration_minutes", "long_duration", "max_auctions", "min_value", "fresh_price",
+                            "require_existing_tag",
                             "relist", "night"))
     sell_tags = str_list(sell, "sell", "tags", allow_empty=False)
     number(sell, "sell", "price_factor", 0, strict=True)
@@ -417,6 +421,13 @@ def check_config(cfg):
     boolean(sell, "sell", "fresh_price")
     boolean(sell, "sell", "require_existing_tag")
     choice(sell, "sell", "duration_minutes", sorted(KNOWN_DURATIONS))
+    long_duration = sell.get("long_duration")
+    if long_duration is not None and not isinstance(long_duration, dict):
+        err("sell.long_duration doit valoir { from_value: 100, minutes: 30 } (ou null)")
+    elif long_duration is not None:
+        unknown_keys(long_duration, "sell.long_duration", ("from_value", "minutes"))
+        number(long_duration, "sell.long_duration", "from_value", 0)
+        choice(long_duration, "sell.long_duration", "minutes", sorted(KNOWN_DURATIONS))
     number(sell, "sell", "max_auctions", 0, integer=True)
     if _is_int(sell.get("max_auctions")) and sell["max_auctions"] > SITE_MAX_AUCTIONS:
         err(f"sell.max_auctions ne peut pas dépasser {SITE_MAX_AUCTIONS} (limite du site)")
@@ -452,8 +463,8 @@ def check_config(cfg):
     number(packs, "packs", "delay_seconds", 0)
 
     buy = section("buy", ("keywords", "tag", "keyword_tags", "names", "names_tags", "names_minutes", "price_factor",
-                          "max_price", "buy_unknown", "skip_owned", "snipe_seconds", "scan_minutes", "accounts",
-                          "by_account"))
+                          "max_price", "buy_unknown", "skip_owned", "snipe_seconds", "last_check_seconds",
+                          "bid_on_sight", "scan_minutes", "accounts", "by_account"))
     by_account = buy.get("by_account")
     if by_account is not None and not isinstance(by_account, dict):
         err("buy.by_account doit valoir { compte: { keywords: […], names: […] }, … } (ou null)")
@@ -472,6 +483,11 @@ def check_config(cfg):
     boolean(buy, "buy", "buy_unknown")
     boolean(buy, "buy", "skip_owned")
     number(buy, "buy", "snipe_seconds", 10)
+    number(buy, "buy", "last_check_seconds", 3)
+    if _is_number(buy.get("snipe_seconds")) and _is_number(buy.get("last_check_seconds")) \
+            and buy["last_check_seconds"] >= buy["snipe_seconds"]:
+        err("buy.last_check_seconds doit être plus petit que buy.snipe_seconds (la vérification suit la mise)")
+    boolean(buy, "buy", "bid_on_sight")
     number(buy, "buy", "scan_minutes", 1)
     if buy.get("tag") is not None and (not isinstance(buy["tag"], str) or not buy["tag"].strip()):
         err("buy.tag doit être un texte (ou null)")
@@ -552,9 +568,12 @@ def check_config(cfg):
     if not isinstance(telegram, dict):
         err("telegram : section mal écrite")
     else:
-        unknown_keys(telegram, "telegram", ("notify_on_dry_run", "bot_token", "chat_id"))
-        if "notify_on_dry_run" in telegram:
-            boolean(telegram, "telegram", "notify_on_dry_run")
+        unknown_keys(telegram, "telegram", ("notify_on_dry_run", "every_pass", "daily_report", "bot_token", "chat_id"))
+        for key in ("notify_on_dry_run", "every_pass"):
+            if key in telegram:
+                boolean(telegram, "telegram", key)
+        if telegram.get("daily_report") is not None and clock_minutes(telegram["daily_report"]) is None:
+            err("telegram.daily_report doit être une heure entre guillemets, ex. \"22:00\" (ou null)")
         if telegram.get("bot_token") is not None and not isinstance(telegram["bot_token"], str):
             err("telegram.bot_token doit être un texte entre guillemets")
         if telegram.get("chat_id") is not None and not isinstance(telegram["chat_id"], (str, int)):
@@ -986,6 +1005,21 @@ def at_night(timestamp, night):
     t = time.localtime(timestamp)
     now, start, end = t.tm_hour * 60 + t.tm_min, clock_minutes(night["start"]), clock_minutes(night["end"])
     return start <= now < end if start < end else now >= start or now < end
+
+
+# --loop : une place d'enchère libérée est remplie au passage suivant, lancé ce délai après la fin prévue de l'enchère
+# (le site la règle d'abord), mais jamais moins de MIN_LOOP_SECONDS après la fin du passage.
+SLOT_GRACE_SECONDS, MIN_LOOP_SECONDS = 60, 120
+
+
+def next_free_slot(ctx):
+    """Moment où une enchère lancée par le script libère sa place (fin prévue + SLOT_GRACE_SECONDS), ou None.
+    Une enchère prolongée par une mise de dernière minute (fin prévue passée de peu) compte aussi : bientôt finie."""
+    now = time.time()
+    ends = [(e.get("listed_at") or 0) + 60 * (e.get("duration") or 0) + SLOT_GRACE_SECONDS
+            for _, e in ctx.state.with_status("open")]
+    ends = [t for t in ends if t > now - 300]
+    return min(ends) if ends else None
 
 
 def night_end(timestamp, night):
@@ -1533,7 +1567,7 @@ class Journal:
             return True
         self._prepare()
         row = {
-            "date": time.strftime("%Y-%m-%d %H:%M:%S"), "compte": self._text(self.account), "commande": self.command,
+            "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), "compte": self._text(self.account), "commande": self.command,
             "action": action, "carte": self._text(name), "rarete": self._text(rarity), "exemplaire": copy_id,
             "carte_id": card_id, "enchere_id": auction_id or "", "valeur_moyenne": self._number(value),
             "prix": self._number(price), "duree_min": self._number(duration), "resultat": self._text(result),
@@ -1873,6 +1907,7 @@ class Offer:
     price: int
     attempt: int = 1
     relaunches: str | None = None
+    duration: int | None = None  # minutes (None : sell.duration_minutes)
 
 
 @dataclass
@@ -1894,6 +1929,7 @@ class Context:
     antibot: dict = field(default_factory=dict)
     purchases: object = None  # PurchaseState : enchères du marché où le script a misé
     sniper: object = None  # Sniper, quand les achats sont actifs (« acheter », ou « tout --loop » avec buy.keywords)
+    notify: object = None  # envoie aussitôt une alerte Telegram (texte), si les notifications sont configurées
 
 
 # --- Commandes --------------------------------------------------------------
@@ -1947,6 +1983,11 @@ def antibot_strike(ctx, kind):
     print(f"     Le site demande une vérification anti-robot : {group} en pause jusqu'à {clock_time(entry['until'])} "
           "(le reste continue).")
     print(f"     {ANTIBOT_HINT}")
+    if ctx.notify:
+        again = f", {entry['strikes']}e fois de suite" if entry["strikes"] > 1 else ""
+        ctx.notify(f"🛑 {group.capitalize()} en pause jusqu'à {clock_time(entry['until'])} : le site demande une "
+                   f"vérification anti-robot{again}. Pour reprendre plus tôt : sur wiki-masters.com avec ce compte, "
+                   f"faites l'action à la main (passez la vérification). Le reste continue.")
 
 
 def read_values(client, cards, cfg, cache, since=0, quiet=False):
@@ -2200,6 +2241,15 @@ def follow_returned_copies(ctx):
             ctx.state.set_status(auction_id, "gone")
 
 
+def auction_minutes(value, sell):
+    """Durée de l'enchère : plus longue pour les cartes chères (sell.long_duration), qui trouvent rarement preneur en
+    10 minutes (vu le 15/10/2026 : 1 vendue sur 18 à 100 ou plus)."""
+    long = sell.get("long_duration")
+    if long and value is not None and value >= long["from_value"]:
+        return long["minutes"]
+    return sell["duration_minutes"]
+
+
 def relist_price(previous, value, sell):
     """Mise d'une relance : moins que la précédente, jamais plus que la mise normale au prix actuel."""
     relist = sell["relist"]
@@ -2291,8 +2341,15 @@ def plan_sell(ctx, cards, tagged=None):
                   "(discard.unsold_max_value)")
             return None
         previous = ctx.state.latest_for(card.copy_id, "unsold") if relist["enabled"] else None
+        duration = auction_minutes(value, sell)
+        ends = time.time() + 60 * duration
+        if at_night(ends, night):
+            summary["skip"].add(card.copy_id)
+            print(f"  ignorée   {label(card, value)} : une enchère de {duration} min finirait à {clock_time(ends)}, "
+                  f"pendant la nuit (sell.night) : vendue au matin")
+            return None
         if not previous:
-            return card, value, Offer(start_price(value, sell), 1)
+            return card, value, Offer(start_price(value, sell), 1, duration=duration)
         auction_id, entry = previous
         attempt = int(entry.get("attempt", 1)) + 1
         if attempt > relist["max_attempts"]:
@@ -2300,7 +2357,7 @@ def plan_sell(ctx, cards, tagged=None):
             ctx.state.set_status(auction_id, "abandoned")
             print(f"  ignorée   {label(card, value)} : invendue {attempt - 1} fois (sell.relist.max_attempts)")
             return None
-        return card, value, Offer(relist_price(entry["price"], value, sell), attempt, auction_id)
+        return card, value, Offer(relist_price(entry["price"], value, sell), attempt, auction_id, duration)
 
     since = ctx.run_started if sell["fresh_price"] else 0
     if sell["order"] == "random":
@@ -2521,7 +2578,8 @@ class Runner:
     @staticmethod
     def _describe(kind, arg):
         if kind == "auction":
-            return f"ENCHÈRE départ={arg.price}" + (f" (relance {arg.attempt})" if arg.attempt > 1 else "")
+            return f"ENCHÈRE départ={arg.price}" + (f" (relance {arg.attempt})" if arg.attempt > 1 else "") \
+                + (f" {arg.duration} min" if arg.duration and arg.duration >= 30 else "")
         return {"add_tag": f"+ étiquette « {arg} »", "remove_tag": f"- étiquette « {arg} »", "discard": "DÉFAUSSE"}[kind]
 
     def _log(self, card, kind, arg, value, result, balance=None, auction_id=""):
@@ -2529,7 +2587,7 @@ class Runner:
                   "auction": "relance" if kind == "auction" and arg.attempt > 1 else "enchere"}[kind]
         extra = {}
         if kind == "auction":
-            extra = dict(price=arg.price, duration=self.cfg["sell"]["duration_minutes"])
+            extra = dict(price=arg.price, duration=arg.duration or self.cfg["sell"]["duration_minutes"])
         elif kind in ("add_tag", "remove_tag"):
             result = f"{result} ({arg})"
         self.ctx.journal.card(action, card, value, result=result, balance=balance, auction_id=auction_id, **extra)
@@ -2548,7 +2606,7 @@ class Runner:
             self.ctx.state.close_copy(card.copy_id, "gone")  # invendue défaussée la nuit : plus rien à relancer
             self._log(card, kind, arg, value, "OK", balance=balance)
             return f"OK, solde : {'?' if balance is None else balance}"
-        duration = self.cfg["sell"]["duration_minutes"]
+        duration = arg.duration or self.cfg["sell"]["duration_minutes"]
         response = as_dict(self.client.create_auction(card, arg.price, duration))
         auction_id = response.get("auction_id")
         # D'abord clore les anciens invendus de cet exemplaire : le site pourrait redonner le même identifiant.
@@ -2622,7 +2680,8 @@ def open_packs(ctx):
 
 @dataclass
 class Target:
-    """Enchère du marché suivie par les achats : mise à fin - buy.snipe_seconds, revue à fin - LAST_CHECK_SECONDS."""
+    """Enchère du marché suivie par les achats : mise à fin - buy.snipe_seconds (ou dès sight_at, voir
+    buy.bid_on_sight), revue à fin - buy.last_check_seconds."""
 
     auction_id: str
     card: Card  # copy_id vide : la carte n'est pas (encore) à nous
@@ -2632,6 +2691,7 @@ class Target:
     stage: int = 0  # 0 : mise à venir, 1 : dernière vérification à venir, 2 : fin (ou prolongation) à constater
     bid: int | None = None  # dernière mise du script sur cette enchère
     tags: list = field(default_factory=list)  # étiquettes de protection de la carte gagnée (voir Sniper._tags_for)
+    sight_at: float | None = None  # buy.bid_on_sight : première mise dès ce moment, sans attendre la fin
 
 
 class Sniper:
@@ -2657,6 +2717,7 @@ class Sniper:
         # card_id -> {auction_id: (annonce, fin)} : autres annonces d'une carte déjà suivie, reprises si elle est perdue
         self.spares = {}
         self.name_turn = 0  # prochain nom de buy.names à chercher
+        self.last_sight = 0.0  # buy.bid_on_sight : moment prévu de la dernière première mise
         self.results = {}  # auction_id -> moment de lire le résultat d'une enchère où le script a misé
         self.next_scan = 0.0
         self.busy = False  # lecture du marché ou mise en cours : une pause demandée entre-temps est une simple pause
@@ -2704,9 +2765,10 @@ class Sniper:
 
     def _due(self, target):
         if target.stage == 0:
-            return target.end_at - self.buy["snipe_seconds"]
+            snipe = target.end_at - self.buy["snipe_seconds"]
+            return snipe if target.sight_at is None else min(snipe, target.sight_at)
         if target.stage == 1:
-            return target.end_at - LAST_CHECK_SECONDS
+            return target.end_at - self.buy["last_check_seconds"]
         return target.end_at + AFTER_END_SECONDS
 
     def _next_check(self):
@@ -2873,7 +2935,12 @@ class Sniper:
             if self.ctx.verbose or not quiet:
                 self.say(f"ignorée   {label(card, value)} : {reason}")
             return read
-        self.targets[aid] = Target(aid, card, end, value, ceiling, tags=self._tags_for(auction, info))
+        sight = None
+        if self.buy["bid_on_sight"]:
+            # Mise sans attendre la fin : jamais en retard (le site met parfois 30 s à répondre), et une mise faite
+            # dans la dernière minute fait prolonger l'enchère de toute façon. Espacées entre elles (anti-robot).
+            sight = self.last_sight = max(time.time(), self.last_sight + SIGHT_SPACING)
+        self.targets[aid] = Target(aid, card, end, value, ceiling, tags=self._tags_for(auction, info), sight_at=sight)
         current = auction.get("current_bid")
         self.say(f"repérée   {label(card, value)} : fin à {time.strftime('%H:%M:%S', time.localtime(end))}, "
                  f"mise actuelle {'aucune' if current is None else current}, plafond {show_ceiling(ceiling)}")
@@ -3466,7 +3533,53 @@ def telegram_settings(cfg):
         print(f"Attention : il faut telegram.bot_token ET telegram.chat_id dans {PERSO_FILE} : pas de notification.")
         return None
     return {"bot_token": token.strip(), "chat_id": str(chat_id).strip(),
-            "notify_on_dry_run": tg.get("notify_on_dry_run", False)}
+            "notify_on_dry_run": tg.get("notify_on_dry_run", False), "every_pass": tg.get("every_pass", False),
+            "daily_report": tg.get("daily_report")}
+
+
+def telegram_alert(username, text):
+    """Alerte envoyée aussitôt (pas à la fin du passage)."""
+    return f"<b>[WikiMasters]</b> {html.escape(username)}\n{html.escape(text, quote=False)}"
+
+
+def daily_report(journal, day):
+    """Bilan de la journée de ce compte, d'après journal.csv : ventes, défausses, achats, blocages."""
+    try:
+        with open(journal.path, encoding="utf-8-sig", newline="") as f:
+            rows = [r for r in csv.DictReader(f, delimiter=journal.delimiter)
+                    if r.get("compte") == journal.account and str(r.get("date", "")).startswith(day)]
+    except OSError:
+        return None
+
+    def count(action):
+        return sum(1 for r in rows if r.get("action") == action)
+
+    def total(action):
+        return sum(float(r.get("prix") or 0) for r in rows if r.get("action") == action and _is_price(r.get("prix")))
+
+    sold, unsold = count("vendue"), count("invendue")
+    lines = [
+        f"Ventes : {sold} vendue(s) pour {total('vendue'):g} wikicoins, {unsold} invendue(s), "
+        f"{count('enchere') + count('relance')} enchère(s) lancée(s)",
+        f"Défausses : {count('defausse')}",
+    ]
+    if count("mise") or count("achat"):
+        lines.append(f"Achats : {count('achat')} carte(s) pour {total('achat'):g} wikibidous, {count('perdue')} perdue(s)")
+    blocked = sum(1 for r in rows if "anti-robot" in str(r.get("resultat", "")))
+    if blocked:
+        lines.append(f"Vérifications anti-robot : {blocked}")
+    balance = next((r["solde"] for r in reversed(rows) if r.get("solde")), None)
+    if balance:
+        lines.append(f"Solde : {balance}")
+    return "\n".join(lines)
+
+
+def _is_price(text):
+    try:
+        float(text)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def telegram_message(username, command, outcome, summary_text):
@@ -3575,7 +3688,11 @@ def main():
         lock.acquire()
     keep_awake()
 
+    alerts = telegram and (args.execute or telegram["notify_on_dry_run"])
+    if alerts:
+        ctx.notify = lambda text: send_telegram(telegram, telegram_alert(client.username, text))
     outcome, cycle, reported = ("ok", None), 0, time.time()
+    last_problem, report_day = None, None
     try:
         while True:
             # Un bilan par cycle de --loop.
@@ -3626,8 +3743,23 @@ def main():
                 if ctx.journal.diverted:
                     print(f"Attention : {ctx.journal.diverted} ligne(s) écrite(s) dans {ctx.journal.backup.name} "
                           f"({journal_cfg['file']} verrouillé), recopiée(s) au prochain passage.")
-                if telegram and (args.execute or telegram["notify_on_dry_run"]):
+                # Telegram : un message seulement quand il faut agir (arrêt, plantage, veille), une fois par problème
+                # (un site en panne des heures n'envoie pas un message par passage), sauf telegram.every_pass.
+                problem = (outcome[1] if outcome[0] in ("error", "crash") else None) or asleep
+                if alerts and (telegram["every_pass"] or (problem and problem != last_problem)):
                     send_telegram(telegram, telegram_message(client.username, args.command, outcome, summary_text))
+                last_problem = problem
+                # Bilan de la journée, une fois par jour, au premier passage après telegram.daily_report.
+                local, at = time.localtime(time.time()), clock_minutes(telegram and telegram["daily_report"])
+                today = time.strftime("%Y-%m-%d", local)
+                if alerts and args.execute and at is not None and local.tm_hour * 60 + local.tm_min >= at \
+                        and report_day != today:
+                    report_day, text = today, daily_report(ctx.journal, today)
+                    if text:
+                        title = f"📊 Bilan du {time.strftime('%d/%m', local)}"
+                        send_telegram(telegram, telegram_alert(client.username, f"{title}\n{text}"))
+                # Cartes en attente d'une place : le passage suivant a lieu dès qu'une enchère se termine.
+                waiting = ctx.summary["no_slot"] and not antibot_until(ctx, "auction")
                 # Rien fait et rien de reporté : la nuit, inutile de revenir toutes les 15 minutes (voir plus bas).
                 idle = not any(ctx.summary[k] for k in ("tag_add", "tag_remove", "discard", "auction", "pack",
                                                         "deferred"))
@@ -3651,6 +3783,11 @@ def main():
                 buying = " (les achats continuent)" if ctx.sniper and ctx.sniper.market else ""
                 print(f"\nNuit : plus rien à vendre ni à défausser, prochain passage à {night['end']}{buying} "
                       "(Ctrl+C pour quitter)")
+            elif outcome[0] == "ok" and waiting and (free := next_free_slot(ctx)) and free < now + args.loop * 60:
+                # Une place d'enchère se libère avant le passage prévu : il a lieu dès qu'elle est libre.
+                pause = max(MIN_LOOP_SECONDS, free - now)
+                print(f"\nUne place d'enchère se libère vers {clock_time(free)} : prochain passage dans "
+                      f"{pause / 60:.0f} minute(s)… (Ctrl+C pour quitter)")
             else:
                 pause = args.loop * 60
                 print(f"\nProchain passage dans {args.loop} minute(s)… (Ctrl+C pour quitter)")
