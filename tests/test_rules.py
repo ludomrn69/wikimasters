@@ -363,6 +363,13 @@ class ConfigTest(unittest.TestCase):
                                         c.update(auto_tags=[{"tag": "poubelle", "when": {"max_value": 2}}])),
                              "défausse ne peut pas")
 
+    def test_auto_tags_name_contains_may_be_a_list(self):
+        self.assert_rejected(lambda c: c.update(auto_tags=[{"tag": "x", "when": {"name_contains": []}}]), "name_contains")
+        self.assert_rejected(lambda c: c.update(auto_tags=[{"tag": "x", "when": {"name_contains": 3}}]), "name_contains")
+        cfg = load_cfg()
+        cfg["auto_tags"] = [{"tag": "x", "when": {"name_contains": ["Rayan Cherki", "Olympique lyonnais"]}}]
+        w.check_config(cfg)
+
     def test_guards_must_match_bands(self):
         self.assert_rejected(lambda c: c["price_tags"]["bands"][0].update(below=20) or
                              c["price_tags"]["bands"][1].update({"from": 20}), "jamais défaussées")
@@ -427,16 +434,13 @@ class ConfigTest(unittest.TestCase):
         self.assert_rejected(night({"debut": "23:00", "end": "08:00"}), "sell.night.debut : clé inconnue")
         self.assert_rejected(night({"start": "8:00", "end": "08:00"}), "différents")
         self.assert_rejected(night("23:00-08:00"), "sell.night")
-        self.assert_rejected(lambda c: c["discard"].update(night_max_value=10),
-                             "discard.night_max_value demande sell.night")
-        self.assert_rejected(lambda c: (c["sell"].update(night={"start": "23:00", "end": "08:00"}),
-                                        c["discard"].update(night_max_value="10")),
-                             "discard.night_max_value doit être un nombre")
+        self.assert_rejected(lambda c: c["discard"].update(unsold_max_value="10"),
+                             "discard.unsold_max_value doit être un nombre")
         self.assert_rejected(lambda c: c["buy"].update(accounts=[]), "buy.accounts")
         self.assert_rejected(lambda c: c["buy"].update(accounts="moi"), "buy.accounts")
         cfg = load_cfg()
         cfg["sell"]["night"], cfg["buy"]["accounts"] = {"start": "23:00", "end": "8:00"}, ["moi"]
-        cfg["discard"]["night_max_value"] = 10
+        cfg["discard"]["unsold_max_value"] = 10
         w.check_config(cfg)
 
     def test_unknown_rarities_need_the_unknown_tag_and_unprotected_rarities(self):
@@ -615,6 +619,19 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.run_main(site, "analyser", execute=True, mutate=lambda c: c["price_tags"].update(remove_outdated=False))
         self.assertEqual(site.tag_unlinks(), [])
         self.assertIn((FACE, "t-+10"), site.tag_links())
+
+    def test_auto_tags_by_name_also_go_on_protected_cards(self):
+        # « OL » posée par analyser sur un joueur déjà protégé (étiquette « lyon ») : sans lire son prix.
+        site = standard_site()
+        cfg = lambda c: (c["protection"]["tags"].append("OL"),  # noqa: E731
+                         c.update(auto_tags=[{"tag": "OL", "when": {"name_contains": ["Rayan Cherki", "Forest Hills"]}},
+                                             {"tag": "lyon", "when": {"name_contains": ["Chacana"]}}]))
+        output, code = self.run_main(site, "analyser", execute=True, mutate=cfg)
+        self.assertEqual(code, 0, output)
+        self.assertIn("-> + étiquette « OL »         Forest Hills (Queens) [R] valeur=?", output)
+        self.assertNotIn(FOREST, [u.split("/")[-2] for u in site.gets("/sales")])  # prix jamais lu
+        self.assertIn("-> + étiquette « lyon »       Chacana [R] valeur=5", output)  # protégée plutôt que « defausse »
+        self.assertNotIn("« defausse »", output.split("Chacana")[0][-80:])
 
     def test_waiting_shown_and_verbose(self):
         site = standard_site(selling=4, tags=SORTED)
@@ -1102,9 +1119,9 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertIn("nuit (23:00-08:00) : aucune mise en vente avant 08:00\n", output)
         self.assertIn("nuit : aucune mise en vente avant 08:00", output.split("Résumé")[-1])
 
-    def test_unsold_cards_under_the_night_cap_are_discarded_at_night_only(self):
-        # La nuit, rien ne se vend : une invendue qui vaut moins de discard.night_max_value est défaussée au lieu d'être
-        # relancée au matin. Une carte jamais mise en vente attend son tour, même bon marché.
+    def test_cheap_unsold_cards_are_discarded_instead_of_relisted(self):
+        # Relancée, une invendue qui vaut 5 partirait à 1 ou 2 wikicoins et occuperait une place d'enchère : sous
+        # discard.unsold_max_value, elle est défaussée. Une carte jamais mise en vente est vendue, même bon marché.
         site = standard_site(tags={FACE: ["+10"], AMPHIBIA: ["+10"]})
         never = dict(copy.deepcopy(site.pages[0]["collection"][2]), id="jamais-vendue")  # Face (12) jamais en vente
         site.pages[0]["collection"].append(never)
@@ -1113,23 +1130,62 @@ class EndToEndTest(MainHarness, unittest.TestCase):
             "auction-1": dict(entry, copy_id=FACE, card_id=never["card_id"], name="Face", status="unsold"),
             "auction-2": dict(entry, copy_id=AMPHIBIA, card_id="amphibia", name="Amphibia", status="abandoned"),
         }}
-        night = lambda c: (c["sell"].update(night=self.NIGHT), c["discard"].update(night_max_value=15))  # noqa: E731
         (self.acc / "ventes.json").write_text(json.dumps(state))
-        output, code = self.run_main(site, "tout", execute=True, mutate=night, clock=self.clock_at(2))
+        cap = lambda c: c["discard"].update(unsold_max_value=15)  # noqa: E731
+        output, code = self.run_main(site, "tout", execute=True, mutate=cap)
         self.assertEqual(code, 0, output)
-        self.assertEqual((site.discards(), site.sells()), ([FACE], []))
-        self.assertIn("invendues à moins de 15 défaussées aussi (discard.night_max_value) : 2 carte(s)", output)
+        self.assertEqual((site.discards(), site.sells()), ([FACE], ["jamais-vendue"]))
+        self.assertIn("Face visible de la Lune [R] valeur=12 : invendue à moins de 15, défaussée plutôt que relancée",
+                      output)
         self.assertIn("Amphibia (série télévisée d'animation) [R] valeur=60 : invendue, mais vaut 60", output)
         remaining = json.loads((self.acc / "ventes.json").read_text(encoding="utf-8"))["auctions"]
-        self.assertEqual(list(remaining), ["auction-2"])  # la défaussée n'a plus de suivi de vente
+        self.assertNotIn("auction-1", remaining)  # la défaussée n'a plus de suivi de vente
+        self.assertEqual(remaining["auction-2"]["status"], "abandoned")
 
-        # Le jour, la même invendue est relancée, pas défaussée.
+        # La nuit aussi (rien ne se vend).
         (self.acc / "ventes.json").write_text(json.dumps(state))
         site = standard_site(tags={FACE: ["+10"], AMPHIBIA: ["+10"]})
-        output, _ = self.run_main(site, "tout", execute=True, mutate=night, clock=self.clock_at(14))
+        self.run_main(site, "tout", execute=True, clock=self.clock_at(2),
+                      mutate=lambda c: (cap(c), c["sell"].update(night=self.NIGHT)))
+        self.assertEqual((site.discards(), site.sells()), ([FACE], []))
+
+        # Sans le réglage, elle est relancée moins cher, comme avant.
+        (self.acc / "ventes.json").write_text(json.dumps(state))
+        site = standard_site(tags={FACE: ["+10"], AMPHIBIA: ["+10"]})
+        output, _ = self.run_main(site, "tout", execute=True)
         self.assertEqual(site.discards(), [])
         self.assertIn(FACE, site.sells())
-        self.assertNotIn("night_max_value", output)
+        self.assertNotIn("unsold_max_value", output)
+
+    def test_loop_sleeps_until_morning_once_the_night_has_nothing_left(self):
+        # La nuit, un passage qui n'a plus rien fait : pause jusqu'à la fin de la nuit, au lieu de revenir toutes les
+        # 15 minutes. Le jour, ou tant qu'il reste à faire, le rythme de --loop.
+        night = {"start": "00:00", "end": "07:00"}
+        for hour, expected in ((2, ["15 min", "jusqu'à 07:00"]), (14, ["15 min", "15 min"])):
+            site, clock, pauses = standard_site(tags=SORTED), self.clock_at(hour), []
+
+            def sleep(seconds):
+                clock.now += seconds
+                if seconds >= 600:  # pauses de --loop (les autres : entre deux requêtes)
+                    pauses.append(clock.now)
+                    # Le faux site garde les cartes défaussées : Chacana quitte la collection, comme sur le vrai.
+                    site.pages[0]["collection"] = [i for i in site.pages[0]["collection"] if i["id"] != CHACANA]
+                    if len(pauses) == 2:
+                        raise KeyboardInterrupt
+
+            (self.acc / "ventes.json").unlink(missing_ok=True)
+            output, code = self.run_main(site, "tout", execute=True, clock=clock, sleep=sleep, args=["--loop"],
+                                         mutate=lambda c: (c["sell"].update(night=night),
+                                                           c["discard"].update(require_existing_tag=False)))
+            self.assertEqual(code, 0, output)
+            self.assertEqual(site.discards(), [CHACANA])  # 1er passage : quelque chose à faire
+            woke = [time.strftime("%H:%M", time.localtime(t)) for t in pauses]
+            if hour == 2:
+                self.assertIn("Nuit : plus rien à vendre ni à défausser, prochain passage à 07:00", output)
+                self.assertEqual(woke[1], "07:00")
+            else:
+                self.assertNotIn("plus rien à vendre", output)
+                self.assertLess(pauses[1] - pauses[0], 3600)
 
     def test_no_auction_may_end_at_night(self):
         night = lambda c: c["sell"].update(night=self.NIGHT)  # noqa: E731
@@ -2047,7 +2103,7 @@ class MarketTest(MainHarness, unittest.TestCase):
 
     def run_market(self, command, execute=False, buy=None, packs=None, **kw):
         def mutate(cfg):
-            cfg["buy"].update(keywords=["lyon"], tag="lyon", **(buy or {}))
+            cfg["buy"].update({"keywords": ["lyon"], "tag": "lyon", **(buy or {})})
             cfg["packs"].update(packs or {})
             cfg["safety"]["read_delay_seconds"] = 1
         return self.run_main(self.market, command, execute=execute, mutate=mutate, clock=self.clock,
@@ -2492,6 +2548,120 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertIn((CHACANA, LYON_TAG), self.market.site.tag_links())
         self.assertNotIn(CHACANA, self.market.site.discards())  # sans l'étiquette, elle aurait été défaussée
         self.assertEqual(self.purchases(), {})
+
+    def test_keyword_tag_protects_the_cards_won_with_that_keyword(self):
+        # « pnl » trouve les chansons et albums par leur catégorie (« chanson de PNL ») ; la carte gagnée reçoit
+        # l'étiquette « pnl » (buy.keyword_tags), pas buy.tag.
+        perso = {"protection": {"tags": ["favori", "garder", "lyon", "pnl"]}}
+        buy = {"keywords": ["lyon", "pnl"], "keyword_tags": {"PNL": "pnl"}}
+        self.market.add("mk-P", "Au DD", 300, current=10, value=20, category="chanson de PNL, sortie en 2019")
+        output, code = self.run_market("acheter", execute=True, buy=buy, perso=perso)
+        self.assertEqual(code, 0, output)
+        self.assertIn("ACHETÉE   Au DD [R] pour 12 wikibidous (étiquette « pnl » au prochain tri)", output)
+        self.assertEqual(self.purchases()["mk-P"]["tags"], ["pnl"])
+
+        chacana = load("collection.json")["collection"][1]["card_id"]  # vaut 5 : défaussée sans sa protection
+        (self.acc / "achats.json").write_text(json.dumps({"auctions": {"mk-Z": {
+            "card_id": chacana, "name": "Chacana", "rarity": "R", "value": 5, "price": 4,
+            "end_at": self.clock.now - 100, "status": "won", "tags": ["pnl"]}}}), encoding="utf-8")
+        output, code = self.run_market("tout", execute=True, buy=buy, perso=perso)
+        self.assertEqual(code, 0, output)
+        self.assertIn("== Cartes achetées : étiquette « pnl » ==", output)
+        self.assertIn("-> + étiquette « pnl »", output)
+        self.assertNotIn(CHACANA, self.market.site.discards())
+        self.assertEqual(self.purchases(), {})
+
+    def test_keyword_tags_are_checked(self):
+        cfg = load_cfg()
+        cfg["buy"].update(keywords=["lyon", "pnl"], tag="lyon", keyword_tags={"pnl": "pnl", "olympique": ["lyon", 3]},
+                          names=["Rayan Cherki"], names_tags=["lyon", "OL"])
+        with self.assertRaises(SystemExit) as ctx:
+            w.check_config(cfg)
+        for where in ("buy.keyword_tags.pnl", "buy.keyword_tags.olympique", "buy.names_tags"):
+            self.assertIn(f"{where} doit être une étiquette de protection.tags", str(ctx.exception.code))
+        cfg["protection"]["tags"] += ["pnl", "OL"]
+        cfg["buy"]["keyword_tags"]["olympique"] = ["lyon", "OL"]
+        w.check_config(cfg)
+
+    def test_club_cards_get_every_tag_of_their_group(self):
+        # « Saison … de l'Olympique lyonnais », trouvée par « lyon », reçoit « lyon » et « OL » (buy.keyword_tags) ;
+        # un joueur trouvé par son nom reçoit buy.names_tags ; une rue de Lyon, seulement buy.tag.
+        m = self.market
+        m.add("mk-S", "Saison 2019-2020 de l'Olympique lyonnais", 300, current=10, value=20)
+        m.add("mk-C", "Rayan Cherki", 400, current=10, value=20, category="footballeur français")
+        m.add("mk-R", "Rue Dubois", 500, current=10, value=20, category="rue de Lyon, en France")
+        perso = {"protection": {"tags": ["favori", "garder", "lyon", "OL"]}}
+        buy = {"keyword_tags": {"olympique lyonnais": ["lyon", "OL"]}, "names": ["Rayan Cherki"],
+               "names_tags": ["lyon", "OL"], "names_minutes": 5}
+        output, code = self.run_market("acheter", execute=True, buy=buy, perso=perso)
+        self.assertEqual(code, 0, output)
+        self.assertEqual({aid: e["tags"] for aid, e in self.purchases().items()},
+                         {"mk-S": ["lyon", "OL"], "mk-C": ["lyon", "OL"], "mk-R": ["lyon"]})
+        self.assertIn("(étiquette « lyon », « OL » au prochain tri)", output)
+
+    def test_names_are_searched_in_turn_and_followed_until_their_next_turn(self):
+        # Une recherche par nom renvoie toutes ses annonces, même lointaines, et le site met jusqu'à 30 s à répondre :
+        # chaque nom est cherché à son tour (ici un par relecture), et ses annonces suivies jusqu'à son tour suivant.
+        m = self.market
+        m.add("mk-C", "Rayan Cherki", 1200, current=10, value=20, category="footballeur français")  # dans 20 min
+        m.add("mk-T", "Anas Tajaouart", 300, current=10, value=20, category="joueur de football marocain")
+        buy = {"keywords": [], "names": ["Rayan Cherki", "Houssem Aouar", "Karim Benzema"], "names_minutes": 15}
+        output, code = self.run_market("acheter", execute=True, buy=buy)
+        self.assertEqual(code, 0, output)
+        queries = [p["q"] for method, u, _, _, p in m.site.calls if method == "GET" and u.endswith("/api/marketplace")]
+        self.assertEqual(queries, ["Rayan Cherki"])  # 3 noms en 15 min, relecture toutes les 5 min : un à la fois
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-C", 12)])  # au-delà des 10 min des mots-clés
+        self.assertNotIn("Tajaouart", output)  # trouvée par la recherche, mais pas ce nom-là
+
+    def test_another_auction_of_the_card_is_taken_when_the_followed_one_gets_too_expensive(self):
+        m = self.market
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        m.add("mk-B", "Rue Émile-Zola (Lyon)", 500, current=10, value=20, card_id="card-mk-A",
+              card={"id": "card-mk-A", "wikipedia_title": "Rue Émile-Zola (Lyon)", "category": "", "rarity": "R"})
+        m.rivals.append((self.clock.now + 200, "mk-A", 40))  # au-delà du plafond (20) avant notre mise
+        output, code = self.run_market("acheter", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("trop chère Rue Émile-Zola (Lyon) [R] valeur=20 : mise minimale", output)
+        self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-B", 12)])
+
+    def test_buying_goes_on_during_the_night_pause(self):
+        # La nuit, plus rien à vendre ni à défausser : prochain passage à 7 h, mais les achats continuent.
+        self.clock.now = start = time.mktime((2026, 10, 14, 2, 0, 0, 0, 0, -1))
+        site = standard_site(tags={FACE: ["+10"], AMPHIBIA: ["+10"]})  # collection déjà triée : rien à faire
+        site.pages[0]["collection"] = [i for i in site.pages[0]["collection"] if i["id"] != CHACANA]
+        self.market = Market(site, self.clock)
+        self.market.add("mk-A", "Rue Émile-Zola (Lyon)", 2 * 3600, current=10, value=20)  # finit à 4 h
+
+        def sleep(seconds):
+            MarketTest.sleep(self, seconds)
+            if self.clock.now > start + 2.5 * 3600:
+                raise KeyboardInterrupt
+
+        self.sleep = sleep  # utilisé par run_market
+        perso = {"sell": {"night": {"start": "00:00", "end": "07:00"}}}
+        output, code = self.run_market("tout", execute=True, args=["--loop"], perso=perso)
+        self.assertEqual(code, 0, output)
+        self.assertIn("Nuit : plus rien à vendre ni à défausser, prochain passage à 07:00 (les achats continuent)",
+                      output)
+        pause = output.index("prochain passage à 07:00")
+        self.assertGreater(output.index("-> MISE 12       Rue Émile-Zola (Lyon)"), pause)  # misée pendant la pause
+        self.assertEqual([aid for _, aid, _ in self.market.bids], ["mk-A"])
+
+    def test_each_account_may_search_its_own_keywords_and_names(self):
+        # Les recherches (et les mises) réparties entre vos comptes : buy.by_account remplace les mots-clés et les
+        # noms du compte qui tourne.
+        self.market.add("mk-P", "Au DD", 300, current=10, value=20, category="chanson de PNL, sortie en 2019")
+        buy = {"by_account": {"Testeur": {"keywords": ["pnl"], "names": ["Rayan Cherki"], "names_minutes": 5}}}
+        output, code = self.run_market("acheter", execute=True, buy=buy)
+        self.assertEqual(code, 0, output)
+        queries = [p["q"] for m, u, _, _, p in self.market.site.calls if m == "GET" and u.endswith("/api/marketplace")]
+        self.assertEqual(queries, ["pnl", "Rayan Cherki"])  # et plus « lyon », le mot-clé commun
+        self.assertEqual([aid for _, aid, _ in self.market.bids], ["mk-P"])
+
+        output, code = self.run_market("acheter", buy={"by_account": {"autre": {"keywords": ["pnl"]}}})
+        self.assertIn("buy.by_account : compte(s) inconnu(s) autre", str(code))
+        output, code = self.run_market("acheter", buy={"by_account": {"testeur": {"tag": "pnl"}}})
+        self.assertIn("buy.by_account.testeur.tag : clé inconnue", str(code))
 
     def test_card_whose_bid_result_is_unknown_is_never_sold_or_discarded(self):
         # Enchère finie pendant que le script ne tournait pas : sans son résultat, la carte gagnée arrivait sans

@@ -63,7 +63,8 @@ price_tags:
   tag_protected: false    # true = étiqueter aussi les cartes protégées (elles restent protégées)
 
 # Étiquettes supplémentaires posées par « analyser » selon des conditions (combinées en ET).
-# Conditions : name_contains, rarity_in, shiny, min_value, max_value. Exemples :
+# Conditions : name_contains (un texte, ou une liste : l'un d'eux), rarity_in, shiny, min_value, max_value.
+# Une règle sans min_value ni max_value s'applique aussi aux cartes protégées. Exemples :
 #   - tag: "à surveiller"
 #     color: "#eab308"
 #     when: { min_value: 50, rarity_in: ["R", "SR"] }
@@ -84,10 +85,10 @@ discard:
   fresh_price: true       # prix relu sur le site pendant le passage, juste avant de défausser (au lieu du cache)
   require_existing_tag: false  # true = ne défausser qu'au passage suivant celui qui a posé « defausse »
                                # (pour avoir le temps de vérifier) ; false = dès le premier passage
-  # La nuit (sell.night), rien ne se vend : les invendues (mises aux enchères sans trouver d'acheteur) qui valent
-  # moins de night_max_value sont défaussées au lieu d'être relancées au matin, les moins chères d'abord, prix relu
-  # sur le site juste avant. Les cartes jamais mises en vente attendent leur tour.
-  night_max_value: null   # ex. 10 (null = la nuit ne change rien aux défausses)
+  # Invendues (mises aux enchères sans trouver d'acheteur) qui valent moins de unsold_max_value : défaussées au lieu
+  # d'être relancées (une relance partirait à 1 ou 2 wikicoins et occuperait une place d'enchère), prix relu sur le
+  # site juste avant. Les cartes jamais mises en vente attendent leur tour.
+  unsold_max_value: null  # ex. 10 (null = toujours relancer, voir sell.relist)
 
 # ----------------------------------------------------------------------------
 # Ventes aux enchères (commande « vendre »).
@@ -137,6 +138,13 @@ buy:
                           # « lyon » trouve « lyonnais » ou « To-Lyon », pas « Elyon »
   tag: null               # étiquette posée sur les cartes gagnées. Elle doit être dans protection.tags,
                           # sinon « analyser » pourrait les revendre ou les défausser. Ex. "lyon"
+  keyword_tags: {}        # étiquette(s) selon un texte du titre ou de la catégorie (sinon tag), chacune dans
+                          # protection.tags, ex. { pnl: "pnl", "olympique lyonnais": ["lyon", "OL"] }
+  names: []               # cartes cherchées par leur nom (ex. ["Rayan Cherki"]). Chacun est cherché à son tour,
+                          # environ toutes les names_minutes : une recherche par nom renvoie toutes ses annonces,
+                          # même lointaines, et le site met parfois 30 s à répondre à chaque recherche
+  names_tags: null        # étiquette(s) des cartes trouvées par leur nom, ex. ["lyon", "OL"] (null = tag)
+  names_minutes: 60
   price_factor: 1.0       # plafond = prix moyen de la carte × 1,0 ; null = pas de plafond lié au prix
   max_price: null         # plafond absolu par carte, en wikibidous (null = pas d'autre plafond)
   buy_unknown: false      # true = acheter aussi les cartes jamais vendues (prix inconnu), plafonnées par max_price

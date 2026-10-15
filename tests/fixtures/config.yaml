@@ -84,7 +84,7 @@ discard:
   fresh_price: true       # relire le prix sur le site juste avant de défausser (au lieu du cache)
   require_existing_tag: true  # ne défausser que si « defausse » était déjà là au début du passage :
                               # dans « tout », les cartes qu'analyser vient d'étiqueter attendent le passage suivant
-  night_max_value: null   # la nuit (sell.night), défausser aussi les invendues qui valent moins de N
+  unsold_max_value: null  # défausser au lieu de relancer les invendues qui valent moins de N
 
 # ----------------------------------------------------------------------------
 # Ventes aux enchères (commande « vendre »).
@@ -130,6 +130,10 @@ buy:
                           # « lyon » trouve « lyonnais » ou « To-Lyon », pas « Elyon »
   tag: null               # étiquette posée sur les cartes gagnées. Elle doit être dans protection.tags,
                           # sinon « analyser » pourrait les revendre ou les défausser. Ex. "lyon"
+  keyword_tags: {}        # étiquette selon le mot-clé (sinon tag)
+  names: []               # cartes cherchées par leur nom, chacun à son tour
+  names_tags: null        # étiquette(s) des cartes trouvées par leur nom (null = tag)
+  names_minutes: 60       # chaque nom environ toutes les N minutes
   price_factor: 1.0       # plafond = prix moyen de la carte × 1,0 ; null = pas de plafond lié au prix
   max_price: null         # plafond absolu par carte, en wikibidous (null = pas d'autre plafond)
   buy_unknown: false      # true = acheter aussi les cartes jamais vendues (prix inconnu), plafonnées par max_price

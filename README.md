@@ -91,18 +91,18 @@ Si le prix d'une carte change de tranche, l'ancienne étiquette est remplacée.
 
 **2. Vendre.** Le script fait d'abord le bilan des enchères précédentes (vendue ou invendue). Il relance ensuite les invendus à 80 % de la mise précédente (3 essais au plus), puis remplit les places libres avec des cartes tirées au hasard, à 75 % de leur prix moyen, pour 30 minutes. Seul le prix des cartes tirées est lu : la vente n'attend pas la relecture des centaines d'autres.
 
-**La nuit, il ne vend rien.** De 23 h à 8 h (heure de l'ordinateur), il ne met aucune carte en vente et ne relance aucun invendu, et il ne lance pas d'enchère qui se terminerait dans ce créneau (donc plus rien après 22 h 30 avec des enchères de 30 minutes). Il continue d'ouvrir les boosters, de poser les étiquettes, de défausser et d'acheter. Pour changer les heures, dans `perso.yaml` :
+**La nuit, il ne vend rien.** De 23 h à 8 h (heure de l'ordinateur), il ne met aucune carte en vente et ne relance aucun invendu, et il ne lance pas d'enchère qui se terminerait dans ce créneau (donc plus rien après 22 h 30 avec des enchères de 30 minutes). Il continue d'ouvrir les boosters, de poser les étiquettes, de défausser et d'acheter. Avec `--loop`, dès qu'un passage de nuit n'a plus rien fait (ni défausse, ni étiquette), le passage suivant n'a lieu qu'à la fin de la nuit au lieu de revenir toutes les 15 minutes ; les achats, eux, continuent toute la nuit, et une carte gagnée reçoit sa protection au début de ce passage, avant tout tri. Pour changer les heures, dans `perso.yaml` :
 
 ```yaml
 sell:
   night: { start: "00:00", end: "07:00" }   # heures entre guillemets ; null = vendre à toute heure
 ```
 
-**La nuit, il peut aussi défausser les invendues bon marché** au lieu de les relancer au matin : les cartes mises aux enchères sans trouver d'acheteur (même plusieurs fois) qui valent moins de `night_max_value` (prix relu sur le site juste avant). Les cartes jamais mises en vente ne sont pas touchées : elles attendent leur tour. Désactivé par défaut ; dans `perso.yaml` :
+**Il peut aussi défausser les invendues bon marché** au lieu de les relancer : relancée, une carte qui vaut 5 partirait à 1 ou 2 wikicoins et occuperait une place d'enchère pour à peu près ce que rapporte une défausse. Ce sont les cartes mises aux enchères sans trouver d'acheteur (même plusieurs fois) qui valent moins de `unsold_max_value` (prix relu sur le site juste avant), de jour comme de nuit. Les cartes jamais mises en vente ne sont pas touchées : elles attendent leur tour. Désactivé par défaut ; dans `perso.yaml` :
 
 ```yaml
 discard:
-  night_max_value: 10   # la nuit, défausser les invendues qui valent moins de 10 (null = jamais)
+  unsold_max_value: 10   # défausser au lieu de relancer les invendues qui valent moins de 10 (null = toujours relancer)
 ```
 
 **3. Défausser.** Par lots de 10 cartes : le prix des 10 cartes est relu sur le site, puis elles sont défaussées, et ainsi de suite. Une carte qui vaut maintenant 5 ou plus est épargnée. Le script fait au plus 200 défausses par passage ; la suite au passage suivant. Le site répond lentement (environ 7 secondes par prix) : comptez environ 40 minutes pour 200 défausses.
@@ -136,6 +136,39 @@ protection:
 - une mise de dernière minute fait prolonger l'enchère par le site : le script la suit jusqu'à sa vraie fin, et remise à chaque fois que quelqu'un le dépasse ;
 - le plafond est le **prix moyen** de la carte multiplié par `buy.price_factor` (1 par défaut, 5 pour aller jusqu'à 5 fois le prix moyen), et `buy.max_price` peut ajouter une limite absolue. Avec `price_factor: null`, il n'y a plus de plafond lié au prix ;
 - une carte gagnée reçoit l'étiquette `buy.tag` au passage suivant, avant toute analyse : elle n'est donc jamais revendue ni défaussée. Tant que le résultat d'une mise n'est pas connu, la carte n'est pas touchée. Ce résultat est lu au début de chaque passage `--execute` (même sans `--loop`), et même pendant une pause anti-robot des achats.
+- une même carte a souvent plusieurs annonces : le script n'en suit qu'une, et si elle devient trop chère ou qu'il la perd, il passe à une autre annonce de la même carte.
+
+**Des étiquettes selon la carte.** `buy.keyword_tags` donne une ou plusieurs étiquettes (à mettre aussi dans `protection.tags`) aux cartes dont le titre ou la catégorie contient un texte ; les autres reçoivent `buy.tag`. La recherche porte sur le titre et la courte description de la carte : « pnl » trouve « PNL (groupe) », mais aussi « Au DD (chanson de PNL) » ou « Deux Frères (album de PNL) ». Avec `"olympique lyonnais": ["lyon", "OL"]`, une « Saison 2019-2020 de l'Olympique lyonnais » trouvée par « lyon » reçoit les deux.
+
+**Des cartes par leur nom.** Un footballeur est décrit seulement comme « footballeur français », sans son club : pour acheter les joueurs de l'OL, il faut donner leurs noms dans `buy.names` ; ils reçoivent `buy.names_tags` (sinon `buy.tag`). Chaque recherche prend parfois 30 secondes : chaque nom est cherché à son tour, environ toutes les `buy.names_minutes` (60 par défaut), et toutes ses annonces jusqu'à son tour suivant sont suivies.
+
+**Répartir les achats entre vos comptes.** Tous les comptes de `buy.accounts` achètent, et une même annonce n'est suivie que par l'un d'eux. Pour qu'ils ne fassent pas les mêmes recherches, `buy.by_account` remplace les mots-clés et les noms d'un compte : moins de recherches et de mises par compte, donc moins de vérifications anti-robot.
+
+```yaml
+buy:
+  accounts: ["compte1", "compte2"]
+  keywords: ["lyon", "pnl", "plk"]        # compte1
+  by_account:
+    compte2: { keywords: [], names: ["Rayan Cherki", "Maxence Caqueret"] }
+```
+
+**Les cartes que vous avez déjà** reçoivent les mêmes étiquettes avec `auto_tags` (posées par l'analyse, même sur une carte déjà protégée). En YAML, `&ol` nomme la liste et `*ol` la reprend, pour ne pas l'écrire deux fois :
+
+```yaml
+buy:
+  keywords: ["lyon", "pnl", "plk"]
+  tag: "lyon"
+  keyword_tags: { pnl: "pnl", plk: "plk", "olympique lyonnais": ["lyon", "OL"] }
+  names: &ol ["Rayan Cherki", "Maxence Caqueret"]
+  names_tags: ["lyon", "OL"]
+
+auto_tags:
+  - { tag: "OL", when: { name_contains: *ol } }
+  - { tag: "lyon", when: { name_contains: *ol } }
+
+protection:
+  tags: ["garder", "favori", "lyon", "OL", "pnl", "plk"]
+```
 
 Pour miser à la seconde près, le script doit tourner en continu :
 
