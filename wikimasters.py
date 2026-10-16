@@ -72,8 +72,11 @@ ANTIBOT_PAUSES = (3600, 7200, 14400, 28800)
 ANTIBOT_CODE = "human_verification_required"
 ANTIBOT_HINT = ("Ouvrez wiki-masters.com dans votre navigateur avec ce compte et faites l'action à la main "
                 "(passez la vérification si elle s'affiche), puis relancez le script.")
-ANTIBOT_GROUPS = {"auction": "mises en vente", "discard": "défausses", "add_tag": "étiquettes",
-                  "remove_tag": "étiquettes", "pack": "boosters", "bid": "achats"}
+# Ventes, mises et boosters sont bloqués ensemble : la vérification vaut pour tout le marché du compte (vu les 15 et
+# 16/10/2026 : après un blocage des mises, la mise en vente suivante l'est aussi, et l'inverse). Les défausses non.
+MARKET_GROUP = "ventes, achats et boosters"
+ANTIBOT_GROUPS = {"auction": MARKET_GROUP, "pack": MARKET_GROUP, "bid": MARKET_GROUP, "discard": "défausses",
+                  "add_tag": "étiquettes", "remove_tag": "étiquettes"}
 # Nouvelles tentatives du renouvellement de session (réseau, 429, 5xx). Rapides : si la première demande était
 # arrivée, Supabase accepte encore l'ancien jeton pendant quelques secondes, au-delà il révoquerait la session.
 REFRESH_RETRY_DELAYS = (1, 3)
@@ -85,6 +88,10 @@ LAST_CHECK_SECONDS = 6
 # buy.bid_on_sight : les mises sur les annonces repérées à la même relecture partent espacées d'au moins ce nombre de
 # secondes (des mises enchaînées déclenchent la vérification anti-robot du site).
 SIGHT_SPACING = 15
+# buy.max_bids : le site bloque le marché du compte après une dizaine de mises rapprochées (vu les 15 et 16/10/2026 :
+# 10 mises acceptées, la 11e refusée, 6 fois sur 8). Ces dernières places sont gardées pour répondre à une surenchère
+# sur une enchère où le script a déjà misé, plutôt que de la perdre pour une nouvelle.
+BID_RESERVE = 2
 # Mise refusée parce qu'un autre joueur vient de miser (409 « Mise trop basse », avec le nouveau minimum) : ce minimum
 # est remisé aussitôt, toujours sous le plafond, au plus ce nombre de fois de suite.
 TOO_LOW_RETRIES = 2
@@ -243,7 +250,7 @@ def _is_int(x):
     return isinstance(x, int) and not isinstance(x, bool)
 
 
-CONDITION_KEYS = {"name_contains", "rarity_in", "shiny", "min_value", "max_value"}
+CONDITION_KEYS = {"name_contains", "name_words", "rarity_in", "shiny", "min_value", "max_value"}
 
 
 def check_config(cfg):
@@ -300,8 +307,9 @@ def check_config(cfg):
         unknown_keys(cond, where, CONDITION_KEYS)
         if "rarity_in" in cond:
             str_list(cond, where, "rarity_in", allow_empty=False)
-        if "name_contains" in cond and not isinstance(cond["name_contains"], str):
-            str_list(cond, where, "name_contains", allow_empty=False)  # ou une liste : l'un de ces textes
+        for key in ("name_contains", "name_words"):
+            if key in cond and not isinstance(cond[key], str):
+                str_list(cond, where, key, allow_empty=False)  # ou une liste : l'un de ces textes
         if "shiny" in cond and not isinstance(cond["shiny"], bool):
             err(f"{where}.shiny doit valoir true ou false")
         for key in ("min_value", "max_value"):
@@ -464,7 +472,15 @@ def check_config(cfg):
 
     buy = section("buy", ("keywords", "tag", "keyword_tags", "names", "names_tags", "names_minutes", "price_factor",
                           "max_price", "buy_unknown", "skip_owned", "snipe_seconds", "last_check_seconds",
-                          "bid_on_sight", "scan_minutes", "accounts", "by_account"))
+                          "bid_on_sight", "max_bids", "exclude", "scan_minutes", "accounts", "by_account"))
+    str_list(buy, "buy", "exclude")
+    max_bids = buy.get("max_bids")
+    if max_bids is not None and not isinstance(max_bids, dict):
+        err("buy.max_bids doit valoir { count: 8, minutes: 30 } (ou null)")
+    elif max_bids is not None:
+        unknown_keys(max_bids, "buy.max_bids", ("count", "minutes"))
+        number(max_bids, "buy.max_bids", "count", BID_RESERVE + 1, integer=True)
+        number(max_bids, "buy.max_bids", "minutes", 1)
     by_account = buy.get("by_account")
     if by_account is not None and not isinstance(by_account, dict):
         err("buy.by_account doit valoir { compte: { keywords: […], names: […] }, … } (ou null)")
@@ -874,14 +890,16 @@ def text_list(value):
     return [value] if isinstance(value, str) else list(value or [])
 
 
-def found_in(key, text):
+def found_in(key, text, whole=False):
     """key est-il dans text (déjà normalisé), en début de mot ? « lyon » trouve « lyonnais » ou « To-Lyon », pas
-    « Elyon »."""
-    return re.search(r"(?<!\w)" + re.escape(norm(key)), text) is not None
+    « Elyon ». whole : en mots entiers (un nom : « Lucas Perri » ne trouve pas « Lucas Perrin »)."""
+    return re.search(r"(?<!\w)" + re.escape(norm(key)) + (r"(?!\w)" if whole else ""), text) is not None
 
 
 def matches(card, value, cond):
     if "name_contains" in cond and not any(norm(n) in norm(card.name) for n in text_list(cond["name_contains"])):
+        return False
+    if "name_words" in cond and not any(found_in(n, norm(card.name), whole=True) for n in text_list(cond["name_words"])):
         return False
     if "rarity_in" in cond and norm(card.rarity) not in {norm(r) for r in cond["rarity_in"]}:
         return False
@@ -1984,10 +2002,12 @@ def antibot_strike(ctx, kind):
           "(le reste continue).")
     print(f"     {ANTIBOT_HINT}")
     if ctx.notify:
-        again = f", {entry['strikes']}e fois de suite" if entry["strikes"] > 1 else ""
-        ctx.notify(f"🛑 {group.capitalize()} en pause jusqu'à {clock_time(entry['until'])} : le site demande une "
-                   f"vérification anti-robot{again}. Pour reprendre plus tôt : sur wiki-masters.com avec ce compte, "
-                   f"faites l'action à la main (passez la vérification). Le reste continue.")
+        # Le blocage ne se lève souvent pas tout seul (vu le 16/10/2026 : encore là au matin, 7 h plus tard).
+        again = f" ({entry['strikes']}e fois de suite)" if entry["strikes"] > 1 else ""
+        ctx.notify(f"🛑 {group.capitalize()} bloqués : le site demande une vérification anti-robot{again}. Il faut la "
+                   f"passer à la main, souvent ça ne repart pas tout seul : sur wiki-masters.com avec ce compte, "
+                   f"faites une action (mise ou mise en vente) et validez la vérification. Le script réessaie à "
+                   f"{clock_time(entry['until'])} ; les défausses continuent.")
 
 
 def read_values(client, cards, cfg, cache, since=0, quiet=False):
@@ -2718,6 +2738,9 @@ class Sniper:
         self.spares = {}
         self.name_turn = 0  # prochain nom de buy.names à chercher
         self.last_sight = 0.0  # buy.bid_on_sight : moment prévu de la dernière première mise
+        # Mises envoyées (buy.max_bids), y compris avant un redémarrage du script : relues dans le journal.
+        self.bid_times = recent_bids(ctx.journal, (self.buy.get("max_bids") or {}).get("minutes", 0) * 60) \
+            if ctx.execute else []
         self.results = {}  # auction_id -> moment de lire le résultat d'une enchère où le script a misé
         self.next_scan = 0.0
         self.busy = False  # lecture du marché ou mise en cours : une pause demandée entre-temps est une simple pause
@@ -2960,6 +2983,9 @@ class Sniper:
             return "même carte déjà misée ou achetée"
         if not self._match(auction, info):
             return "mot-clé absent du titre et de la catégorie"
+        excluded = next((x for x in self.buy["exclude"] if found_in(x, self._text(auction, info))), None)
+        if excluded:
+            return f"« {excluded} » dans le titre ou la catégorie (buy.exclude)"
         return None
 
     def _match(self, auction, info):
@@ -2969,7 +2995,8 @@ class Sniper:
         trouve « lyonnais » ou « To-Lyon », pas « Elyon ».
         """
         text = self._text(auction, info)
-        return next((k for k in self.buy["keywords"] + self.buy["names"] if found_in(k, text)), None)
+        return next((k for k in self.buy["keywords"] if found_in(k, text)), None) \
+            or next((n for n in self.buy["names"] if found_in(n, text, whole=True)), None)
 
     @staticmethod
     def _text(auction, info):
@@ -2983,7 +3010,7 @@ class Sniper:
         for key, value in (self.buy.get("keyword_tags") or {}).items():
             if found_in(key, text):
                 tags += text_list(value)
-        if any(found_in(name, text) for name in self.buy["names"]):
+        if any(found_in(name, text, whole=True) for name in self.buy["names"]):
             tags += text_list(self.buy.get("names_tags")) or [self.buy["tag"]]
         return list({norm(t): t for t in tags or [self.buy["tag"]] if t}.values())  # sans doublon, dans l'ordre
 
@@ -3054,8 +3081,33 @@ class Sniper:
                      f"{target.ceiling}, on laisse")
             self._finish(target)
         else:
-            outbid = f"dépassé à {current}, " if target.bid is not None else ""
+            first = target.bid is None
+            free_at = self._bid_budget(first)
+            if free_at is not None:
+                # Limite de mises atteinte : une première mise attend qu'une place se libère (au plus tard
+                # buy.snipe_seconds avant la fin) ; sinon l'enchère est laissée.
+                if first and stage == 0 and free_at < end - self.buy["snipe_seconds"]:
+                    target.stage, target.sight_at = 0, free_at
+                    return
+                limit = self.buy["max_bids"]
+                self.say(f"laissée   {label(target.card, target.value)} : {limit['count']} mises en "
+                         f"{limit['minutes']:g} min au plus (buy.max_bids, contre la vérification anti-robot)")
+                self._finish(target)
+                return
+            outbid = f"dépassé à {current}, " if not first else ""
             self._bid(target, need, end - now, outbid)
+
+    def _bid_budget(self, first):
+        """None si une mise peut partir (buy.max_bids), sinon le moment où une place se libère."""
+        limit = self.buy.get("max_bids")
+        if not limit:
+            return None
+        window, now = limit["minutes"] * 60, time.time()
+        self.bid_times = sorted(t for t in self.bid_times if now - t < window)
+        allowed = limit["count"] - (BID_RESERVE if first else 0)
+        if len(self.bid_times) < allowed:
+            return None
+        return self.bid_times[len(self.bid_times) - allowed] + window
 
     def _bid(self, target, amount, left, note=""):
         ctx = self.ctx
@@ -3067,6 +3119,7 @@ class Sniper:
             return
         for attempt in range(TOO_LOW_RETRIES + 1):
             try:
+                self.bid_times.append(time.time())  # même refusée, elle compte peut-être pour le site
                 response = as_dict(self.client.bid(target.auction_id, amount))
                 break
             except ApiError as e:
@@ -3195,6 +3248,26 @@ def settle_vanished(ctx, all_cards):
 def bought_tags(ctx, entry):
     """Étiquettes de protection d'une carte gagnée : celles choisies à la mise (Sniper._tags_for), sinon buy.tag."""
     return [t for t in entry.get("tags") or [ctx.cfg["buy"]["tag"]] if t]
+
+
+def recent_bids(journal, seconds):
+    """Moments des mises de ce compte dans le journal, ces dernières secondes (buy.max_bids)."""
+    if seconds <= 0:
+        return []
+    since, found = time.time() - seconds, []
+    try:
+        with open(journal.path, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f, delimiter=journal.delimiter):
+                if row.get("action") == "mise" and row.get("compte") == journal.account:
+                    try:
+                        at = time.mktime(time.strptime(row["date"], "%Y-%m-%d %H:%M:%S"))
+                    except (TypeError, ValueError):
+                        continue
+                    if at >= since:
+                        found.append(at)
+    except OSError:
+        pass
+    return found
 
 
 def plan_bought(ctx, cards, all_cards):

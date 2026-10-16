@@ -143,6 +143,9 @@ buy:
   snipe_seconds: 20       # mise quand il reste N secondes (10 au moins)
   last_check_seconds: 6   # dernière vérification (et surenchère si dépassé) quand il reste N secondes
   bid_on_sight: false     # true = première mise dès que l'annonce est repérée, sans attendre snipe_seconds
+  max_bids: null  # au plus N mises par compte en M minutes : le site bloque le marché (ventes
+                          # comprises) après une dizaine de mises rapprochées (null = pas de limite)
+  exclude: []             # annonces ignorées si leur titre ou catégorie contient un de ces mots, ex. ["Lyons"]
   scan_minutes: 5         # le marché est relu toutes les N minutes
   accounts: null          # tous les comptes achètent
 

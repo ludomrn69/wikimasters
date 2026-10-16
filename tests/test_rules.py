@@ -1852,8 +1852,8 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(site.sells()), 1)  # on n'insiste pas avec la carte suivante
         self.assertEqual(site.discards(), [CHACANA])
-        self.assertIn("vérification anti-robot : mises en vente en pause jusqu'à", output)
-        self.assertIn("mises en vente en pause jusqu'à", output.split("Résumé")[-1])
+        self.assertIn("vérification anti-robot : ventes, achats et boosters en pause jusqu'à", output)
+        self.assertIn("ventes, achats et boosters en pause jusqu'à", output.split("Résumé")[-1])
         self.assertNotIn("login", output)
 
     TELEGRAM = {"telegram": {"bot_token": "1:x", "chat_id": 1}}
@@ -1865,8 +1865,8 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual(len(site.telegram), 1)  # l'alerte, pas de bilan (passage sans erreur)
         text = site.telegram[0][1]["text"]
-        self.assertIn("🛑 Mises en vente en pause jusqu'à", text)
-        self.assertIn("faites l'action à la main", text)
+        self.assertIn("🛑 Ventes, achats et boosters bloqués", text)
+        self.assertIn("validez la vérification", text)
 
     def test_same_problem_is_reported_once_in_loop(self):
         site, clock, pauses = standard_site(tags=SORTED), Clock(), []
@@ -2621,8 +2621,8 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.market.bid_replies = [FakeResponse(403, self.ANTIBOT)]
         output, code = self.run_market("acheter", execute=True)
         self.assertEqual(code, 0)
-        self.assertIn("vérification anti-robot : achats en pause jusqu'à", output)
-        self.assertIn("achats en pause jusqu'à", output.split("Résumé")[-1])
+        self.assertIn("vérification anti-robot : ventes, achats et boosters en pause jusqu'à", output)
+        self.assertIn("achats et boosters en pause jusqu'à", output.split("Résumé")[-1])
         # La mise suivante (10 s plus tard) n'est pas tentée : on n'insiste pas.
         self.assertEqual(len([u for _, u, *_ in self.market.site.calls if u.endswith("/bid")]), 1)
         self.assertEqual(self.purchases(), {})
@@ -2761,6 +2761,70 @@ class MarketTest(MainHarness, unittest.TestCase):
             w.check_config(cfg)
         self.assertIn("buy.last_check_seconds doit être plus petit que buy.snipe_seconds", str(ctx.exception.code))
 
+    def test_bids_are_capped_and_the_last_ones_kept_for_outbids(self):
+        # buy.max_bids 4 en 30 min : 2 premières mises (2 places gardées pour répondre à une surenchère), une
+        # troisième annonce est laissée, la surenchère sur la première est jouée.
+        m, start = self.market, self.clock.now
+        for aid, end in (("mk-B", 290), ("mk-A", 300), ("mk-C", 360)):
+            m.add(aid, f"Rue {aid} (Lyon)", end, current=10, value=20)
+        m.rivals.append((start + 285, "mk-A", 13))  # après nos deux premières mises (270 s et 280 s)
+        buy = {"max_bids": {"count": 4, "minutes": 30}, "price_factor": 5}
+        output, code = self.run_market("acheter", execute=True, buy=buy)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([aid for _, aid, _ in m.bids], ["mk-B", "mk-A", "mk-A"])
+        self.assertIn("laissée   Rue mk-C (Lyon) [R] valeur=20 : 4 mises en 30 min au plus (buy.max_bids", output)
+
+    def test_bid_cap_counts_the_bids_made_before_a_restart(self):
+        rows = [f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.clock.now - 60 * k))};testeur;tout;mise;"
+                f"X;R;;c;a{k};5;6;;OK;" for k in range(3)]
+        header = "date;compte;commande;action;carte;rarete;exemplaire;carte_id;enchere_id;valeur_moyenne;prix;" \
+                 "duree_min;resultat;solde"
+        (self.dir / "journal.csv").write_text("\n".join([header] + rows) + "\n", encoding="utf-8")
+        self.market.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
+        output, code = self.run_market("acheter", execute=True, buy={"max_bids": {"count": 4, "minutes": 30}})
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.market.bids, [])  # 3 mises il y a moins de 3 min : plus de place pour une première
+        self.assertIn("4 mises en 30 min au plus", output)
+
+    def test_names_match_whole_words_and_exclusions_are_skipped(self):
+        m = self.market
+        m.add("mk-P", "Lucas Perrin", 300, current=10, value=20, category="footballeur français")
+        m.add("mk-L", "Marty Lyons", 320, current=10, value=20, category="joueur de football américain")
+        m.add("mk-R", "Lucas Perri", 340, current=10, value=20, category="footballeur brésilien")
+        buy = {"names": ["Lucas Perri"], "names_minutes": 5, "exclude": ["Lyons"]}
+        output, code = self.run_market("acheter", execute=True, buy=buy, args=["--verbose"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual([aid for _, aid, _ in m.bids], ["mk-R"])
+        self.assertIn("ignorée   Marty Lyons [R] valeur=? : « Lyons » dans le titre ou la catégorie (buy.exclude)",
+                      output)
+        card = lambda name: w.Card(copy_id="x", card_id="y", name=name, rarity="R")  # noqa: E731
+        self.assertTrue(w.matches(card("Lucas Perri"), None, {"name_words": ["Lucas Perri"]}))
+        self.assertFalse(w.matches(card("Lucas Perrin"), None, {"name_words": ["Lucas Perri"]}))
+
+    def test_antibot_on_a_bid_also_pauses_sales(self):
+        # Le blocage vaut pour tout le marché du compte : après une mise refusée, pas de mise en vente (elle serait
+        # refusée aussi, et redemanderait la vérification).
+        m = self.market
+        m.site = standard_site(tags=SORTED)
+        m.add("mk-A", "Rue Émile-Zola (Lyon)", 30, current=10, value=20)
+        m.bid_replies = [FakeResponse(403, self.ANTIBOT)]
+        self.sleep = self._stop_after(2)
+        output, code = self.run_market("tout", execute=True, args=["--loop", "1"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(m.site.sells(), [])
+        self.assertIn("mises en vente en pause jusqu'à", output)
+
+    def _stop_after(self, loops):
+        seen = []
+
+        def sleep(seconds):
+            MarketTest.sleep(self, seconds)
+            if seconds == 60:
+                seen.append(1)
+                if len(seen) == loops:
+                    raise KeyboardInterrupt
+        return sleep
+
     def test_each_account_may_search_its_own_keywords_and_names(self):
         # Les recherches (et les mises) réparties entre vos comptes : buy.by_account remplace les mots-clés et les
         # noms du compte qui tourne.
@@ -2822,7 +2886,7 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual([(aid, amount) for _, aid, amount in m.bids], [("mk-A", 12)])
         self.assertEqual(len([u for _, u, *_ in m.site.calls if u.endswith("/bid")]), 2)  # on n'insiste pas
-        self.assertIn("achats en pause jusqu'à", output)
+        self.assertIn("achats et boosters en pause jusqu'à", output)
         self.assertIn("ACHETÉE   Rue Émile-Zola (Lyon) [R] pour 12", output)
         self.assertEqual(self.purchases()["mk-A"]["status"], "won")
 
@@ -2837,7 +2901,7 @@ class MarketTest(MainHarness, unittest.TestCase):
         m.bid_replies = [FakeResponse(403, self.ANTIBOT)]
         output, code = self.run_market("acheter", execute=True)
         self.assertEqual(code, 0, output)
-        self.assertIn("achats en pause jusqu'à", output)
+        self.assertIn("achats et boosters en pause jusqu'à", output)
         self.assertNotIn("repérée   Olympique lyonnais", output)
         self.assertEqual(len(m.site.gets("/api/marketplace/cards/")), 1)
 
