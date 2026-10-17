@@ -628,10 +628,30 @@ class EndToEndTest(MainHarness, unittest.TestCase):
                                              {"tag": "lyon", "when": {"name_contains": ["Chacana"]}}]))
         output, code = self.run_main(site, "analyser", execute=True, mutate=cfg)
         self.assertEqual(code, 0, output)
-        self.assertIn("-> + étiquette « OL »         Forest Hills (Queens) [R] valeur=?", output)
+        self.assertIn("-> pose « OL »                Forest Hills (Queens) [R] valeur=?", output)
         self.assertNotIn(FOREST, [u.split("/")[-2] for u in site.gets("/sales")])  # prix jamais lu
-        self.assertIn("-> + étiquette « lyon »       Chacana [R] valeur=5", output)  # protégée plutôt que « defausse »
+        self.assertIn("-> pose « lyon »              Chacana [R] valeur=5", output)  # protégée plutôt que « defausse »
         self.assertNotIn("« defausse »", output.split("Chacana")[0][-80:])
+
+    def test_auto_tags_read_the_card_description_and_protect_it_from_discard(self):
+        # « Au DD » : rien dans le titre, mais la description dit « chanson de PNL ». Déjà étiquetée « defausse »
+        # (transférée d'un autre compte, vaut 5) : protégée, jamais défaussée.
+        site = standard_site(tags={CHACANA: ["defausse"]})
+        for item in site.pages[0]["collection"]:
+            if item["id"] == CHACANA:
+                item["card"].update(wikipedia_title="Au DD", category="chanson de PNL, sortie en 2019")
+            if item["id"] == FACE:
+                item["card"]["category"] = "papillon de la famille des Lyonetiidae"
+        rules = [{"tag": "pnl", "when": {"text_contains": ["pnl"]}},
+                 {"tag": "lyon", "when": {"text_contains": ["lyon"], "text_excludes": ["Lyonet"]}}]
+        cfg = lambda c: (c["protection"]["tags"].append("pnl"), c.update(auto_tags=rules),  # noqa: E731
+                         c["discard"].update(require_existing_tag=False))
+        output, code = self.run_main(site, "tout", execute=True, mutate=cfg)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(site.discards(), [])
+        self.assertIn("PROTÉGÉE  Au DD [R] valeur=5 : « analyser » va lui poser « pnl » (auto_tags)", output)
+        self.assertIn("-> pose « pnl »               Au DD [R]", output)
+        self.assertNotIn("« lyon »        Face visible", output)  # « Lyonet… » exclu
 
     def test_waiting_shown_and_verbose(self):
         site = standard_site(selling=4, tags=SORTED)
@@ -654,6 +674,90 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertIn("ENCHÈRE départ=45", output)  # prix gardé
         self.run_main(site, "vendre", execute=True, mutate=lambda c: (keep(c), c["sell"].update(fresh_price=True)))
         self.assertEqual(site.sell_bodies(), [{"card_id": AMPHIBIA, "base_amount": 75, "duration_minutes": 30}])
+
+    def test_protected_cards_lose_their_price_tags(self):
+        # Forest Hills (protégée par « lyon ») étiquetée +10 : l'étiquette de prix est retirée, sans lire son prix.
+        site = standard_site(tags={FOREST: ["+10"]})
+        output, code = self.run_main(site, "analyser", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn((f"eq.{FOREST}", "eq.t-+10"), site.tag_unlinks())
+        self.assertIn("1 carte(s) protégée(s) : étiquette(s) de prix retirée(s)", output)
+        self.assertEqual(site.gets("5c7df689"), [])
+        # Dans un échange en attente : on n'y touche pas (elle revient si l'échange est refusé).
+        site = standard_site(tags={FOREST: ["+10"]})
+        site.pages[0]["pendingTradeCardIds"] = [FOREST]
+        self.run_main(site, "analyser", execute=True)
+        self.assertEqual(site.tag_unlinks(), [])
+        # tag_protected : les cartes protégées gardent leurs étiquettes de prix.
+        site = standard_site(tags={FOREST: ["defausse"]})
+        self.run_main(site, "analyser", execute=True, mutate=lambda c: c["price_tags"].update(tag_protected=True))
+        self.assertEqual(site.tag_unlinks(), [])
+
+    def test_retired_price_tag_is_removed_and_replaced(self):
+        # Ancienne tranche « +5 » supprimée : Face visible (12) passe à « +10 », Forest Hills (protégée) la perd.
+        site = standard_site(tags={FACE: ["+5"], FOREST: ["+5"]})
+        retired = lambda c: c["price_tags"].update(retired=["+5"])  # noqa: E731
+        output, code = self.run_main(site, "analyser", execute=True, mutate=retired)
+        self.assertEqual(code, 0, output)
+        self.assertIn((f"eq.{FACE}", "eq.t-+5"), site.tag_unlinks())
+        self.assertIn((FACE, "t-+10"), site.tag_links())
+        self.assertIn((f"eq.{FOREST}", "eq.t-+5"), site.tag_unlinks())
+        cfg = load_cfg()
+        cfg["price_tags"]["retired"] = ["+10"]
+        with self.assertRaises(SystemExit) as ctx:
+            w.check_config(cfg)
+        self.assertIn("price_tags.retired : « +10 » est encore une tranche de prix", str(ctx.exception.code))
+
+    def sr_site(self, tags=None):
+        """Chacana (5), Amphibia (60) et Hotel California (jamais vendue) en SR."""
+        site = standard_site(tags=tags)
+        for item in site.pages[0]["collection"]:
+            if item["id"] in (CHACANA, AMPHIBIA, HOTEL):
+                item["card"]["rarity"] = "SR"
+        return site
+
+    def test_unprotected_rarity_is_tagged_sold_and_discarded_like_the_others(self):
+        rules = lambda c: (c["protection"].update(unprotected_rarities=["SR"]),  # noqa: E731
+                           c["price_tags"].update(unknown_tag="inconnu"),
+                           c["discard"].update(unknown_rarities=["C", "PC", "R", "SR"], require_existing_tag=False))
+        site = self.sr_site()
+        output, code = self.run_main(site, "tout", execute=True, mutate=rules)
+        self.assertEqual(code, 0, output)
+        self.assertIn((AMPHIBIA, "t-+10"), site.tag_links())
+        self.assertIn(AMPHIBIA, site.sells())
+        self.assertEqual(sorted(site.discards()), sorted([CHACANA, HOTEL]))  # moins de 10, et jamais vendue
+        self.assertNotIn(FOREST, site.discards())  # protégée par son étiquette « lyon »
+        # Sans unprotected_rarities, les SR restent protégées : ni étiquette de prix, ni vente, ni défausse.
+        site = self.sr_site()
+        self.run_main(site, "tout", execute=True)
+        self.assertEqual([c for c, _ in site.tag_links() if c in (CHACANA, AMPHIBIA, HOTEL)], [])
+        self.assertFalse({CHACANA, AMPHIBIA, HOTEL} & set(site.sells() + site.discards()))
+
+    def test_unprotected_rarities_must_be_protected_rarities(self):
+        cfg = load_cfg()
+        cfg["protection"]["unprotected_rarities"] = ["R"]
+        with self.assertRaises(SystemExit) as ctx:
+            w.check_config(cfg)
+        self.assertIn("protection.unprotected_rarities : R n'est pas dans protection.rarities", str(ctx.exception.code))
+        # Une SR encore protégée ne peut pas être défaussée comme jamais vendue.
+        cfg = load_cfg()
+        cfg["price_tags"]["unknown_tag"] = "inconnu"
+        cfg["discard"]["unknown_rarities"] = ["SR"]
+        with self.assertRaises(SystemExit) as ctx:
+            w.check_config(cfg)
+        self.assertIn("discard.unknown_rarities contient SR, qui est protégée", str(ctx.exception.code))
+        cfg["protection"]["unprotected_rarities"] = ["SR"]
+        w.check_config(cfg)
+
+    def test_card_that_becomes_protected_loses_its_price_tag_after_the_protection(self):
+        site = standard_site(tags={AMPHIBIA: ["+10"]})
+        rule = lambda c: c.update(auto_tags=[{"tag": "lyon", "when": {"name_contains": "Amphibia"}}])  # noqa: E731
+        output, code = self.run_main(site, "analyser", execute=True, mutate=rule)
+        self.assertEqual(code, 0, output)
+        changes = [m for m, u, b, _, p in site.calls if u.endswith("/user_card_tags")
+                   and AMPHIBIA in (b["user_card_id"] if b else p["user_card_id"])]
+        self.assertEqual(changes, ["POST", "DELETE"])  # protégée d'abord, puis +10 retirée
+        self.assertEqual(site.tag_unlinks(), [(f"eq.{AMPHIBIA}", "eq.t-+10")])
 
     def test_analyse_can_tag_protected_cards_without_unprotecting_them(self):
         site = standard_site()
@@ -737,9 +841,122 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         output, code = self.run_main(site, "vendre", execute=True, args=["--loop"], sleep=sleep, clock=clock,
                                      mutate=lambda c: c["sell"].update(duration_minutes=10))
         self.assertEqual((code, site.sells()), (0, [AMPHIBIA]))  # Face attend une place
-        self.assertIn("Une place d'enchère se libère vers", output)
+        self.assertIn("Ventes en attente, possibles vers", output)
         self.assertLess(pauses[0], 15 * 60)
         self.assertGreaterEqual(pauses[0], w.MIN_LOOP_SECONDS)
+
+    def test_sales_respect_the_market_limit_and_the_loop_comes_back_when_it_frees(self):
+        # 10 actions en 25 min (vu le 16/10/2026) : le site a bloqué le marché. safety.market_limit 3 en 60 min, dont
+        # 2 déjà faites (journal) : une seule vente ; le passage suivant a lieu quand la limite le permet.
+        site, clock, pauses = standard_site(tags=SORTED), Clock(), []
+        header = "date;compte;commande;action;carte;rarete;exemplaire;carte_id;enchere_id;valeur_moyenne;prix;" \
+                 "duree_min;resultat;solde"
+        rows = [f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(clock.now - 60 * k))};testeur;tout;enchere;X;R;"
+                f";c;a{k};5;6;30;OK;" for k in (50, 40)]
+        (self.dir / "journal.csv").write_text("\n".join([header] + rows) + "\n", encoding="utf-8")
+
+        def sleep(seconds):
+            clock.now += seconds
+            if seconds >= 120:
+                pauses.append(seconds)
+                raise KeyboardInterrupt
+
+        output, code = self.run_main(site, "vendre", execute=True, args=["--loop"], sleep=sleep, clock=clock,
+                                     perso={"safety": {"market_limit": {"count": 3, "minutes": 60}}})
+        self.assertEqual((code, site.sells()), (0, [AMPHIBIA]))
+        self.assertIn("Ventes en attente, possibles vers", output)
+        self.assertAlmostEqual(pauses[0], 10 * 60, delta=120)  # la plus ancienne (il y a 50 min) sort de la fenêtre
+
+    def test_peak_hours_sell_short_auctions_one_every_few_minutes(self):
+        # Aux heures de pointe, des enchères de 10 min. Lancées toutes d'un coup, les 10 actions de l'heure partiraient
+        # en un quart d'heure et les places resteraient vides ensuite : une toutes les 6 min, il y en a toujours une.
+        site, clock, pauses = standard_site(tags=SORTED), Clock(), []
+        day = time.localtime(clock.now)
+        clock.now = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 19, 0, 0, 0, 0, -1))
+
+        def sleep(seconds):
+            clock.now += seconds
+            if seconds >= 120:  # pause de --loop
+                pauses.append(seconds)
+                if len(pauses) == 2:
+                    raise KeyboardInterrupt
+
+        perso = {"safety": {"market_limit": {"count": 10, "minutes": 60}},
+                 "sell": {"peak": {"start": "18:00", "end": "22:00", "duration_minutes": 10}}}
+        output, code = self.run_main(site, "vendre", execute=True, args=["--loop"], sleep=sleep, clock=clock,
+                                     perso=perso)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(site.sells(), [AMPHIBIA, FACE])  # une par passage
+        self.assertEqual([b["duration_minutes"] for b in site.sell_bodies()], [10, 10])
+        self.assertAlmostEqual(pauses[0], 6 * 60 - 45, delta=60)  # revient pour la suivante, 6 min après la 1re
+        self.assertIn("Ventes en attente, possibles vers", output)
+
+    def test_a_slot_freed_during_the_discards_is_filled_at_once(self):
+        # 200 défausses prennent 25 min (prix relu à chacune) : des enchères de 10 min auraient toutes fini avant.
+        site = standard_site(selling=[5, 4], tags=dict(SORTED, **{FOREST: ["defausse"]}))
+        site.pages[0]["collection"][0]["tags"] = [t for t in site.pages[0]["collection"][0]["tags"]
+                                                 if t["name"] != "lyon"]  # Forest Hills (3) n'est plus protégée
+        with mock.patch.object(w, "DISCARD_BATCH", 1):
+            output, code = self.run_main(site, "tout", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("aucune place d'enchère libre", output)  # pleines au début du passage
+        self.assertIn("-- place d'enchère libre pendant les défausses :", output)
+        self.assertEqual(site.sells(), [AMPHIBIA])  # mise en vente entre deux défausses
+        self.assertEqual(sorted(site.discards()), sorted([FOREST, CHACANA]))
+        site = standard_site(selling=[5, 4], tags=dict(SORTED, **{FOREST: ["defausse"]}))
+        with mock.patch.object(w, "DISCARD_BATCH", 1):
+            self.run_main(site, "defausser", execute=True)
+        self.assertEqual(site.sells(), [])  # « defausser » demandé à la main : pas de vente
+
+    def test_peak_hours_can_allow_more_market_actions_for_the_seller(self):
+        cfg = load_cfg()
+        cfg["sell"]["peak"] = {"start": "18:00", "end": "22:00", "duration_minutes": 10, "market_limit": 30}
+        cfg["safety"]["market_limit"] = {"count": 10, "minutes": 60}
+        day = time.localtime()
+        at = lambda h: time.mktime((day.tm_year, day.tm_mon, day.tm_mday, h, 30, 0, 0, 0, -1))  # noqa: E731
+        seller = w.Context(client=None, cfg=cfg, execute=True, summary=w.new_summary(), cache=None, verbose=False,
+                           journal=None, state=None)
+        buyer = w.Context(client=None, cfg=cfg, execute=True, summary=w.new_summary(), cache=None, verbose=False,
+                          journal=None, state=None, sells=False)
+        limit = cfg["safety"]["market_limit"]
+        self.assertEqual((w.market_count(seller, limit, at(19)), w.market_count(seller, limit, at(15))), (30, 10))
+        self.assertEqual(w.market_count(buyer, limit, at(19)), 10)  # ses mises gardent la limite normale
+        self.assertEqual(w.sale_spacing(seller, at(19)), 0)  # 30 par heure : les 5 places restent pleines d'elles-mêmes
+
+    def test_auction_length_and_spacing_by_time_of_day(self):
+        sell = dict(load_cfg()["sell"], peak={"start": "18:00", "end": "22:00", "duration_minutes": 10})
+        day = time.localtime()
+        at = lambda h: time.mktime((day.tm_year, day.tm_mon, day.tm_mday, h, 30, 0, 0, 0, -1))  # noqa: E731
+        self.assertEqual(w.auction_minutes(50, sell, at(19)), 10)
+        self.assertEqual(w.auction_minutes(50, sell, at(15)), 30)
+        long = dict(sell, long_duration={"from_value": 100, "minutes": 60})
+        self.assertEqual(w.auction_minutes(150, long, at(19)), 60)  # les cartes chères gardent leur durée
+        cfg = load_cfg()
+        cfg["sell"], cfg["safety"]["market_limit"] = sell, {"count": 10, "minutes": 60}
+        ctx = w.Context(client=None, cfg=cfg, execute=True, summary=w.new_summary(), cache=None, verbose=False,
+                        journal=None, state=None)
+        self.assertEqual(w.sale_spacing(ctx, at(19)), 360)
+        self.assertEqual(w.sale_spacing(ctx, at(15)), 0)  # 30 min : les 5 places restent pleines sans étaler
+        bad = load_cfg()
+        bad["sell"]["peak"] = {"start": "18:00", "end": "22:00", "duration_minutes": 15}
+        with self.assertRaises(SystemExit) as raised:
+            w.check_config(bad)
+        self.assertIn("sell.peak.duration_minutes", str(raised.exception.code))
+
+    def test_accounts_that_neither_sell_nor_discard_keep_everything(self):
+        site = standard_site(tags=SORTED)
+        keep = {"sell": {"accounts": ["autre"]}, "discard": {"accounts": ["autre"]}}
+        (self.dir / "comptes" / "autre").mkdir(parents=True, exist_ok=True)
+        w.SessionStore(self.dir / "comptes" / "autre" / "session.json").save(make_session())
+        output, code = self.run_main(site, "tout", execute=True, perso=keep, args=["--compte", "testeur"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual((site.sells(), site.discards()), ([], []))
+        self.assertIn("pas de mise en vente sur ce compte (sell.accounts : autre)", output)
+        self.assertIn("pas de défausse sur ce compte (discard.accounts : autre)", output)
+
+        output, code = self.run_main(site, "tout", perso={"discard": {"accounts": ["inconnu"]}},
+                                     args=["--compte", "testeur"])
+        self.assertIn("discard.accounts : compte(s) inconnu(s) inconnu", str(code))
 
     def test_sell_without_free_slot_reads_no_price(self):
         site = standard_site(selling=5, tags=SORTED)
@@ -1449,8 +1666,8 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         output, _ = self.run_main(site, "analyser", execute=True, mutate=mutate, args=["--fresh"])
         self.assertIn("Option --fresh", output)
         self.assertEqual(len(site.gets(face_id)), reads + 1)  # relu sur le site
-        self.assertEqual(changes(output, "Chacana"), ["- étiquette « defausse »", "+ étiquette « +10 »"])
-        self.assertEqual(changes(output, "Face visible"), ["- étiquette « +10 »", "+ étiquette « +100 »"])
+        self.assertEqual(changes(output, "Chacana"), ["retire « defausse »", "pose « +10 »"])
+        self.assertEqual(changes(output, "Face visible"), ["retire « +10 »", "pose « +100 »"])
         self.assertIn((CHACANA, "t-+10"), site.tag_links())
 
     def test_telegram_message_escapes_html(self):
@@ -2301,6 +2518,94 @@ class MarketTest(MainHarness, unittest.TestCase):
         opened = next(i for i, u in enumerate(urls) if u.endswith("/api/packs/open"))
         self.assertLess(opened, next(i for i, u in enumerate(urls) if "my-collection" in u))
 
+    def pack_reads(self):
+        return [u for _, u, *_ in self.market.site.calls if u.endswith("/rpc/sync_profile_packs")]
+
+    def test_tout_tries_the_packs_now_and_then(self):
+        self.clock.now = float(int(self.clock.now))  # le journal garde l'heure à la seconde
+        packs = {"in_tout": True, "every_minutes": 180}
+        self.market.packs = 1
+        card = {"id": "c1", "wikipedia_title": "Route 566", "rarity": "C", "user_card_id": "u1"}
+        self.market.pack_replies = [FakeResponse(200, {"cards": [card], "packs_remaining": 0})]
+        output, code = self.run_market("tout", execute=True, packs=packs)
+        self.assertEqual(code, 0, output)
+        self.assertIn("booster 1/1 : Route 566 [C]", output)
+        opened = max(at for at, ok in w.recent_pack_events(self.journal())[0])
+        # Relancé une heure plus tard : le dernier essai est relu dans le journal.
+        self.clock.now += 3600
+        output, _ = self.run_market("tout", execute=True, packs=packs)
+        self.assertEqual(len(self.pack_reads()), 1)
+        self.assertIn(f"prochain essai vers {w.clock_time(opened + 180 * 60)} (packs.every_minutes)", output)
+        self.clock.now += 2 * 3600
+        self.market.packs = 0
+        output, _ = self.run_market("tout", execute=True, packs=packs)
+        self.assertEqual(len(self.pack_reads()), 2, output)
+        self.assertIn("0 booster(s) disponible(s)", output)
+
+    def journal(self):
+        return w.Journal(self.dir / "journal.csv", ";", True, "testeur", "tout")
+
+    def test_packs_stop_after_three_antibot_checks_in_a_row_then_one_is_tried(self):
+        self.clock.now = float(int(self.clock.now))
+        packs = {"in_tout": True}
+        self.market.packs = 2
+        for _ in range(3):  # trois essais (relances du script : la pause anti-robot, en mémoire, est levée)
+            self.market.pack_replies = [FakeResponse(403, self.ANTIBOT)]
+            output, code = self.run_market("tout", execute=True, packs=packs)
+            self.assertEqual(code, 0, output)
+            self.clock.now += 2 * 3600
+        last = self.last_block()
+        retry = w.day_time(last + 6 * 3600)
+        self.assertIn("3 vérifications anti-robot de suite sur les boosters : « tout » les arrête, un seul sera essayé "
+                      f"le {retry}", output)
+        output, _ = self.run_market("tout", execute=True, packs=packs)
+        self.assertIn(f"arrêtés après 3 vérifications anti-robot de suite (packs.max_blocks) : un seul sera essayé le "
+                      f"{retry}", output)
+        self.assertEqual(len(self.pack_reads()), 3)
+        self.assertIn("== Défausses (nouvelles étiquettes) ==", output)  # le reste du passage continue
+        # 6 h après le dernier blocage : un seul booster, encore bloqué. Le suivant 6 h plus tard.
+        self.clock.now = last + 6 * 3600 + 60
+        self.market.pack_replies = [FakeResponse(403, self.ANTIBOT)]
+        output, _ = self.run_market("tout", execute=True, packs=packs)
+        self.assertIn("2 booster(s) disponible(s) → 1 ouverture(s)", output)
+        self.assertIn(f"un seul sera essayé le {w.day_time(self.last_block() + 6 * 3600)}", output)
+        # Encore 6 h : il passe, tout repart (jusqu'à packs.max_per_run), même après une relance (journal).
+        self.clock.now += 6 * 3600 + 60
+        card = {"id": "c1", "wikipedia_title": "Route 566", "rarity": "C", "user_card_id": "u1"}
+        self.market.pack_replies = [FakeResponse(200, {"cards": [card], "packs_remaining": 1})]
+        output, _ = self.run_market("tout", execute=True, packs=packs)
+        self.assertIn("1 booster(s) ouvert(s)", output)
+        self.assertIn("le site accepte à nouveau les boosters", output)
+        self.clock.now += 60
+        self.market.pack_replies = [FakeResponse(200, {"cards": [], "packs_remaining": 1})] * 2
+        output, _ = self.run_market("tout", execute=True, packs=packs)
+        self.assertIn("2 booster(s) disponible(s) → 2 ouverture(s)", output)
+
+    def last_block(self):
+        """Moment du dernier blocage des boosters, tel que noté dans le journal (à la seconde)."""
+        return w.packs_blocked(mock.Mock(pack_events=w.recent_pack_events(self.journal())[0]))[1]
+
+    def test_packs_blocks_are_counted_in_a_row(self):
+        ctx = mock.Mock()
+        ctx.pack_events = [(100, False), (200, False), (300, True), (400, False), (500, False)]
+        self.assertEqual(w.packs_blocked(ctx), (2, 500))  # 2 de suite depuis la dernière ouverture réussie
+        ctx.pack_events = [(10, False), (2000000, False), (30, False)]  # pas de limite de temps
+        self.assertEqual(w.packs_blocked(ctx), (3, 2000000))
+        ctx.pack_events = [(10, False), (20, True)]
+        self.assertEqual(w.packs_blocked(ctx), (0, 10))
+
+    def test_boosters_command_opens_the_packs_even_when_tout_stopped_them(self):
+        self.clock.now = float(int(self.clock.now))
+        for _ in range(3):
+            self.market.packs = 1
+            self.market.pack_replies = [FakeResponse(403, self.ANTIBOT)]
+            self.run_market("tout", execute=True, packs={"in_tout": True})
+            self.clock.now += 2 * 3600
+        self.market.pack_replies = [FakeResponse(200, {"cards": [], "packs_remaining": 0})]
+        output, code = self.run_market("boosters", execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("1 booster(s) ouvert(s)", output)
+
     # --- achats ---
 
     def standard_market(self):
@@ -2657,7 +2962,7 @@ class MarketTest(MainHarness, unittest.TestCase):
         output, code = self.run_market("tout", execute=True, buy=buy, perso=perso)
         self.assertEqual(code, 0, output)
         self.assertIn("== Cartes achetées : étiquette « pnl » ==", output)
-        self.assertIn("-> + étiquette « pnl »", output)
+        self.assertIn("-> pose « pnl »", output)
         self.assertNotIn(CHACANA, self.market.site.discards())
         self.assertEqual(self.purchases(), {})
 
@@ -2762,17 +3067,29 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertIn("buy.last_check_seconds doit être plus petit que buy.snipe_seconds", str(ctx.exception.code))
 
     def test_bids_are_capped_and_the_last_ones_kept_for_outbids(self):
-        # buy.max_bids 4 en 30 min : 2 premières mises (2 places gardées pour répondre à une surenchère), une
+        # safety.market_limit 4 en 30 min : 2 premières mises (2 places gardées pour répondre à une surenchère), une
         # troisième annonce est laissée, la surenchère sur la première est jouée.
         m, start = self.market, self.clock.now
         for aid, end in (("mk-B", 290), ("mk-A", 300), ("mk-C", 360)):
             m.add(aid, f"Rue {aid} (Lyon)", end, current=10, value=20)
         m.rivals.append((start + 285, "mk-A", 13))  # après nos deux premières mises (270 s et 280 s)
-        buy = {"max_bids": {"count": 4, "minutes": 30}, "price_factor": 5}
-        output, code = self.run_market("acheter", execute=True, buy=buy)
+        perso = {"safety": {"market_limit": {"count": 4, "minutes": 30}}}
+        output, code = self.run_market("acheter", execute=True, buy={"price_factor": 5}, perso=perso)
         self.assertEqual(code, 0, output)
         self.assertEqual([aid for _, aid, _ in m.bids], ["mk-B", "mk-A", "mk-A"])
-        self.assertIn("laissée   Rue mk-C (Lyon) [R] valeur=20 : 4 mises en 30 min au plus (buy.max_bids", output)
+        self.assertIn("laissée   Rue mk-C (Lyon) [R] valeur=20 : 4 actions sur le marché en 30 min au plus", output)
+
+    def test_new_bids_leave_room_for_sales(self):
+        # 10 h 56, 16/10/2026 : 8 mises en 2 minutes avaient pris toute la limite, plus aucune vente pendant une heure.
+        m = self.market
+        for i, aid in enumerate(("mk-A", "mk-B", "mk-C")):
+            m.add(aid, f"Rue {aid} (Lyon)", 300 + 30 * i, current=10, value=20)
+        perso = {"safety": {"market_limit": {"count": 10, "minutes": 60, "bids": 2}}}
+        output, code = self.run_market("acheter", execute=True, perso=perso)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([aid for _, aid, _ in m.bids], ["mk-A", "mk-B"])
+        self.assertIn("laissée   Rue mk-C (Lyon) [R] valeur=20 : 10 actions sur le marché en 60 min au plus, dont 2 "
+                      "nouvelles mises", output)
 
     def test_bid_cap_counts_the_bids_made_before_a_restart(self):
         rows = [f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.clock.now - 60 * k))};testeur;tout;mise;"
@@ -2781,10 +3098,11 @@ class MarketTest(MainHarness, unittest.TestCase):
                  "duree_min;resultat;solde"
         (self.dir / "journal.csv").write_text("\n".join([header] + rows) + "\n", encoding="utf-8")
         self.market.add("mk-A", "Rue Émile-Zola (Lyon)", 300, current=10, value=20)
-        output, code = self.run_market("acheter", execute=True, buy={"max_bids": {"count": 4, "minutes": 30}})
+        output, code = self.run_market("acheter", execute=True,
+                                       perso={"safety": {"market_limit": {"count": 4, "minutes": 30}}})
         self.assertEqual(code, 0, output)
         self.assertEqual(self.market.bids, [])  # 3 mises il y a moins de 3 min : plus de place pour une première
-        self.assertIn("4 mises en 30 min au plus", output)
+        self.assertIn("4 actions sur le marché en 30 min au plus", output)
 
     def test_names_match_whole_words_and_exclusions_are_skipped(self):
         m = self.market
@@ -2987,6 +3305,291 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertTrue(end - 20 <= m.bids[0][0] < end - w.LAST_CHECK_SECONDS)
         self.assertIn("ACHETÉE", output)
         self.assertIn("1 mise(s) sur le marché", output)
+
+
+OTHER_ID = "00000000-0000-4000-8000-000000000002"  # l'autre compte enregistré, qui reçoit les envois
+SERVER_ERROR = {"error": "Erreur serveur"}
+NOT_FRIENDS = {"error": "Vous devez être amis pour échanger des cartes"}
+
+
+class Trades:
+    """Amis et échanges simulés par-dessus un FakeSite (le reste lui est transmis)."""
+
+    def __init__(self, site):
+        self.site = site
+        self.friends = [OTHER_ID]
+        # Réponses imposées à POST /api/trades, dans l'ordre. ("créé", réponse) : l'échange est créé quand même.
+        self.replies = []
+        self.created = []  # corps des échanges créés
+        self.pending = []  # exemplaires dans un échange en attente
+        self.timeouts = []  # délai de réponse accordé à chaque POST /api/trades
+
+    def __call__(self, method, url, timeout=None, params=None, json=None, headers=None, allow_redirects=True, **kw):
+        path = url.split(".com", 1)[1] if ".com" in url else None
+        if path == "/api/friends":
+            reply = FakeResponse(200, {"friendships": [
+                {"status": "accepted", "requester": {"id": f, "username": "moncompte2"},
+                 "addressee": {"id": USER_ID, "username": "testeur"}} for f in self.friends]})
+        elif path == "/api/trades" and method == "GET":
+            reply = FakeResponse(200, {"trades": [{"status": "pending", "items": [
+                {"user_card_id": copy_id} for copy_id in self.pending]}]})
+        elif path == "/api/trades" and method == "POST":
+            self.timeouts.append(timeout)
+            reply = self.replies.pop(0) if self.replies else None
+            if isinstance(reply, tuple) or reply is None:
+                self.created.append(json)
+                self.pending += [i["user_card_id"] for i in json["items"]]
+                reply = reply[1] if reply else FakeResponse(201, {"trade": {"id": f"trade-{len(self.created)}"}})
+            if isinstance(reply, BaseException):
+                self.site.calls.append((method, url, json, headers or {}, params or {}))
+                raise reply
+        else:
+            return self.site(method, url, timeout=timeout, params=params, json=json, headers=headers,
+                             allow_redirects=allow_redirects, **kw)
+        self.site.calls.append((method, url, json, headers or {}, params or {}))
+        return reply
+
+    def posts(self):
+        return [b for m, u, b in self.site.mutations() if u.endswith("/api/trades")]
+
+
+class SendTest(MainHarness, unittest.TestCase):
+    """Envoi des cartes à vendre à un autre de vos comptes (commande envoyer, ou tout avec send.in_tout)."""
+
+    def setUp(self):
+        super().setUp()
+        other = self.dir / "comptes" / "moncompte2"
+        other.mkdir()
+        session = make_session()
+        claims = {"sub": OTHER_ID, "exp": session["expires_at"], "user_metadata": {"username": "moncompte2"}}
+        session["access_token"] = f"{b64({'alg': 'HS256'})}.{b64(claims)}.sig-autre"
+        w.SessionStore(other / "session.json").save(session)
+        # Face visible (12) et Amphibia (60) : à vendre (+10). Chacana : à défausser. Forest Hills : protégée (lyon).
+        self.trades = Trades(standard_site(tags=SORTED))
+
+    def run_send(self, execute=False, send=None, command="envoyer", account="testeur", to="moncompte2"):
+        args = ["--compte", account] + (["--vers", to] if to else [])
+        return self.run_main(self.trades, command, execute=execute, args=args,
+                             mutate=lambda cfg: cfg["send"].update(send or {}))
+
+    def journal_rows(self):
+        path = self.dir / "journal.csv"
+        return path.read_text(encoding="utf-8-sig").splitlines()[1:] if path.exists() else []
+
+    def test_dry_run_shows_the_trade_and_sends_nothing(self):
+        output, code = self.run_send()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.trades.posts(), [])
+        self.assertIn("2 carte(s) à envoyer à moncompte2, 2 au plus ce passage, par échanges de 20 carte(s)", output)
+        self.assertIn("-> ÉCHANGE vers moncompte2 : 2 carte(s)", output)
+        self.assertIn("Face visible de la Lune [R], Amphibia (série télévisée d'animation) [R]", output)
+        self.assertIn("2 carte(s) envoyée(s) en 1 échange(s)", output)
+        self.assertNotIn("Forest Hills", output)  # protégée, et pas étiquetée à vendre
+        self.assertEqual(self.journal_rows(), [])
+
+    def test_execute_offers_the_cards_for_nothing_in_batches(self):
+        output, code = self.run_send(execute=True, send={"batch_size": 1})
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.trades.posts(), [
+            {"recipient_id": OTHER_ID, "initiator_wikibidous": 0, "recipient_wikibidous": 0,
+             "items": [{"user_card_id": copy_id, "card_id": card_id, "offered_by": USER_ID}]}
+            for copy_id, card_id in ((FACE, "dd1bca63-409e-4f4c-baa5-f09398edd4cd"),
+                                     (AMPHIBIA, "51be5cb1-66d8-4d2d-b83e-5c66fa5955f8"))])
+        self.assertIn("OK, échange trade-1", output)
+        self.assertIn("À faire : acceptez le(s) échange(s) sur wiki-masters.com avec le compte moncompte2", output)
+        rows = self.journal_rows()
+        self.assertEqual(len(rows), 2, rows)
+        self.assertIn(f"envoi;Face visible de la Lune;R;{FACE}", rows[0])
+        self.assertIn("OK, échange trade-1 vers moncompte2", rows[0])
+        self.assertEqual((self.trades.site.sells(), self.trades.site.discards()), ([], []))
+
+    def test_chosen_tag_only(self):
+        output, _ = self.run_main(self.trades, "envoyer", args=["--compte", "testeur", "--vers", "moncompte2",
+                                                                "--etiquette", "defausse"])
+        self.assertIn("ignorée   Chacana [R] : étiquettes contradictoires", output)  # aussi à défausser : laissée
+        self.trades.site.pages[0]["collection"][1]["tags"] = [{"id": "t-x", "name": "Échange", "color": "#000"}]
+        output, _ = self.run_main(self.trades, "envoyer", args=["--compte", "testeur", "--vers", "moncompte2",
+                                                                "--etiquette", "echange"])
+        self.assertIn("-> ÉCHANGE vers moncompte2 : 1 carte(s)\n       Chacana [R]", output)
+
+    def test_protected_pending_and_listed_cards_stay(self):
+        site = self.trades.site
+        site.pages[0]["pendingTradeCardIds"] = [FACE]
+        site.pages[0]["collection"][0]["tags"].append({"id": "t-+10", "name": "+10", "color": "#000"})
+        (self.acc / "ventes.json").write_text(json.dumps({"auctions": {"a1": {
+            "copy_id": AMPHIBIA, "card_id": "x", "status": "open", "listed_at": time.time()}}}), encoding="utf-8")
+        output, code = self.run_send(execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.trades.posts(), [])
+        self.assertIn("1 carte(s) déjà dans un échange en attente", output)
+        self.assertIn("ignorée   Amphibia (série télévisée d'animation) [R] : en vente aux enchères", output)
+        self.assertIn("PROTÉGÉE  Forest Hills (Queens) [R] (étiquette lyon) : étiquetée à envoyer", output)
+        self.assertEqual(self.trades.site.gets("/api/friends"), [])  # rien à envoyer : amis même pas lus
+
+    def test_server_error_is_checked_then_retried_in_smaller_batches(self):
+        self.trades.replies = [FakeResponse(500, SERVER_ERROR)]
+        output, code = self.run_send(execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([len(b["items"]) for b in self.trades.posts()], [2, 1, 1])
+        self.assertIn("nouvel essai par échanges de 1 carte(s)", output)
+        self.assertEqual(len(self.trades.site.gets("/api/trades")), 1)  # échanges en attente relus après l'erreur
+        self.assertIn("2 carte(s) envoyée(s) en 2 échange(s)", output)
+        self.assertIn("1 échec(s)", output)
+
+    def test_trade_created_despite_the_error_is_not_offered_twice(self):
+        self.trades.replies = [("créé", FakeResponse(500, SERVER_ERROR))]
+        output, code = self.run_send(execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.trades.posts()), 1)
+        self.assertIn("2 carte(s) quand même dans un échange en attente : envoyée(s)", output)
+        self.assertIn("2 carte(s) envoyée(s) en 1 échange(s)", output)
+
+    def test_slow_trade_is_checked_instead_of_stopping_the_pass(self):
+        # Vu 3 fois le 16/10/2026 : délai dépassé sur un échange de 17 cartes, tout le passage arrêté.
+        self.trades.replies = [requests.ReadTimeout("lent"), ("créé", requests.ReadTimeout("lent"))]
+        output, code = self.run_send(execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("ARRÊT", output)
+        self.assertEqual([len(b["items"]) for b in self.trades.posts()], [2, 1, 1])
+        self.assertIn("1 carte(s) quand même dans un échange en attente : envoyée(s)", output)
+        self.assertIn("2 carte(s) envoyée(s) en 2 échange(s)", output)
+        self.assertEqual(set(self.trades.timeouts), {90})  # le site est lent à créer un échange
+
+    def test_shared_antibot_pause_stops_the_other_account_until_a_restart(self):
+        until = time.time() + 1800
+        (self.dir / "comptes" / "marche_commun.json").write_text(json.dumps(
+            {"pause": {"until": until, "strikes": 1, "account": "moncompte2"}}), encoding="utf-8")
+        output, code = self.run_main(self.trades, "vendre", args=["--compte", "testeur"])
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"mises en vente en pause jusqu'à {w.clock_time(until)}", output)  # bloqué avec l'autre compte
+        output, code = self.run_main(self.trades, "vendre", execute=True, args=["--compte", "testeur"])
+        self.assertIn("Pause anti-robot commune levée par ce lancement", output)
+        self.assertEqual(sorted(self.trades.site.sells()), sorted([FACE, AMPHIBIA]))
+        pause = json.loads((self.dir / "comptes" / "marche_commun.json").read_text(encoding="utf-8")).get("pause")
+        self.assertIsNone(pause)  # mises en vente acceptées : les blocages de suite repartent à zéro
+
+    def test_refused_trade_is_not_a_revoked_session(self):
+        self.trades.replies = [FakeResponse(403, NOT_FRIENDS)] * 3
+        output, code = self.run_send(execute=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("ÉCHEC : échange refusé par le site : Vous devez être amis pour échanger des cartes", output)
+        self.assertIn("3 échanges refusés d'affilée : 1 carte(s) attendent le prochain passage", output)
+        self.assertNotIn("login", output)
+        self.assertEqual(self.trades.site.gets("/api/trades"), [])  # refus net : rien à vérifier
+
+    def test_recipient_must_be_a_friend_and_one_of_your_accounts(self):
+        self.trades.friends = []
+        output, code = self.run_send(execute=True)
+        self.assertIn("moncompte2 n'est pas l'ami de ce compte sur le site", output)
+        self.assertEqual(self.trades.posts(), [])
+        _, code = self.run_send(execute=True, to="Nevius")
+        self.assertIn("« Nevius » n'est pas un de vos comptes enregistrés", str(code))
+        _, code = self.run_send(execute=True, to="testeur")
+        self.assertIn("ne peut pas s'envoyer ses cartes", str(code))
+        _, code = self.run_send(to=None)
+        self.assertIn("À quel compte envoyer les cartes ?", str(code))
+
+    def test_tout_sends_from_one_account_and_sells_on_the_other(self):
+        send = {"to": "moncompte2", "in_tout": True}
+        output, code = self.run_send(execute=True, send=send, command="tout", to=None)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([[i["user_card_id"] for i in b["items"]] for b in self.trades.posts()], [[FACE, AMPHIBIA]])
+        self.assertEqual(self.trades.site.sells(), [])  # parties avant les ventes
+        self.assertEqual(self.trades.site.discards(), [CHACANA])  # le reste du tri continue
+        self.assertLess(output.index("== Envoi de cartes à moncompte2 =="), output.index("== Ventes aux enchères =="))
+        # Le compte qui reçoit, avec le même perso.yaml : il n'envoie rien et vend.
+        self.trades.pending = []
+        self.trades.site.pages[0]["pendingTradeCardIds"] = []
+        output, code = self.run_send(execute=True, send=send, command="tout", account="moncompte2", to=None)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("Envoi de cartes", output)
+        self.assertEqual(sorted(self.trades.site.sells()), sorted([FACE, AMPHIBIA]))
+
+    def test_packs_only_on_the_chosen_accounts(self):
+        # Le compte qui vend n'ouvre pas de boosters : ils prendraient sur ses ventes (safety.market_limit).
+        packs = lambda cfg: cfg["packs"].update(in_tout=True, accounts=["moncompte2"])  # noqa: E731
+        output, code = self.run_main(self.trades, "tout", mutate=packs, args=["--compte", "testeur"])
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("== Boosters ==", output)
+        self.assertEqual([u for _, u, *_ in self.trades.site.calls if "sync_profile_packs" in u], [])
+        output, code = self.run_main(self.trades, "boosters", mutate=packs, args=["--compte", "testeur"])
+        self.assertIn("pas de booster sur ce compte (packs.accounts : moncompte2)", output)
+        _, code = self.run_main(self.trades, "tout", args=["--compte", "testeur"],
+                                mutate=lambda cfg: cfg["packs"].update(accounts=["inconnu"]))
+        self.assertIn("packs.accounts : compte(s) inconnu(s) inconnu", str(code))
+
+    def test_send_config_is_checked(self):
+        def rejected(change, fragment):
+            cfg = load_cfg()
+            cfg["send"].update(change)
+            with self.assertRaises(SystemExit) as ctx:
+                w.check_config(cfg)
+            self.assertIn(fragment, str(ctx.exception.code))
+
+        rejected({"tags": ["+10", "Lyon"]}, "send.tags et protection.tags ont des étiquettes en commun")
+        rejected({"in_tout": True}, "send.in_tout demande send.to")
+        rejected({"batch_size": 0}, "send.batch_size")
+        rejected({"tags": []}, "send.tags doit être une liste de textes non vide")
+        _, code = self.run_main(self.trades, "vendre", args=["--vers", "moncompte2"])
+        self.assertEqual(code, 2)  # refusé par argparse : --vers ne sert qu'avec « envoyer »
+
+
+class SharedMarketTest(unittest.TestCase):
+    """Limite d'actions et pause anti-robot communes à vos comptes (safety.shared_market)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = pathlib.Path(tmp.name) / "marche_commun.json"
+        self.cfg = load_cfg()
+        self.cfg["safety"]["market_limit"] = {"count": 3, "minutes": 60, "bids": 1}
+
+    def ctx(self, account, sells=True):
+        return w.Context(client=None, cfg=self.cfg, execute=True, summary=w.new_summary(), cache=None, verbose=False,
+                         journal=None, state=None, shared=w.SharedMarket(self.path, account), sells=sells)
+
+    def test_one_account_blocked_pauses_the_others(self):
+        a, b = self.ctx("a"), self.ctx("b")
+        with redirect_stdout(io.StringIO()) as out:
+            w.antibot_strike(a, "auction")
+        self.assertIn("en pause jusqu'à", out.getvalue())
+        self.assertIn("pour tous vos comptes", out.getvalue())
+        until = w.antibot_until(b, "bid")
+        self.assertAlmostEqual(until, time.time() + 3600, delta=5)
+        self.assertIsNone(w.antibot_until(b, "discard"))  # les défausses ne sont pas concernées
+        with redirect_stdout(io.StringIO()):
+            w.antibot_strike(b, "pack")  # bloqué au même moment : on se range dans la même pause
+        self.assertEqual(w.antibot_until(a, "pack"), until)
+        with mock.patch("time.time", return_value=until + 10), redirect_stdout(io.StringIO()):
+            w.antibot_strike(b, "bid")  # encore bloqué après la pause : 2 h
+            self.assertAlmostEqual(w.antibot_until(a, "auction"), until + 10 + 7200, delta=1)
+        w.antibot_cleared(a, "auction")  # acceptée : levée pour tous, et le compte repart à zéro
+        self.assertIsNone(w.antibot_until(b, "bid"))
+        with redirect_stdout(io.StringIO()):
+            w.antibot_strike(b, "bid")
+        self.assertAlmostEqual(w.antibot_until(a, "bid"), time.time() + 3600, delta=5)
+
+    def test_restart_lifts_the_pause_but_the_next_block_lasts_longer(self):
+        shared = w.SharedMarket(self.path, "a")
+        shared.strike(0)
+        shared.clear(keep_strikes=True)
+        self.assertIsNone(shared.pause_until())
+        until, strikes = shared.strike(0)
+        self.assertEqual(strikes, 2)
+        self.assertAlmostEqual(until, time.time() + 7200, delta=5)
+
+    def test_market_limit_counts_every_account(self):
+        seller, buyer = self.ctx("vendeur"), self.ctx("acheteur", sells=False)
+        w.market_action(seller)
+        w.market_action(buyer, new_bid=True)
+        self.assertIsNone(w.market_wait(seller))
+        self.assertEqual(w.market_room(seller), 1)
+        # Nouvelle mise : 1 au plus (bids), même pour un compte qui ne vend pas (l'autre compte vend).
+        self.assertIsNotNone(w.market_wait(buyer, new_bid=True))
+        w.market_action(seller)
+        self.assertIsNotNone(w.market_wait(buyer))  # 3 actions en tout : plus rien pour personne
+        self.assertEqual(w.market_room(seller), 0)
+        self.assertIn("pour vos comptes ensemble", w.market_limit_text(seller))
 
 
 class SleepWatchTest(unittest.TestCase):

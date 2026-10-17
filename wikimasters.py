@@ -8,6 +8,7 @@
     ./wm defausser    défausse les cartes « defausse » (et les « inconnu » des raretés choisies)
     ./wm boosters     ouvre les boosters disponibles
     ./wm acheter      mise à la dernière seconde sur les enchères du marché qui correspondent à buy.keywords
+    ./wm envoyer      envoie les cartes à vendre (ou d'une étiquette) à un autre de vos comptes, qui les vendra
     ./wm comptes      liste les comptes enregistrés
 
 Sans --execute, chaque commande est une simulation : elle affiche ce qu'elle ferait sans rien modifier.
@@ -31,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -76,21 +78,20 @@ ANTIBOT_HINT = ("Ouvrez wiki-masters.com dans votre navigateur avec ce compte et
 # 16/10/2026 : après un blocage des mises, la mise en vente suivante l'est aussi, et l'inverse). Les défausses non.
 MARKET_GROUP = "ventes, achats et boosters"
 ANTIBOT_GROUPS = {"auction": MARKET_GROUP, "pack": MARKET_GROUP, "bid": MARKET_GROUP, "discard": "défausses",
-                  "add_tag": "étiquettes", "remove_tag": "étiquettes"}
+                  "add_tag": "étiquettes", "remove_tag": "étiquettes", "trade": "échanges"}
 # Nouvelles tentatives du renouvellement de session (réseau, 429, 5xx). Rapides : si la première demande était
 # arrivée, Supabase accepte encore l'ancien jeton pendant quelques secondes, au-delà il révoquerait la session.
 REFRESH_RETRY_DELAYS = (1, 3)
 MAYBE_DONE = "L'action a peut-être été effectuée : vérifiez sur le site."
-COMMANDS = ("tout", "analyser", "vendre", "defausser", "boosters", "acheter")
+COMMANDS = ("tout", "analyser", "vendre", "defausser", "boosters", "acheter", "envoyer")
 # Achats : une annonce qui finit dans moins de ce nombre de secondes n'est plus suivie (trop tard pour miser). La
 # dernière vérification, pour répondre à une surenchère, a lieu à buy.last_check_seconds de la fin.
 LAST_CHECK_SECONDS = 6
 # buy.bid_on_sight : les mises sur les annonces repérées à la même relecture partent espacées d'au moins ce nombre de
 # secondes (des mises enchaînées déclenchent la vérification anti-robot du site).
 SIGHT_SPACING = 15
-# buy.max_bids : le site bloque le marché du compte après une dizaine de mises rapprochées (vu les 15 et 16/10/2026 :
-# 10 mises acceptées, la 11e refusée, 6 fois sur 8). Ces dernières places sont gardées pour répondre à une surenchère
-# sur une enchère où le script a déjà misé, plutôt que de la perdre pour une nouvelle.
+# safety.market_limit : quand un compte achète, ces dernières places sont gardées pour répondre à une surenchère sur
+# une enchère où le script a déjà misé, plutôt que de la perdre pour une nouvelle vente ou une nouvelle mise.
 BID_RESERVE = 2
 # Mise refusée parce qu'un autre joueur vient de miser (409 « Mise trop basse », avec le nouveau minimum) : ce minimum
 # est remisé aussitôt, toujours sous le plafond, au plus ce nombre de fois de suite.
@@ -114,6 +115,8 @@ PERSO_FILE = "perso.yaml"
 ACCOUNTS_DIR = "comptes"
 # Dans ACCOUNTS_DIR : enchère du marché -> compte qui la suit, pour que vos comptes ne misent pas l'un contre l'autre.
 CLAIMS_FILE = "achats_en_cours.json"
+# Dans ACCOUNTS_DIR : actions sur le marché et pause anti-robot communes à vos comptes (safety.shared_market).
+MARKET_FILE = "marche_commun.json"
 # Commande affichée dans les messages : le lanceur (./wm ou wm) la précise.
 CMD = os.environ.get("WM_CMD") or "python wikimasters.py"
 
@@ -130,9 +133,10 @@ def as_dict(data):
 class ApiError(Exception):
     """Erreur d'API. fatal=True arrête le passage, sinon seule l'action en cours est abandonnée."""
 
-    def __init__(self, message, fatal=False, status=None, code=None, body=None):
+    def __init__(self, message, fatal=False, status=None, code=None, body=None, network=False):
         super().__init__(message)
         self.fatal = fatal
+        self.network = network  # coupure ou délai dépassé : la requête est peut-être arrivée
         self.status = status
         self.code = code  # code d'erreur renvoyé par le site ou Supabase (ex. "23505")
         self.body = as_dict(body)  # réponse JSON du site (ex. {"code": "bid_too_low", "min": 43})
@@ -157,6 +161,7 @@ class Card:
     is_shiny: bool = False
     in_trade: bool = False
     count: int = 1
+    category: str = ""  # courte description de la carte (ex. « chanson de PNL, sortie en 2019 »)
 
     def has_any_tag(self, names, initial_only=False):
         mine = self.initial_tags if initial_only else {norm(t) for t in self.tags}
@@ -250,7 +255,8 @@ def _is_int(x):
     return isinstance(x, int) and not isinstance(x, bool)
 
 
-CONDITION_KEYS = {"name_contains", "name_words", "rarity_in", "shiny", "min_value", "max_value"}
+CONDITION_KEYS = {"name_contains", "name_words", "text_contains", "text_excludes", "rarity_in", "shiny", "min_value",
+                  "max_value"}
 
 
 def check_config(cfg):
@@ -307,7 +313,7 @@ def check_config(cfg):
         unknown_keys(cond, where, CONDITION_KEYS)
         if "rarity_in" in cond:
             str_list(cond, where, "rarity_in", allow_empty=False)
-        for key in ("name_contains", "name_words"):
+        for key in ("name_contains", "name_words", "text_contains", "text_excludes"):
             if key in cond and not isinstance(cond[key], str):
                 str_list(cond, where, key, allow_empty=False)  # ou une liste : l'un de ces textes
         if "shiny" in cond and not isinstance(cond["shiny"], bool):
@@ -318,7 +324,7 @@ def check_config(cfg):
 
     if isinstance(cfg, dict):
         unknown_keys(cfg, "", ("site", "protection", "price", "price_tags", "auto_tags", "discard", "sell", "packs",
-                               "buy", "safety", "journal", "display", "telegram"))
+                               "buy", "send", "safety", "journal", "display", "telegram"))
 
     site_keys = ("base_url", "supabase_url", "supabase_anon_key")
     site = section("site", site_keys)
@@ -326,11 +332,16 @@ def check_config(cfg):
         if not isinstance(site.get(key), str) or not site.get(key):
             err(f"site.{key} doit être un texte")
 
-    prot = section("protection", ("tags", "starred", "shiny", "rarities", "name_contains"))
+    prot = section("protection", ("tags", "starred", "shiny", "rarities", "unprotected_rarities", "name_contains"))
     prot_tags = str_list(prot, "protection", "tags")
     boolean(prot, "protection", "starred")
     boolean(prot, "protection", "shiny")
-    str_list(prot, "protection", "rarities")
+    rarities = {norm(r) for r in str_list(prot, "protection", "rarities")}
+    if prot.get("unprotected_rarities") is not None:
+        for rarity in str_list(prot, "protection", "unprotected_rarities"):
+            if norm(rarity) not in rarities:
+                err(f"protection.unprotected_rarities : {rarity} n'est pas dans protection.rarities (elle est déjà "
+                    "vendue et défaussée comme les autres)")
     str_list(prot, "protection", "name_contains")
 
     price = section("price", ("cache_hours", "cache_file"))
@@ -338,7 +349,7 @@ def check_config(cfg):
     if not isinstance(price.get("cache_file"), str) or not price.get("cache_file"):
         err("price.cache_file doit être un nom de fichier")
 
-    pt = section("price_tags", ("bands", "unknown_tag", "remove_outdated", "tag_protected"))
+    pt = section("price_tags", ("bands", "unknown_tag", "remove_outdated", "tag_protected", "retired"))
     boolean(pt, "price_tags", "remove_outdated")
     boolean(pt, "price_tags", "tag_protected")
     if pt.get("unknown_tag") is not None and not isinstance(pt.get("unknown_tag"), str):
@@ -376,6 +387,10 @@ def check_config(cfg):
         band_tags.append(pt["unknown_tag"])
     if len({norm(t) for t in band_tags}) != len(band_tags):
         err("price_tags : chaque tranche (et unknown_tag) doit avoir une étiquette différente")
+    if pt.get("retired") is not None:
+        for tag in str_list(pt, "price_tags", "retired"):
+            if norm(tag) in {norm(t) for t in band_tags}:
+                err(f"price_tags.retired : « {tag} » est encore une tranche de prix (elle serait retirée puis remise)")
 
     auto_tags = cfg.get("auto_tags", [])
     if not isinstance(auto_tags, list):
@@ -396,15 +411,18 @@ def check_config(cfg):
         if rule.get("color") is not None and not isinstance(rule.get("color"), str):
             err(f"{where}.color doit être un texte, ex. \"#22c55e\"")
 
-    disc = section("discard", ("tags", "max_value", "unknown_rarities", "max_per_run", "fresh_price",
+    disc = section("discard", ("tags", "accounts", "max_value", "unknown_rarities", "max_per_run", "fresh_price",
                                "require_existing_tag", "unsold_max_value"))
+    if disc.get("accounts") is not None:
+        str_list(disc, "discard", "accounts", allow_empty=False)
     disc_tags = str_list(disc, "discard", "tags", allow_empty=False)
     number(disc, "discard", "max_value", 0, allow_none=True)
     unknown_rarities = str_list(disc, "discard", "unknown_rarities")
     if unknown_rarities and not pt.get("unknown_tag"):
         err("discard.unknown_rarities demande price_tags.unknown_tag (ex. \"inconnu\") : c'est cette étiquette "
             "qui repère les cartes jamais vendues")
-    protected_rarities = {norm(r) for r in prot.get("rarities") or [] if isinstance(r, str)}
+    protected_rarities = {norm(r) for r in prot.get("rarities") or [] if isinstance(r, str)} \
+        - {norm(r) for r in prot.get("unprotected_rarities") or [] if isinstance(r, str)}
     for rarity in unknown_rarities:
         if norm(rarity) in protected_rarities:
             err(f"discard.unknown_rarities contient {rarity}, qui est protégée (protection.rarities) : "
@@ -414,10 +432,10 @@ def check_config(cfg):
     boolean(disc, "discard", "fresh_price")
     boolean(disc, "discard", "require_existing_tag")
 
-    sell = section("sell", ("tags", "order", "price_factor", "rounding", "min_start_price", "max_start_price",
+    sell = section("sell", ("tags", "accounts", "order", "price_factor", "rounding", "min_start_price", "max_start_price",
                             "duration_minutes", "long_duration", "max_auctions", "min_value", "fresh_price",
                             "require_existing_tag",
-                            "relist", "night"))
+                            "relist", "night", "peak"))
     sell_tags = str_list(sell, "sell", "tags", allow_empty=False)
     number(sell, "sell", "price_factor", 0, strict=True)
     choice(sell, "sell", "rounding", ["floor", "round", "ceil"])
@@ -428,6 +446,8 @@ def check_config(cfg):
         err("sell.max_start_price doit être >= sell.min_start_price")
     boolean(sell, "sell", "fresh_price")
     boolean(sell, "sell", "require_existing_tag")
+    if sell.get("accounts") is not None:
+        str_list(sell, "sell", "accounts", allow_empty=False)
     choice(sell, "sell", "duration_minutes", sorted(KNOWN_DURATIONS))
     long_duration = sell.get("long_duration")
     if long_duration is not None and not isinstance(long_duration, dict):
@@ -464,23 +484,35 @@ def check_config(cfg):
         if clock_minutes(night.get("start")) is not None \
                 and clock_minutes(night.get("start")) == clock_minutes(night.get("end")):
             err("sell.night : start et end doivent être différents")
+    peak = sell.get("peak")
+    if peak is not None and not isinstance(peak, dict):
+        err("sell.peak doit valoir { start: \"18:00\", end: \"22:00\", duration_minutes: 10 } (ou null)")
+    elif peak is not None:
+        unknown_keys(peak, "sell.peak", ("start", "end", "duration_minutes", "market_limit"))
+        number(peak, "sell.peak", "market_limit", 1, integer=True, allow_none=True)
+        for key in ("start", "end"):
+            if clock_minutes(peak.get(key)) is None:
+                err(f"sell.peak.{key} doit être une heure entre guillemets, ex. \"18:00\"")
+        if clock_minutes(peak.get("start")) is not None \
+                and clock_minutes(peak.get("start")) == clock_minutes(peak.get("end")):
+            err("sell.peak : start et end doivent être différents")
+        choice(peak, "sell.peak", "duration_minutes", sorted(KNOWN_DURATIONS))
 
-    packs = section("packs", ("in_tout", "max_per_run", "delay_seconds"))
+    packs = section("packs", ("in_tout", "accounts", "every_minutes", "max_blocks", "retry_hours", "max_per_run",
+                              "delay_seconds"))
     boolean(packs, "packs", "in_tout")
+    if packs.get("accounts") is not None:
+        str_list(packs, "packs", "accounts", allow_empty=False)
+    number(packs, "packs", "every_minutes", 1, allow_none=True)
+    number(packs, "packs", "max_blocks", 1, integer=True, allow_none=True)
+    number(packs, "packs", "retry_hours", 0, strict=True)
     number(packs, "packs", "max_per_run", 0, integer=True)
     number(packs, "packs", "delay_seconds", 0)
 
     buy = section("buy", ("keywords", "tag", "keyword_tags", "names", "names_tags", "names_minutes", "price_factor",
                           "max_price", "buy_unknown", "skip_owned", "snipe_seconds", "last_check_seconds",
-                          "bid_on_sight", "max_bids", "exclude", "scan_minutes", "accounts", "by_account"))
+                          "bid_on_sight", "exclude", "scan_minutes", "accounts", "by_account"))
     str_list(buy, "buy", "exclude")
-    max_bids = buy.get("max_bids")
-    if max_bids is not None and not isinstance(max_bids, dict):
-        err("buy.max_bids doit valoir { count: 8, minutes: 30 } (ou null)")
-    elif max_bids is not None:
-        unknown_keys(max_bids, "buy.max_bids", ("count", "minutes"))
-        number(max_bids, "buy.max_bids", "count", BID_RESERVE + 1, integer=True)
-        number(max_bids, "buy.max_bids", "minutes", 1)
     by_account = buy.get("by_account")
     if by_account is not None and not isinstance(by_account, dict):
         err("buy.by_account doit valoir { compte: { keywords: […], names: […] }, … } (ou null)")
@@ -527,6 +559,22 @@ def check_config(cfg):
     if buy.get("names_tags") is not None:
         bought_tags_ok(buy["names_tags"], "buy.names_tags")
 
+    send = section("send", ("to", "tags", "in_tout", "batch_size", "max_per_run", "delay_seconds"))
+    if send.get("to") is not None and (not isinstance(send["to"], str) or not send["to"].strip()):
+        err("send.to doit être le nom d'un de vos comptes, ex. \"moncompte2\" (ou null)")
+    send_tags = str_list(send, "send", "tags", allow_empty=False) if send.get("tags") is not None else []
+    boolean(send, "send", "in_tout")
+    if send.get("in_tout") is True and not send.get("to"):
+        err("send.in_tout demande send.to : le compte qui reçoit les cartes")
+    number(send, "send", "batch_size", 1, integer=True)
+    number(send, "send", "max_per_run", 0, integer=True)
+    number(send, "send", "delay_seconds", 0)
+    common = sorted({norm(t) for t in send_tags} & protecting)
+    if common:
+        # Une carte protégée n'est jamais envoyée : ses étiquettes ne la suivent pas sur l'autre compte.
+        err(f"send.tags et protection.tags ont des étiquettes en commun : {common} (une carte protégée n'est jamais "
+            "envoyée)")
+
     journal = section("journal", ("enabled", "file", "delimiter"))
     boolean(journal, "journal", "enabled")
     if not isinstance(journal.get("file"), str) or not journal.get("file"):
@@ -564,7 +612,17 @@ def check_config(cfg):
             err(f"{name_a} et {name_b} ont des étiquettes en commun : {sorted(common)}")
 
     safety = section("safety", ("max_actions_per_run", "delay_seconds", "auction_delay_seconds", "read_delay_seconds",
-                                "max_consecutive_errors", "max_consecutive_read_failures"))
+                                "max_consecutive_errors", "max_consecutive_read_failures", "market_limit",
+                                "shared_market"))
+    boolean(safety, "safety", "shared_market")
+    market_limit = safety.get("market_limit")
+    if market_limit is not None and not isinstance(market_limit, dict):
+        err("safety.market_limit doit valoir { count: 10, minutes: 60 } (ou null)")
+    elif market_limit is not None:
+        unknown_keys(market_limit, "safety.market_limit", ("count", "minutes", "bids"))
+        number(market_limit, "safety.market_limit", "count", BID_RESERVE + 1, integer=True)
+        number(market_limit, "safety.market_limit", "minutes", 1)
+        number(market_limit, "safety.market_limit", "bids", 0, integer=True, allow_none=True)
     number(safety, "safety", "max_actions_per_run", 0, integer=True)
     number(safety, "safety", "delay_seconds", 0)
     number(safety, "safety", "auction_delay_seconds", 0)
@@ -813,6 +871,7 @@ def parse_collection_page(data, pending=None):
                 # On ne sait pas si ces ids sont ceux des exemplaires ou des cartes : on teste les deux.
                 in_trade=copy_id in pending or card_id in pending,
                 count=int(item.get("count") or 1),
+                category=str(card.get("category") or ""),
             )
         )
     return copies
@@ -901,6 +960,12 @@ def matches(card, value, cond):
         return False
     if "name_words" in cond and not any(found_in(n, norm(card.name), whole=True) for n in text_list(cond["name_words"])):
         return False
+    # Titre ou description de la carte, en début de mot, comme buy.keywords (« pnl » trouve « chanson de PNL »).
+    text = norm(f"{card.name} {card.category}")
+    if "text_contains" in cond and not any(found_in(n, text) for n in text_list(cond["text_contains"])):
+        return False
+    if "text_excludes" in cond and any(found_in(n, text) for n in text_list(cond["text_excludes"])):
+        return False
     if "rarity_in" in cond and norm(card.rarity) not in {norm(r) for r in cond["rarity_in"]}:
         return False
     if "shiny" in cond and card.is_shiny != cond["shiny"]:
@@ -923,7 +988,10 @@ def protection_reason(card, prot):
         return "favori"
     if card.is_shiny and prot["shiny"]:
         return "shiny"
-    if norm(card.rarity) in {norm(r) for r in prot["rarities"]}:
+    # protection.unprotected_rarities : raretés traitées comme les autres cartes (perso.yaml ne peut pas en retirer
+    # une de protection.rarities, voir load_config).
+    unprotected = {norm(r) for r in prot.get("unprotected_rarities") or []}
+    if norm(card.rarity) in {norm(r) for r in prot["rarities"]} - unprotected:
         return f"rareté {card.rarity}"
     for part in prot["name_contains"]:
         if norm(part) in norm(card.name):
@@ -951,10 +1019,21 @@ def band_for(value, bands):
     return None
 
 
+def price_tag_names(pt):
+    """Étiquettes de prix (tranches et unknown_tag) de la section price_tags."""
+    return [b["tag"] for b in pt["bands"]] + ([pt["unknown_tag"]] if pt.get("unknown_tag") else [])
+
+
+def old_price_tags(pt):
+    """Étiquettes de prix à retirer quand elles ne sont plus les bonnes : les actuelles, et les anciennes tranches
+    supprimées (price_tags.retired, ex. « +5 »)."""
+    return price_tag_names(pt) + list(pt.get("retired") or [])
+
+
 def tag_changes(card, value, cfg):
     """Étiquettes à ajouter et à retirer pour la commande analyser : (ajouts, retraits)."""
     pt = cfg["price_tags"]
-    price_tag_names = [b["tag"] for b in pt["bands"]] + ([pt["unknown_tag"]] if pt.get("unknown_tag") else [])
+    price_tags = old_price_tags(pt)
     if value is None:
         target = pt.get("unknown_tag") or None
     else:
@@ -966,7 +1045,7 @@ def tag_changes(card, value, cfg):
         add.append(target)
     # Les anciennes étiquettes de prix ne sont retirées que si la nouvelle tranche est connue.
     if pt["remove_outdated"] and target:
-        remove = [have[norm(n)] for n in price_tag_names if norm(n) in have and norm(n) != norm(target)]
+        remove = [have[norm(n)] for n in price_tags if norm(n) in have and norm(n) != norm(target)]
     auto = []
     for rule in cfg.get("auto_tags", []):
         if norm(rule["tag"]) not in have and norm(rule["tag"]) not in {norm(t) for t in add + auto} \
@@ -975,7 +1054,9 @@ def tag_changes(card, value, cfg):
     protecting = {norm(t) for t in cfg["protection"]["tags"]}
     if any(norm(t) in protecting for t in auto):
         # La carte devient protégée : pas d'étiquette de vente ni de défausse, et la protection est posée en premier.
-        return [t for t in auto if norm(t) in protecting] + [t for t in auto if norm(t) not in protecting], []
+        # Ses étiquettes de prix sont retirées (sauf tag_protected) : filtrée par prix sur le site, elle n'apparaît plus.
+        stale = [] if pt["tag_protected"] else [have[norm(n)] for n in price_tags if norm(n) in have]
+        return [t for t in auto if norm(t) in protecting] + [t for t in auto if norm(t) not in protecting], stale
     return add + auto, remove
 
 
@@ -1038,6 +1119,22 @@ def next_free_slot(ctx):
             for _, e in ctx.state.with_status("open")]
     ends = [t for t in ends if t > now - 300]
     return min(ends) if ends else None
+
+
+def next_sale_at(ctx):
+    """Moment où les ventes en attente de ce passage deviennent possibles (place d'enchère libérée par une enchère du
+    script, et/ou safety.market_limit), ou None (rien en attente, ou on ne sait pas quand une place se libère)."""
+    summary, times = ctx.summary, []
+    if summary["slot_full"]:
+        free = next_free_slot(ctx)
+        if free is None:
+            return None
+        times.append(free)
+    if summary["market_full"]:
+        times.append(market_wait(ctx, market_reserve(ctx)) or time.time())
+    if summary["paced"]:  # mises en vente étalées (sale_spacing) : le passage suivant a lieu pour la prochaine
+        times.append(next_paced_sale(ctx) or time.time())
+    return max(times) if times else None
 
 
 def night_end(timestamp, night):
@@ -1242,7 +1339,7 @@ class WikiMastersClient:
         """Pause entre deux requêtes, allongée tant que le serveur montre des signes de surcharge."""
         (self.waiter or time.sleep)(seconds * self.slowdown)
 
-    def _request(self, method, url, headers_fn, retry=None, **kwargs):
+    def _request(self, method, url, headers_fn, retry=None, timeout=20, **kwargs):
         """Envoie la requête ; en cas de panne du serveur (429, 5xx, réseau), attend puis la renvoie.
 
         Une lecture est toujours renvoyée. Une écriture ne l'est que si retry le permet :
@@ -1263,14 +1360,14 @@ class WikiMastersClient:
             wait, resp = delays[attempt] if attempt < len(delays) else 0, None
             try:
                 resp = self.http.request(
-                    method, url, timeout=20, allow_redirects=False, headers=headers_fn(), **kwargs
+                    method, url, timeout=timeout, allow_redirects=False, headers=headers_fn(), **kwargs
                 )
             except requests.RequestException as e:
                 sent = not isinstance(e, requests.ConnectTimeout)  # délai de connexion dépassé : rien n'est parti
                 uncertain = uncertain or (sent and method != "GET")
                 # Jamais str(e) : le message peut contenir les en-têtes, donc le cookie.
                 problem = f"erreur réseau ({type(e).__name__})"
-                error = ApiError(f"{problem} sur {what}.{self._maybe_done(uncertain)}", fatal=True)
+                error = ApiError(f"{problem} sur {what}.{self._maybe_done(uncertain)}", fatal=True, network=True)
                 retryable = retry == "idempotent" or not sent
             else:
                 self._adopt_server_cookies(resp)
@@ -1347,6 +1444,11 @@ class WikiMastersClient:
             # « Plus de paquets disponibles » (vu le 14/10/2026) : le compteur lu juste avant annonçait plus de
             # boosters que le site n'en accorde. Rien à voir avec la session : seuls les boosters s'arrêtent.
             raise ApiError(f"plus de booster disponible sur {what}{detail}", status=403, code="no_packs", body=body)
+        if resp.status_code == 403 and what == "POST /api/trades":
+            # « Vous devez être amis pour échanger des cartes » (vu le 16/10/2026, alors que les deux comptes étaient
+            # amis) : seul cet échange est refusé, la session n'y est pour rien.
+            reason = f" : {body['error']}" if isinstance(body.get("error"), str) else detail
+            raise ApiError(f"échange refusé par le site{reason}", status=403, code="trade_refused", body=body)
         if resp.status_code == 403 and code == "42501":
             # Session valide mais règle d'accès Supabase refusée : en pratique, l'exemplaire a quitté la collection
             # pendant le passage. Seule cette carte est abandonnée ; si tout est refusé, max_consecutive_errors arrête.
@@ -1472,6 +1574,32 @@ class WikiMastersClient:
 
     def bid(self, auction_id, amount):
         return self._api("POST", f"/api/marketplace/{auction_id}/bid", json={"amount": amount}, retry="safe")
+
+    def friends(self):
+        """Amis du compte (amitiés acceptées) : id du joueur -> pseudo."""
+        data = as_dict(self._api("GET", "/api/friends"))
+        found = {}
+        for friendship in data.get("friendships") or []:
+            if not isinstance(friendship, dict) or friendship.get("status") != "accepted":
+                continue
+            for side in ("requester", "addressee"):  # l'un des deux est ce compte
+                player = as_dict(friendship.get(side))
+                if player.get("id") and str(player["id"]) != self.user_id:
+                    found[str(player["id"])] = str(player.get("username") or "")
+        return found
+
+    def trade_copy_ids(self):
+        """Exemplaires engagés dans un échange en attente (les nôtres et ceux des autres joueurs)."""
+        data = as_dict(self._api("GET", "/api/trades", params={"active": 1}))
+        return {str(item["user_card_id"]) for trade in data.get("trades") or [] if isinstance(trade, dict)
+                for item in trade.get("items") or [] if isinstance(item, dict) and item.get("user_card_id")}
+
+    def create_trade(self, recipient_id, cards):
+        """Propose un échange : ces exemplaires, contre rien (ni carte ni wikibidous en retour)."""
+        items = [{"user_card_id": c.copy_id, "card_id": c.card_id, "offered_by": self.user_id} for c in cards]
+        body = {"recipient_id": recipient_id, "items": items, "initiator_wikibidous": 0, "recipient_wikibidous": 0}
+        # Le site met souvent plus de 20 s à créer un échange de 17 cartes (délai dépassé 3 fois le 16/10/2026).
+        return self._api("POST", "/api/trades", json=body, retry="safe", timeout=90)
 
     def known_tags(self):
         """Étiquettes du compte : norm(nom) -> id (lues une fois)."""
@@ -1837,7 +1965,75 @@ class RunLock:
             self.held = False
 
 
-class BuyClaims:
+class SharedFile:
+    """Fichier JSON de comptes/ partagé par vos comptes lancés en même temps, sous un verrou que chacun tient un
+    instant."""
+
+    LOCK_WAIT = 5  # secondes d'attente au plus du fichier, que l'autre compte tient un instant
+    STALE_LOCK = 30  # verrou plus vieux : laissé par un passage planté, on le reprend
+    RISK = ""  # conséquence d'un fichier inaccessible, pour les messages
+
+    def __init__(self, path, account):
+        self.path = pathlib.Path(path)
+        self.lock = self.path.with_name(f".{self.path.stem}.lock")
+        self.account = account
+
+    def _acquire(self):
+        deadline = time.time() + self.LOCK_WAIT
+        while True:
+            try:
+                os.close(os.open(self.lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+                return True
+            except FileExistsError:
+                try:
+                    if time.time() - self.lock.stat().st_mtime > self.STALE_LOCK:
+                        os.unlink(self.lock)
+                        continue
+                except OSError:
+                    continue  # verrou retiré entre-temps : on réessaie
+            except OSError as e:
+                print(f"Attention : {self.path.name} inaccessible ({type(e).__name__}) : {self.RISK}.")
+                return False
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def _release(self):
+        try:
+            os.unlink(self.lock)
+        except OSError:
+            pass
+
+    def _read(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write(self, data):
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.stem}.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            print(f"Attention : {self.path.name} non enregistré ({type(e).__name__}) : {self.RISK}.")
+
+    def _change(self, change):
+        """Applique change(contenu) au fichier, sous le verrou ; retourne son résultat (None si inaccessible)."""
+        if not self._acquire():
+            return None
+        try:
+            data = self._read()
+            result = change(data)
+            self._write(data)
+            return result
+        finally:
+            self._release()
+
+
+class BuyClaims(SharedFile):
     """comptes/achats_en_cours.json : quel compte suit chaque enchère du marché.
 
     Vos comptes lancés en même temps repèrent les mêmes annonces et miseraient tous à la même seconde, avant de voir
@@ -1846,13 +2042,7 @@ class BuyClaims:
     """
 
     KEEP_AFTER_END = 3600
-    LOCK_WAIT = 5  # secondes d'attente au plus du fichier, que l'autre compte tient un instant
-    STALE_LOCK = 30  # verrou plus vieux : laissé par un passage planté, on le reprend
-
-    def __init__(self, path, account):
-        self.path = pathlib.Path(path)
-        self.lock = self.path.with_name(f".{self.path.stem}.lock")
-        self.account = account
+    RISK = "vos comptes peuvent miser sur la même enchère"
 
     def holder(self, auction_id, end_at, take):
         """L'autre compte qui suit déjà cette enchère, ou None. take : la réserver pour ce compte si elle est libre."""
@@ -1869,53 +2059,71 @@ class BuyClaims:
                 self._write(claims)
             return None
         finally:
-            try:
-                os.unlink(self.lock)
-            except OSError:
-                pass
+            self._release()
 
     def _alive(self, entry, now):
         return isinstance(entry, dict) and _is_number(entry.get("end_at")) \
             and now < entry["end_at"] + self.KEEP_AFTER_END and isinstance(entry.get("pid"), int) \
             and pid_alive(entry["pid"])
 
-    def _acquire(self):
-        deadline = time.time() + self.LOCK_WAIT
-        while True:
-            try:
-                os.close(os.open(self.lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-                return True
-            except FileExistsError:
-                try:
-                    if time.time() - self.lock.stat().st_mtime > self.STALE_LOCK:
-                        os.unlink(self.lock)
-                        continue
-                except OSError:
-                    continue  # verrou retiré entre-temps : on réessaie
-            except OSError as e:
-                print(f"Attention : {self.path.name} inaccessible ({type(e).__name__}) : "
-                      "vos comptes peuvent miser sur la même enchère.")
-                return False
-            if time.time() >= deadline:
-                return False
-            time.sleep(0.05)
 
-    def _read(self):
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return data if isinstance(data, dict) else {}
+class SharedMarket(SharedFile):
+    """comptes/marche_commun.json : actions sur le marché et pause anti-robot communes à vos comptes
+    (safety.shared_market).
 
-    def _write(self, claims):
-        try:
-            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.stem}.", suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(claims, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, self.path)
-        except OSError as e:
-            print(f"Attention : {self.path.name} non enregistré ({type(e).__name__}) : "
-                  "vos comptes peuvent miser sur la même enchère.")
+    Chaque compte inscrit ici ses actions sur le marché (safety.market_limit vaut pour tous ensemble) et sa pause
+    anti-robot : les autres s'arrêtent aussi. Désactivé par défaut : le 16/10/2026, 7 blocages sur 8 touchaient les deux
+    comptes à quelques minutes d'écart, mais leurs pauses étaient synchronisées (reprise ensemble à la fin de la nuit) ;
+    le 17/10, un compte bloqué sur un booster n'empêchait pas l'autre d'ouvrir et de miser 7 s plus tard.
+    """
+
+    RISK = "chaque compte compte seul ses actions sur le marché et sa pause anti-robot"
+    KEEP = 6 * 3600  # actions gardées dans le fichier (plus que la fenêtre de safety.market_limit)
+
+    def actions(self, since):
+        """Actions des AUTRES comptes depuis ce moment : [(moment, première mise sur une enchère ?)]."""
+        return [(e[0], bool(e[2])) for e in self._read().get("actions") or []
+                if isinstance(e, list) and len(e) == 3 and _is_number(e[0]) and e[0] > since and e[1] != self.account]
+
+    def record(self, times, bid_times=(), replace=False):
+        """Inscrit des actions de ce compte (bid_times : celles qui sont des premières mises). replace : remplace les
+        siennes (au démarrage, d'après le journal)."""
+        def change(data):
+            now, bids = time.time(), set(bid_times)
+            kept = [e for e in data.get("actions") or [] if isinstance(e, list) and len(e) == 3 and _is_number(e[0])
+                    and now - e[0] < self.KEEP and not (replace and e[1] == self.account)]
+            data["actions"] = sorted(kept + [[t, self.account, t in bids] for t in times], key=lambda e: e[0])
+        self._change(change)
+
+    def pause_until(self):
+        until = as_dict(self._read().get("pause")).get("until")
+        return until if _is_number(until) and until > time.time() else None
+
+    def strike(self, local):
+        """Un compte est bloqué : pause commune, plus longue à chaque blocage depuis la dernière action acceptée.
+        local : blocages déjà vus par ce compte. Retourne (fin de la pause, blocages), ou None (fichier inaccessible)."""
+        def change(data):
+            pause, now = as_dict(data.get("pause")), time.time()
+            strikes = max(pause["strikes"] if _is_int(pause.get("strikes")) else 0, local)
+            if _is_number(pause.get("until")) and pause["until"] > now and strikes:
+                return pause["until"], strikes  # déjà en pause (un autre compte bloqué au même moment) : on s'y range
+            until = now + ANTIBOT_PAUSES[min(strikes, len(ANTIBOT_PAUSES) - 1)]
+            data["pause"] = {"until": until, "strikes": strikes + 1, "account": self.account}
+            return until, strikes + 1
+        return self._change(change)
+
+    def clear(self, keep_strikes=False):
+        """Pause levée : le site accepte à nouveau une action sur le marché, ou le script est relancé (keep_strikes :
+        sans vérification faite à la main, le blocage suivant durera plus longtemps)."""
+        if not self._read().get("pause"):
+            return
+
+        def change(data):
+            if keep_strikes:
+                as_dict(data.get("pause"))["until"] = 0
+            else:
+                data.pop("pause", None)
+        self._change(change)
 
 
 @dataclass
@@ -1948,6 +2156,17 @@ class Context:
     purchases: object = None  # PurchaseState : enchères du marché où le script a misé
     sniper: object = None  # Sniper, quand les achats sont actifs (« acheter », ou « tout --loop » avec buy.keywords)
     notify: object = None  # envoie aussitôt une alerte Telegram (texte), si les notifications sont configurées
+    market_times: list = field(default_factory=list)  # actions récentes sur le marché (safety.market_limit)
+    bid_times: list = field(default_factory=list)  # dont premières mises sur une enchère (safety.market_limit.bids)
+    sells: bool = True  # ce compte met des cartes aux enchères (sell.accounts)
+    discards: bool = True  # ce compte défausse (discard.accounts)
+    opens_packs: bool = True  # ce compte ouvre des boosters (packs.accounts)
+    recipient: tuple = None  # (nom, id sur le site) du compte qui reçoit les envois (send.to), sinon None
+    pack_events: list = field(default_factory=list)  # (moment, ouvert ?) : boosters ouverts / bloqués (anti-robot)
+    packs_tried_at: float = 0.0  # dernier essai d'ouverture de boosters (packs.every_minutes)
+    next_top_up: float = 0.0  # prochaine vérification des places d'enchère pendant les défausses (top_up_sales)
+    shared: object = None  # SharedMarket : limite et pause anti-robot communes à vos comptes (safety.shared_market)
+    others_buy: bool = False  # un autre de vos comptes achète, sur le même marché commun (places gardées, BID_RESERVE)
 
 
 # --- Commandes --------------------------------------------------------------
@@ -1959,12 +2178,14 @@ FINAL_ACTIONS = ("discard", "auction")
 
 def new_summary():
     counters = ("tag_add", "tag_remove", "discard", "auction", "relist", "sold", "unsold", "no_slot", "error",
-                "deferred", "pack", "bid", "won", "lost", "retried")
+                "deferred", "pack", "bid", "won", "lost", "retried", "trade", "sent")
     # Ensembles d'exemplaires : une carte vue dans plusieurs phases de « tout » n'est comptée qu'une fois.
     sets = ("protect", "skip", "up_to_date", "read_error")
     # paused : groupe d'actions -> fin de sa pause anti-robot (voir antibot_strike) ; night : fin de la nuit sans
     # mise en vente (sell.night), si les ventes ont été sautées pour cette raison
-    return {**{k: 0 for k in counters}, **{k: set() for k in sets}, "paused": {}, "night": None}
+    # slot_full / market_full : des ventes attendent une place d'enchère / safety.market_limit (voir next_sale_at)
+    return {**{k: 0 for k in counters}, **{k: set() for k in sets}, "paused": {}, "night": None,
+            "slot_full": False, "market_full": False, "paced": False, "slots_unreadable": False}
 
 
 def crash_report(e):
@@ -1981,11 +2202,96 @@ def clock_time(timestamp):
 def antibot_until(ctx, kind):
     """Fin de la pause anti-robot de ce type d'action, ou None s'il n'est pas en pause."""
     group = ANTIBOT_GROUPS[kind]
-    entry = ctx.antibot.get(group)
-    if entry and entry["until"] > time.time():
-        ctx.summary["paused"][group] = entry["until"]
-        return entry["until"]
+    entry = ctx.antibot.get(group) or {}
+    until = entry.get("until") or 0
+    if group == MARKET_GROUP and ctx.shared and not entry.get("local"):
+        until = ctx.shared.pause_until() or 0  # commune : un autre compte bloqué compte aussi, une relance la lève
+    if until > time.time():
+        ctx.summary["paused"][group] = until
+        return until
     return None
+
+
+def antibot_cleared(ctx, kind):
+    """Action acceptée à nouveau par le site : la prochaine pause repart à 1 h (pour tous vos comptes, si commune)."""
+    group = ANTIBOT_GROUPS[kind]
+    ctx.antibot.pop(group, None)
+    if group == MARKET_GROUP and ctx.shared:
+        ctx.shared.clear()
+
+
+def market_wait(ctx, reserve=0, new_bid=False):
+    """None si une action sur le marché (mise, mise en vente, booster) peut partir maintenant, sinon le moment où elle
+    le pourra (safety.market_limit). reserve : places gardées pour répondre à une surenchère (BID_RESERVE).
+    new_bid : première mise sur une enchère, limitée aussi par safety.market_limit.bids (le reste va aux ventes)."""
+    limit = ctx.cfg["safety"].get("market_limit")
+    if not limit:
+        return None
+    window, now = limit["minutes"] * 60, time.time()
+    times, bid_times = market_history(ctx, window)
+    waits = []
+    allowed = max(1, market_count(ctx, limit) - reserve)
+    if len(times) >= allowed:
+        waits.append(times[len(times) - allowed] + window)
+    # Un compte qui ne vend pas peut tout utiliser pour ses mises, sauf sur un marché commun (un autre compte vend).
+    bids = limit.get("bids") if ctx.sells or ctx.shared else None
+    if new_bid and bids is not None and len(bid_times) >= bids:
+        waits.append(bid_times[len(bid_times) - bids] + window if bids else now + window)
+    return max(waits) if waits else None
+
+
+def market_history(ctx, window):
+    """Actions sur le marché de la fenêtre de safety.market_limit, (toutes, premières mises) : celles de ce compte et,
+    sur un marché commun (safety.shared_market), celles de vos autres comptes."""
+    now = time.time()
+    ctx.market_times = sorted(t for t in ctx.market_times if now - t < window)
+    ctx.bid_times = sorted(t for t in ctx.bid_times if now - t < window)
+    others = ctx.shared.actions(now - window) if ctx.shared else []
+    return sorted(ctx.market_times + [t for t, _ in others]), sorted(ctx.bid_times + [t for t, b in others if b])
+
+
+def market_action(ctx, new_bid=False):
+    """Une action sur le marché part (même refusée, elle compte peut-être pour le site) : safety.market_limit.
+    new_bid : première mise sur une enchère (safety.market_limit.bids)."""
+    now = time.time()
+    ctx.market_times.append(now)
+    if new_bid:
+        ctx.bid_times.append(now)
+    if ctx.shared:
+        ctx.shared.record([now], [now] if new_bid else [])
+
+
+def market_room(ctx, reserve=0):
+    """Nombre d'actions sur le marché possibles maintenant (safety.market_limit)."""
+    limit = ctx.cfg["safety"].get("market_limit")
+    if not limit:
+        return math.inf
+    times, _ = market_history(ctx, limit["minutes"] * 60)
+    return max(0, max(1, market_count(ctx, limit) - reserve) - len(times))
+
+
+def market_count(ctx, limit, now=None):
+    """Actions sur le marché permises par fenêtre : safety.market_limit.count, ou sell.peak.market_limit aux heures de
+    pointe pour un compte qui vend (des enchères de 10 min demandent 30 mises en vente par heure pour garder 5
+    places occupées)."""
+    peak = ctx.cfg["sell"].get("peak")
+    if ctx.sells and peak and peak.get("market_limit") and at_night(time.time() if now is None else now, peak):
+        return peak["market_limit"]
+    return limit["count"]
+
+
+def market_reserve(ctx):
+    """Places gardées pour les surenchères, si ce compte achète (ou un autre, sur un marché commun)."""
+    return BID_RESERVE if ctx.sniper and ctx.sniper.market or ctx.others_buy else 0
+
+
+def market_limit_text(ctx, new_bid=False):
+    limit = ctx.cfg["safety"]["market_limit"]
+    bids = f", dont {limit['bids']} nouvelles mises" if new_bid and limit.get("bids") is not None \
+        and (ctx.sells or ctx.shared) else ""
+    everyone = " pour vos comptes ensemble" if ctx.shared else ""
+    return (f"{market_count(ctx, limit)} actions sur le marché en {limit['minutes']:g} min au plus{everyone}{bids} "
+            "(safety.market_limit, contre la vérification anti-robot)")
 
 
 def antibot_strike(ctx, kind):
@@ -1995,11 +2301,20 @@ def antibot_strike(ctx, kind):
     """
     group = ANTIBOT_GROUPS[kind]
     entry = ctx.antibot.setdefault(group, {"strikes": 0})
-    entry["until"] = time.time() + ANTIBOT_PAUSES[min(entry["strikes"], len(ANTIBOT_PAUSES) - 1)]
-    entry["strikes"] += 1
+    # Pause commune : le fichier tient le compte des blocages de suite (remis à zéro par une action acceptée sur un
+    # autre compte) ; ceux vus par ce compte seul ne comptent que s'il n'a pas pu l'écrire.
+    local = entry["strikes"] if entry.get("local") else 0
+    shared = ctx.shared.strike(local) if group == MARKET_GROUP and ctx.shared else None
+    if shared:  # pause commune à vos comptes : le site les bloque ensemble
+        (entry["until"], entry["strikes"]), entry["local"] = shared, False
+    else:
+        entry["until"] = time.time() + ANTIBOT_PAUSES[min(entry["strikes"], len(ANTIBOT_PAUSES) - 1)]
+        entry["strikes"] += 1
+        entry["local"] = True
     ctx.summary["paused"][group] = entry["until"]
-    print(f"     Le site demande une vérification anti-robot : {group} en pause jusqu'à {clock_time(entry['until'])} "
-          "(le reste continue).")
+    everyone = " pour tous vos comptes" if shared else ""
+    print(f"     Le site demande une vérification anti-robot : {group} en pause jusqu'à {clock_time(entry['until'])}"
+          f"{everyone} (le reste continue).")
     print(f"     {ANTIBOT_HINT}")
     if ctx.notify:
         # Le blocage ne se lève souvent pas tout seul (vu le 16/10/2026 : encore là au matin, 7 h plus tard).
@@ -2065,6 +2380,8 @@ def plan_analyse(ctx, cards):
     # Étiquettes automatiques qui ne dépendent pas du prix (nom, rareté…) : posées aussi sur les cartes protégées,
     # sans lire leur prix (ex. « OL » sur un joueur déjà protégé par « lyon »).
     priceless = [r for r in cfg.get("auto_tags", []) if not {"min_value", "max_value"} & set(r.get("when", {}))]
+    price_tags, cleared = {norm(t) for t in old_price_tags(pt)}, 0
+    protecting = {norm(t) for t in cfg["protection"]["tags"]}
     for card in cards:
         reason = protection_reason(card, cfg["protection"])
         if reason and not pt["tag_protected"]:
@@ -2075,6 +2392,12 @@ def plan_analyse(ctx, cards):
             for tag in dict.fromkeys(r["tag"] for r in priceless if matches(card, None, r.get("when", {}))):
                 if norm(tag) not in have:
                     steps.append((card, "add_tag", tag, None))
+            # Une carte protégée ne garde pas d'étiquette de prix : filtrée par prix sur le site (pour un échange), elle
+            # n'apparaît plus. Retirées après la protection : un échec de celle-ci laisse la carte telle quelle.
+            # Celle d'une carte en échange n'est pas touchée (elle revient si l'échange est refusé).
+            stale = [] if card.in_trade else [t for t in card.tags if norm(t) in price_tags]
+            steps += [(card, "remove_tag", t, None) for t in stale]
+            cleared += bool(stale)
             continue
         targets.append(card)
     values = read_values(ctx.client, targets, cfg, ctx.cache)
@@ -2093,13 +2416,20 @@ def plan_analyse(ctx, cards):
         add, remove = tag_changes(card, value, cfg)
         if not add and not remove:
             summary["up_to_date"].add(card.copy_id)
-        steps += [(card, "remove_tag", t, value) for t in remove]
-        steps += [(card, "add_tag", t, value) for t in add]
+        adds = [(card, "add_tag", t, value) for t in add]
+        removes = [(card, "remove_tag", t, value) for t in remove]
+        if remove and any(norm(t) in protecting for t in add):
+            steps += adds + removes  # devient protégée : la protection d'abord, ses étiquettes de prix ensuite
+            cleared += 1
+        else:
+            steps += removes + adds
     order = [b["tag"] for b in pt["bands"]] + ["hors tranches", pt.get("unknown_tag") or "jamais vendue"]
     shown = ", ".join(f"{name} : {spread[name]}" for name in order if spread.get(name))
     print(f"  répartition par prix moyen : {shown or 'aucune carte'}")
     if summary["protect"] and not ctx.verbose:
         print(f"  {len(summary['protect'])} carte(s) protégée(s) laissée(s) sans étiquette de prix (--verbose pour la liste)")
+    if cleared:
+        print(f"  {cleared} carte(s) protégée(s) : étiquette(s) de prix retirée(s) (price_tags.tag_protected: false)")
     wanted = {norm(t): t for c, kind, t, v in steps if kind == "add_tag"}
     if wanted:
         missing = [name for key, name in wanted.items() if key not in ctx.client.known_tags()]
@@ -2261,13 +2591,39 @@ def follow_returned_copies(ctx):
             ctx.state.set_status(auction_id, "gone")
 
 
-def auction_minutes(value, sell):
+def auction_minutes(value, sell, now=None):
     """Durée de l'enchère : plus longue pour les cartes chères (sell.long_duration), qui trouvent rarement preneur en
-    10 minutes (vu le 15/10/2026 : 1 vendue sur 18 à 100 ou plus)."""
+    10 minutes (vu le 15/10/2026 : 1 vendue sur 18 à 100 ou plus) ; sinon celle des heures de pointe (sell.peak)."""
     long = sell.get("long_duration")
     if long and value is not None and value >= long["from_value"]:
         return long["minutes"]
+    peak = sell.get("peak")
+    if peak and at_night(time.time() if now is None else now, peak):  # même créneau horaire que sell.night
+        return peak["duration_minutes"]
     return sell["duration_minutes"]
+
+
+def sale_spacing(ctx, now=None):
+    """Écart (secondes) entre deux mises en vente, ou 0.
+
+    Des enchères courtes (10 min, aux heures de pointe : sell.peak) ne gardent pas les 5 places occupées avec
+    safety.market_limit (10 par heure) : lancées toutes d'un coup, les 10 partent en un quart d'heure et les places
+    restent vides le reste de l'heure. Étalées (une toutes les 6 min), il y en a toujours une en cours.
+    """
+    limit, sell = ctx.cfg["safety"].get("market_limit"), ctx.cfg["sell"]
+    peak = sell.get("peak")
+    if not limit or not (peak and at_night(time.time() if now is None else now, peak)):
+        return 0  # seulement aux heures de pointe
+    allowed = max(1, market_count(ctx, limit, now) - market_reserve(ctx))
+    if auction_minutes(None, sell, now) * allowed >= limit["minutes"] * sell["max_auctions"]:
+        return 0  # assez longues : les places restent pleines sans étaler
+    return limit["minutes"] * 60 / allowed
+
+
+def next_paced_sale(ctx):
+    """Moment de la prochaine mise en vente étalée (sale_spacing), ou None si elle peut partir maintenant."""
+    spacing, last = sale_spacing(ctx), max(ctx.market_times, default=0.0)
+    return last + spacing if spacing and last + spacing > time.time() else None
 
 
 def relist_price(previous, value, sell):
@@ -2282,19 +2638,34 @@ def relist_price(previous, value, sell):
     return max(price, relist["min_start_price"])
 
 
-def plan_sell(ctx, cards, tagged=None):
+def market_full(ctx, candidates):
+    """Limite d'actions sur le marché atteinte (safety.market_limit) : les ventes attendent, sans lire de prix."""
+    until = market_wait(ctx, market_reserve(ctx))
+    ctx.summary["market_full"] = True
+    ctx.summary["deferred"] += len(candidates)
+    print(f"  {len(candidates)} carte(s) à vendre, mais {market_limit_text(ctx)} : reprise vers {clock_time(until)}")
+    return []
+
+
+def plan_sell(ctx, cards, tagged=None, top_up=False):
     """Mises aux enchères : relances des invendus, puis cartes étiquetées à vendre, dans les places libres.
 
     tagged : voir filter_candidates. Le bilan des enchères précédentes n'est fait qu'une fois par passage.
+    top_up : place libérée pendant les défausses (top_up_sales) : sans bilan, ni sell.max_auctions du passage (les 5
+    places du site limitent déjà), ni liste des cartes en attente.
     Au hasard (sell.order: random), seuls les prix des cartes tirées sont lus : la vente commence tout de suite,
     même quand les prix gardés ont expiré et que toute la collection est à relire.
     """
     cfg, summary = ctx.cfg, ctx.summary
     sell = cfg["sell"]
     relist = sell["relist"]
-    if tagged != "during":
+    if tagged != "during" and not top_up:
         settle_sales(ctx)
         follow_returned_copies(ctx)
+    if not ctx.sells:
+        if tagged != "during":
+            print(f"  pas de mise en vente sur ce compte (sell.accounts : {', '.join(sell['accounts'])})")
+        return []
     # La nuit, presque personne n'achète : ni mise en vente ni relance, et aucune enchère ne doit s'y terminer.
     # Le bilan ci-dessus continue ; les invendus seront relancés au matin.
     night, now = sell.get("night"), time.time()
@@ -2318,15 +2689,27 @@ def plan_sell(ctx, cards, tagged=None):
     if not candidates:
         return []
     # sell.max_auctions vaut pour tout le passage, même quand « tout » vend en deux étapes.
-    quota = sell["max_auctions"] - summary["auction"]
+    quota = sell["max_auctions"] - (0 if top_up else summary["auction"])
     # Pas de place libre : inutile de lire des centaines de prix pour rien.
     slots = ctx.client.auction_slots() if quota > 0 else 0
     if slots is None:
+        summary["slots_unreadable"] = True  # pas d'autre essai pendant ce passage (top_up_sales)
         summary["no_slot"] += len(candidates)
         print(f"  {len(candidates)} carte(s) à vendre : ventes au prochain passage")
         return []
     room = min(slots, quota)
+    if room > 0 and market_room(ctx, market_reserve(ctx)) <= 0:
+        return market_full(ctx, candidates)
+    paced = next_paced_sale(ctx)
+    if room > 0 and paced:
+        summary["paced"] = True
+        summary["deferred"] += len(candidates)
+        print(f"  {len(candidates)} carte(s) à vendre : prochaine mise en vente vers {clock_time(paced)} (enchères de "
+              f"{auction_minutes(None, sell)} min : une toutes les {sale_spacing(ctx) / 60:.0f} min, pour qu'il y en "
+              "ait toujours une en cours)")
+        return []
     if room <= 0:
+        summary["slot_full"] = summary["slot_full"] or slots <= 0
         summary["no_slot"] += len(candidates)
         print(f"  {len(candidates)} carte(s) à vendre, mais aucune place d'enchère libre : rien à faire maintenant")
         return []
@@ -2407,19 +2790,47 @@ def plan_sell(ctx, cards, tagged=None):
 
     # Relu après la lecture des prix, qui peut durer : des enchères ont pu se terminer entre-temps.
     slots = ctx.client.auction_slots()
-    room = 0 if slots is None else max(0, min(slots, quota))  # illisibles : toutes attendent le passage suivant
+    free_market = market_room(ctx, market_reserve(ctx))
+    room = 0 if slots is None else max(0, min(slots, quota, free_market))
+    if sale_spacing(ctx):  # enchères courtes : une seule maintenant, la suivante dans quelques minutes
+        room = min(room, 1)
+        summary["paced"] = summary["paced"] or len(offers) > 1
+    need = min(len(offers), quota)
+    summary["slot_full"] = summary["slot_full"] or (slots is not None and slots < need)
+    summary["market_full"] = summary["market_full"] or free_market < need
     free = "?" if slots is None else slots
     print(f"  {len(offers) + len(unread)} carte(s) à vendre dont {relaunches} relance(s), {free} place(s) d'enchère "
           f"libre(s) → {min(room, len(offers))} vente(s)")
     chosen = offers[:room]
     waiting = [label(card, value) for card, value, _ in offers[room:]] + [f"{c.name} [{c.rarity}]" for c in unread]
     summary["no_slot"] += len(waiting)
-    limit = len(waiting) if ctx.verbose else cfg.get("display", {}).get("waiting_shown", 5)
+    limit = len(waiting) if ctx.verbose else 0 if top_up else cfg.get("display", {}).get("waiting_shown", 5)
     for shown in waiting[:limit]:
         print(f"  en attente d'une place : {shown}")
-    if len(waiting) > limit:
+    if len(waiting) > limit and not top_up:
         print(f"  … et {len(waiting) - limit} autre(s) en attente (--verbose pour tout voir)")
     return [(card, "auction", offer, value) for card, value, offer in chosen]
+
+
+# Pendant les défausses (environ 7 s par prix relu, 25 min pour 200), une place d'enchère libérée est remplie au plus
+# tard ce nombre de secondes après : avec des enchères de 10 min, les places se videraient sinon.
+TOP_UP_SECONDS = 60
+
+
+def top_up_sales(ctx, runner, cards):
+    """Une place d'enchère s'est libérée pendant une longue étape : une carte est remise en vente aussitôt."""
+    if not (ctx.execute and ctx.sells) or time.time() < ctx.next_top_up or ctx.summary["slots_unreadable"]:
+        return
+    ctx.next_top_up = time.time() + TOP_UP_SECONDS
+    night = ctx.cfg["sell"].get("night")
+    if at_night(time.time(), night) or antibot_until(ctx, "auction") or next_paced_sale(ctx) \
+            or market_room(ctx, market_reserve(ctx)) <= 0 or not ctx.client.auction_slots():
+        return
+    left = [c for c in cards if c.copy_id not in runner.consumed and c.copy_id not in runner.failed]
+    print("  -- place d'enchère libre pendant les défausses :")
+    steps = plan_sell(ctx, left, top_up=True)
+    if steps:
+        runner.run(steps)
 
 
 def plan_discard(ctx, cards, tagged=None):
@@ -2433,6 +2844,10 @@ def plan_discard(ctx, cards, tagged=None):
     discard.max_per_run sont lues, la suite attend le passage suivant. tagged : voir filter_candidates.
     """
     cfg, summary = ctx.cfg, ctx.summary
+    if not ctx.discards:
+        if tagged != "during":
+            print(f"  pas de défausse sur ce compte (discard.accounts : {', '.join(cfg['discard']['accounts'])})")
+        return
     until = antibot_until(ctx, "discard")
     if until:
         print(f"  défausses en pause jusqu'à {clock_time(until)} : le site a demandé une vérification anti-robot")
@@ -2557,6 +2972,10 @@ class Runner:
             if antibot_until(self.ctx, kind):
                 self.summary["deferred"] += 1
                 continue
+            if kind == "auction" and market_wait(self.ctx, market_reserve(self.ctx)):
+                self.summary["deferred"] += 1  # une mise du marché vient de prendre la place (achats)
+                self.summary["market_full"] = True
+                continue
             print(f"  -> {self._describe(kind, arg):<26} {label(card, value)}")
             if self.execute:
                 try:
@@ -2588,7 +3007,7 @@ class Runner:
             self.actions += 1
             if self.execute:
                 self.errors_in_a_row = 0
-                self.ctx.antibot.pop(ANTIBOT_GROUPS[kind], None)  # acceptée à nouveau : la prochaine pause repart à 1 h
+                antibot_cleared(self.ctx, kind)  # acceptée à nouveau : la prochaine pause repart à 1 h
                 print(f"     {result}")
                 # Des mises en vente enchaînées en quelques secondes déclenchent la vérification anti-robot du site.
                 safety = self.cfg["safety"]
@@ -2600,7 +3019,8 @@ class Runner:
         if kind == "auction":
             return f"ENCHÈRE départ={arg.price}" + (f" (relance {arg.attempt})" if arg.attempt > 1 else "") \
                 + (f" {arg.duration} min" if arg.duration and arg.duration >= 30 else "")
-        return {"add_tag": f"+ étiquette « {arg} »", "remove_tag": f"- étiquette « {arg} »", "discard": "DÉFAUSSE"}[kind]
+        # « retire » plutôt que « - » : « - étiquette « +10 » » se lisait comme une étiquette posée.
+        return {"add_tag": f"pose « {arg} »", "remove_tag": f"retire « {arg} »", "discard": "DÉFAUSSE"}[kind]
 
     def _log(self, card, kind, arg, value, result, balance=None, auction_id=""):
         action = {"add_tag": "etiquette+", "remove_tag": "etiquette-", "discard": "defausse",
@@ -2627,6 +3047,7 @@ class Runner:
             self._log(card, kind, arg, value, "OK", balance=balance)
             return f"OK, solde : {'?' if balance is None else balance}"
         duration = arg.duration or self.cfg["sell"]["duration_minutes"]
+        market_action(self.ctx)  # même refusée, elle compte peut-être pour le site
         response = as_dict(self.client.create_auction(card, arg.price, duration))
         auction_id = response.get("auction_id")
         # D'abord clore les anciens invendus de cet exemplaire : le site pourrait redonner le même identifiant.
@@ -2647,8 +3068,8 @@ class Runner:
             self.consumed.add(card.copy_id)
 
 
-def open_packs(ctx):
-    """Ouvre les boosters disponibles (au plus packs.max_per_run), espacés de packs.delay_seconds."""
+def open_packs(ctx, most=None):
+    """Ouvre les boosters disponibles (au plus packs.max_per_run, ou most), espacés de packs.delay_seconds."""
     client, packs, summary = ctx.client, ctx.cfg["packs"], ctx.summary
     until = antibot_until(ctx, "pack")
     if until:
@@ -2661,7 +3082,7 @@ def open_packs(ctx):
             raise
         print(f"  ÉCHEC     boosters : {e}")
         return
-    count = min(left, packs["max_per_run"])
+    count = min(left, packs["max_per_run"], packs["max_per_run"] if most is None else most)
     print(f"  {left} booster(s) disponible(s) → {count} ouverture(s)")
     if not ctx.execute:
         summary["pack"] += count
@@ -2670,6 +3091,10 @@ def open_packs(ctx):
         if n:
             delay = packs["delay_seconds"]
             client.pause(random.uniform(delay * 0.8, delay * 1.5))  # un rythme trop régulier ferait robot
+        if market_wait(ctx, market_reserve(ctx)):
+            print(f"  boosters : {market_limit_text(ctx)}, la suite au prochain passage")
+            return
+        market_action(ctx)
         try:
             data = as_dict(client.open_pack())
         except ApiError as e:
@@ -2685,9 +3110,22 @@ def open_packs(ctx):
             print(f"  ÉCHEC     booster : {e}")
             if e.antibot:
                 antibot_strike(ctx, "pack")
+                ctx.pack_events.append((time.time(), False))
+                blocks, last = packs_blocked(ctx)
+                if packs.get("max_blocks") and blocks >= packs["max_blocks"]:
+                    retry = day_time(last + packs["retry_hours"] * 3600)
+                    print(f"  {blocks} vérifications anti-robot de suite sur les boosters : « tout » les arrête, un seul "
+                          f"sera essayé le {retry} pour voir si c'est encore bloqué (packs.max_blocks)")
+                    if ctx.notify and blocks == packs["max_blocks"]:  # pas à chaque essai raté pendant l'arrêt
+                        ctx.notify(f"🛑 Boosters arrêtés : le site a demandé {blocks} fois de suite la vérification "
+                                   f"anti-robot en les ouvrant. Un seul sera essayé le {retry}, pour voir si c'est "
+                                   "encore bloqué (packs.retry_hours).")
             return
         summary["pack"] += 1
-        ctx.antibot.pop(ANTIBOT_GROUPS["pack"], None)  # accepté à nouveau : la prochaine pause repart à 1 h
+        if most == 1 and n == 0:
+            print("  le site accepte à nouveau les boosters : « tout » reprend son rythme normal")
+        ctx.pack_events.append((time.time(), True))
+        antibot_cleared(ctx, "pack")  # accepté à nouveau : la prochaine pause repart à 1 h
         cards = [c for c in data.get("cards") or [] if isinstance(c, dict)]
         shown = ", ".join(f"{c.get('wikipedia_title', '?')} [{c.get('rarity', '?')}]" for c in cards)
         print(f"  booster {n + 1}/{count} : {shown or 'aucune carte reçue'}")
@@ -2696,6 +3134,226 @@ def open_packs(ctx):
                               str(c.get("user_card_id") or ""), str(c.get("id") or ""))
         if _is_int(data.get("packs_remaining")) and data["packs_remaining"] <= 0:
             break
+
+
+def day_time(timestamp):
+    return time.strftime("%d/%m à %H:%M", time.localtime(timestamp))
+
+
+def packs_blocked(ctx):
+    """(nombre, moment du dernier) des blocages de suite à l'ouverture des boosters : vérifications anti-robot depuis
+    la dernière ouverture réussie, qui remet le compte à zéro."""
+    blocks, last = 0, 0.0
+    for at, opened in sorted(ctx.pack_events):
+        blocks, last = (0, last) if opened else (blocks + 1, at)
+    return blocks, last
+
+
+def recent_pack_events(journal):
+    """(ouvertures et blocages des boosters de ce compte dans le journal, moment du dernier essai) : packs.max_blocks
+    et packs.every_minutes en tiennent compte même après un redémarrage du script."""
+    events, last = [], 0.0
+    try:
+        with open(journal.path, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f, delimiter=journal.delimiter):
+                if row.get("action") != "booster" or row.get("compte") != journal.account:
+                    continue
+                try:
+                    at = time.mktime(time.strptime(row["date"], "%Y-%m-%d %H:%M:%S"))
+                except (TypeError, ValueError):
+                    continue
+                last = max(last, at)
+                result = str(row.get("resultat") or "")
+                if result == "OK" or "anti-robot" in result:
+                    events.append((at, result == "OK"))  # carte reçue, ou vérification anti-robot
+    except OSError:
+        pass
+    return events, last
+
+
+def packs_in_tout(ctx):
+    """« tout » avec packs.in_tout : ouvre les boosters, au plus une fois toutes les packs.every_minutes.
+
+    Après packs.max_blocks vérifications anti-robot de suite à leur ouverture, ils sont arrêtés : un seul booster est
+    essayé toutes les packs.retry_hours heures, pour voir si c'est encore bloqué. Ouvert, tout reprend normalement.
+    """
+    packs = ctx.cfg["packs"]
+    blocks, last = packs_blocked(ctx)
+    if packs.get("max_blocks") and blocks >= packs["max_blocks"]:
+        retry = last + packs["retry_hours"] * 3600
+        if time.time() < retry:
+            print(f"  arrêtés après {blocks} vérifications anti-robot de suite (packs.max_blocks) : un seul sera essayé "
+                  f"le {day_time(retry)}, pour voir si c'est encore bloqué. « {cmd('boosters')} » les ouvre quand même.")
+            return
+        print(f"  arrêtés après {blocks} vérifications anti-robot de suite : un seul essayé, pour voir si c'est encore "
+              "bloqué")
+        ctx.packs_tried_at = time.time()
+        open_packs(ctx, most=1)
+        return
+    every = packs.get("every_minutes")
+    if every and ctx.packs_tried_at and time.time() < ctx.packs_tried_at + every * 60:
+        print(f"  prochain essai vers {clock_time(ctx.packs_tried_at + every * 60)} (packs.every_minutes)")
+        return
+    ctx.packs_tried_at = time.time()
+    open_packs(ctx)
+
+
+def send_tags(cfg):
+    """Étiquettes des cartes à envoyer : send.tags, sinon celles des cartes à vendre (sell.tags)."""
+    return cfg["send"]["tags"] if cfg["send"].get("tags") is not None else cfg["sell"]["tags"]
+
+
+def send_cards(ctx, cards, tagged=None):
+    """Envoie au compte send.to les cartes étiquetées send_tags, par échanges de send.batch_size cartes contre rien,
+    au plus send.max_per_run par passage. Elles n'y arrivent qu'une fois l'échange accepté par l'autre compte.
+
+    Une carte protégée n'est jamais envoyée : ses étiquettes (garder…) ne la suivent pas, l'autre compte pourrait la
+    vendre ou la défausser. Le site a refusé un échange de 100 cartes (erreur 500, vu le 16/10/2026) : après un refus,
+    les cartes sont proposées à nouveau par lots deux fois plus petits. tagged : voir filter_candidates.
+    Retourne les exemplaires envoyés (ceux qui le seraient, en simulation).
+    """
+    client, send, summary = ctx.client, ctx.cfg["send"], ctx.summary
+    name, recipient_id = ctx.recipient
+    sent = set()
+    until = antibot_until(ctx, "trade")
+    if until:
+        print(f"  envois en pause jusqu'à {clock_time(until)} : le site a demandé une vérification anti-robot")
+        return sent
+    tags = send_tags(ctx.cfg)
+    waiting = [c for c in cards if c.in_trade and c.has_any_tag(tags)]
+    if waiting and tagged != "during":
+        print(f"  {len(waiting)} carte(s) déjà dans un échange en attente (à accepter sur le site par l'autre compte)")
+    on_sale = ctx.on_sale | {e.get("copy_id") for _, e in ctx.state.with_status("open")}
+    candidates = []
+    for card in filter_candidates(ctx, [c for c in cards if not c.in_trade], lambda c: tags,
+                                  ctx.cfg["discard"]["tags"], "à envoyer", tagged=tagged):
+        if card.copy_id in on_sale:
+            summary["skip"].add(card.copy_id)
+            print(f"  ignorée   {card.name} [{card.rarity}] : en vente aux enchères")
+            continue
+        known = ctx.cache.get(card)
+        protecting = auto_protection(card, None if known is PriceCache.MISSING else known, ctx.cfg)
+        if protecting:
+            summary["protect"].add(card.copy_id)
+            print(f"  PROTÉGÉE  {card.name} [{card.rarity}] : « analyser » va lui poser « {protecting} » (auto_tags)")
+            continue
+        candidates.append(card)
+    limit = max(0, send["max_per_run"] - summary["sent"])  # pour tout le passage, même en deux étapes (« tout »)
+    queue, rest = candidates[:limit], candidates[limit:]
+    if not candidates:
+        print("  rien à faire")
+        return sent
+    if not queue:
+        summary["deferred"] += len(rest)
+        print(f"  {len(rest)} carte(s) à envoyer : {send['max_per_run']} au plus par passage (send.max_per_run), la "
+              "suite au prochain passage")
+        return sent
+    try:
+        friends = client.friends()
+    except ApiError as e:
+        if e.fatal:
+            raise
+        friends = None
+        print(f"  liste d'amis illisible ({e}) : envoi tenté quand même")
+    if friends is not None and recipient_id not in friends:
+        summary["error"] += 1
+        summary["deferred"] += len(candidates)
+        print(f"  ÉCHEC     {name} n'est pas l'ami de ce compte sur le site : les échanges ne se font qu'entre amis. "
+              f"Envoyez-lui une demande d'ami, acceptez-la avec {name}, puis relancez.")
+        return sent
+    print(f"  {len(candidates)} carte(s) à envoyer à {name}, {len(queue)} au plus ce passage, par échanges de "
+          f"{send['batch_size']} carte(s)")
+
+    def done(batch, trade_id):
+        for card in batch:
+            card.in_trade = True  # les étapes suivantes de « tout » n'y touchent plus
+            sent.add(card.copy_id)
+            if ctx.execute:
+                ctx.journal.card("envoi", card, result=f"OK, échange {trade_id or '?'} vers {name}")
+        summary["trade"] += 1
+        summary["sent"] += len(batch)
+
+    size, errors_in_a_row, first = send["batch_size"], 0, True
+    while queue:
+        if antibot_until(ctx, "trade"):  # vérification anti-robot demandée pendant ce passage
+            break
+        if ctx.execute and client.session_lost:
+            raise ApiError(client.session_lost, fatal=True)
+        if ctx.execute and not first:
+            delay = send["delay_seconds"]
+            client.pause(random.uniform(delay * 0.8, delay * 1.5))  # un rythme trop régulier ferait robot
+        first = False
+        batch, queue = queue[:size], queue[size:]
+        print(f"  -> ÉCHANGE vers {name} : {len(batch)} carte(s)")
+        print(textwrap.fill(", ".join(f"{c.name} [{c.rarity}]" for c in batch), width=110,
+                            initial_indent=" " * 7, subsequent_indent=" " * 7))
+        if not ctx.execute:
+            done(batch, None)
+            continue
+        try:
+            data = as_dict(client.create_trade(recipient_id, batch))
+        except KeyboardInterrupt:
+            print(f"     Interrompu pendant l'envoi. {MAYBE_DONE}")
+            ctx.journal.write("envoi", result=f"INTERROMPU ({len(batch)} carte(s) vers {name}) : {MAYBE_DONE}")
+            raise
+        except ApiError as e:
+            ctx.journal.write("envoi", result=f"ECHEC ({len(batch)} carte(s) vers {name}) : {e}")
+            if e.fatal and not e.network:
+                raise
+            print(f"     ÉCHEC : {e}")
+            if e.antibot:
+                antibot_strike(ctx, "trade")
+                queue = batch + queue
+                break
+            arrived = set()
+            if e.network or e.status is not None and e.status >= 500 and e.status not in NOT_PROCESSED:
+                # Le site a peut-être créé l'échange avant de planter : on regarde avant de proposer à nouveau.
+                try:
+                    arrived = client.trade_copy_ids() & {c.copy_id for c in batch}
+                except ApiError as check:
+                    if check.fatal:
+                        raise
+                    summary["error"] += 1
+                    summary["deferred"] += len(batch)
+                    print(f"     échanges en attente illisibles ({check}) : ces {len(batch)} carte(s) attendent le "
+                          "prochain passage (pour ne pas les proposer deux fois)")
+                    continue
+            if arrived:
+                print(f"     {len(arrived)} carte(s) quand même dans un échange en attente : envoyée(s)")
+                done([c for c in batch if c.copy_id in arrived], None)
+            left = [c for c in batch if c.copy_id not in arrived]
+            if not left:
+                errors_in_a_row = 0
+                continue
+            summary["error"] += 1
+            errors_in_a_row += 1
+            if errors_in_a_row >= ctx.cfg["safety"]["max_consecutive_errors"]:
+                summary["deferred"] += len(left) + len(queue)
+                print(f"  {errors_in_a_row} échanges refusés d'affilée : {len(left) + len(queue)} carte(s) attendent "
+                      "le prochain passage")
+                queue = []
+                break
+            if len(left) > 1:
+                size = max(1, len(left) // 2)
+                queue = left + queue
+                print(f"     nouvel essai par échanges de {size} carte(s)")
+            else:
+                summary["deferred"] += 1  # proposée à nouveau au prochain passage
+            client.pause(ctx.cfg["safety"]["delay_seconds"])
+            continue
+        errors_in_a_row = 0
+        antibot_cleared(ctx, "trade")  # accepté à nouveau : la prochaine pause repart à 1 h
+        trade_id = data.get("id") or data.get("trade_id") or as_dict(data.get("trade")).get("id")
+        done(batch, trade_id)
+        print("     OK" + (f", échange {trade_id}" if trade_id else ""))
+    summary["deferred"] += len(queue) + len(rest)
+    if rest:
+        print(f"  {len(rest)} autre(s) carte(s) à envoyer : {send['max_per_run']} au plus par passage "
+              "(send.max_per_run), la suite au prochain passage")
+    if sent and ctx.execute:
+        print(f"  À faire : acceptez le(s) échange(s) sur wiki-masters.com avec le compte {name} (page Échanges), "
+              "les cartes n'y arrivent qu'à ce moment.")
+    return sent
 
 
 @dataclass
@@ -2738,9 +3396,6 @@ class Sniper:
         self.spares = {}
         self.name_turn = 0  # prochain nom de buy.names à chercher
         self.last_sight = 0.0  # buy.bid_on_sight : moment prévu de la dernière première mise
-        # Mises envoyées (buy.max_bids), y compris avant un redémarrage du script : relues dans le journal.
-        self.bid_times = recent_bids(ctx.journal, (self.buy.get("max_bids") or {}).get("minutes", 0) * 60) \
-            if ctx.execute else []
         self.results = {}  # auction_id -> moment de lire le résultat d'une enchère où le script a misé
         self.next_scan = 0.0
         self.busy = False  # lecture du marché ou mise en cours : une pause demandée entre-temps est une simple pause
@@ -3082,32 +3737,19 @@ class Sniper:
             self._finish(target)
         else:
             first = target.bid is None
-            free_at = self._bid_budget(first)
+            free_at = market_wait(self.ctx, BID_RESERVE if first else 0, new_bid=first)
             if free_at is not None:
                 # Limite de mises atteinte : une première mise attend qu'une place se libère (au plus tard
                 # buy.snipe_seconds avant la fin) ; sinon l'enchère est laissée.
                 if first and stage == 0 and free_at < end - self.buy["snipe_seconds"]:
                     target.stage, target.sight_at = 0, free_at
                     return
-                limit = self.buy["max_bids"]
-                self.say(f"laissée   {label(target.card, target.value)} : {limit['count']} mises en "
-                         f"{limit['minutes']:g} min au plus (buy.max_bids, contre la vérification anti-robot)")
+                self.say(f"laissée   {label(target.card, target.value)} : {market_limit_text(self.ctx, first)}")
                 self._finish(target)
                 return
             outbid = f"dépassé à {current}, " if not first else ""
             self._bid(target, need, end - now, outbid)
 
-    def _bid_budget(self, first):
-        """None si une mise peut partir (buy.max_bids), sinon le moment où une place se libère."""
-        limit = self.buy.get("max_bids")
-        if not limit:
-            return None
-        window, now = limit["minutes"] * 60, time.time()
-        self.bid_times = sorted(t for t in self.bid_times if now - t < window)
-        allowed = limit["count"] - (BID_RESERVE if first else 0)
-        if len(self.bid_times) < allowed:
-            return None
-        return self.bid_times[len(self.bid_times) - allowed] + window
 
     def _bid(self, target, amount, left, note=""):
         ctx = self.ctx
@@ -3119,7 +3761,8 @@ class Sniper:
             return
         for attempt in range(TOO_LOW_RETRIES + 1):
             try:
-                self.bid_times.append(time.time())  # même refusée, elle compte peut-être pour le site
+                # Même refusée, elle compte peut-être pour le site ; première mise sur cette enchère : market_limit.bids.
+                market_action(self.ctx, new_bid=target.bid is None and attempt == 0)
                 response = as_dict(self.client.bid(target.auction_id, amount))
                 break
             except ApiError as e:
@@ -3151,7 +3794,7 @@ class Sniper:
         balance = response.get("bidder_balance")
         self._log(target, amount, "OK", balance)
         ctx.summary["bid"] += 1
-        ctx.antibot.pop(ANTIBOT_GROUPS["bid"], None)
+        antibot_cleared(ctx, "bid")
         self.say(f"   OK, solde : {'?' if balance is None else balance}")
 
     def _log(self, target, amount, result, balance=None):
@@ -3250,24 +3893,31 @@ def bought_tags(ctx, entry):
     return [t for t in entry.get("tags") or [ctx.cfg["buy"]["tag"]] if t]
 
 
-def recent_bids(journal, seconds):
-    """Moments des mises de ce compte dans le journal, ces dernières secondes (buy.max_bids)."""
+def recent_market_actions(journal, seconds):
+    """Moments des actions de ce compte sur le marché (mises, mises en vente, boosters) dans le journal, ces dernières
+    secondes, et à part celles des premières mises sur une enchère : safety.market_limit en tient compte même après
+    un redémarrage du script."""
     if seconds <= 0:
-        return []
-    since, found = time.time() - seconds, []
+        return [], []
+    since, actions, packs, bids = time.time() - seconds, [], set(), {}
     try:
         with open(journal.path, encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f, delimiter=journal.delimiter):
-                if row.get("action") == "mise" and row.get("compte") == journal.account:
-                    try:
-                        at = time.mktime(time.strptime(row["date"], "%Y-%m-%d %H:%M:%S"))
-                    except (TypeError, ValueError):
-                        continue
-                    if at >= since:
-                        found.append(at)
+                action = row.get("action")
+                if action not in ("mise", "enchere", "relance", "booster") or row.get("compte") != journal.account:
+                    continue
+                try:
+                    at = time.mktime(time.strptime(row["date"], "%Y-%m-%d %H:%M:%S"))
+                except (TypeError, ValueError):
+                    continue
+                if at >= since:
+                    # Un booster écrit une ligne par carte, à la même seconde : compté une fois.
+                    (packs.add if action == "booster" else actions.append)(at)
+                    if action == "mise":
+                        bids.setdefault(row.get("enchere_id"), at)  # première mise sur chaque enchère
     except OSError:
         pass
-    return found
+    return sorted(actions + list(packs)), sorted(bids.values())
 
 
 def plan_bought(ctx, cards, all_cards):
@@ -3314,11 +3964,27 @@ TOUT_PHASES = [
 ]
 
 
+def tout_phases(ctx):
+    """Étapes de « tout ». Avec send.in_tout, sur le compte qui envoie : les cartes à envoyer partent avant les ventes
+    (c'est l'autre compte qui les vend), celles étiquetées pendant l'analyse juste après elle."""
+    if not ctx.recipient:
+        return TOUT_PHASES
+    title = f"Envoi de cartes à {ctx.recipient[0]}"
+    before = (title, lambda ctx, cards: send_cards(ctx, cards, tagged="before"))
+    during = (f"{title} (nouvelles étiquettes)", lambda ctx, cards: send_cards(ctx, cards, tagged="during"))
+    return [before] + TOUT_PHASES[:3] + [during] + TOUT_PHASES[3:]
+
+
 def run_command(ctx, command):
     ctx.run_started = time.time()
-    if command == "boosters" or (command == "tout" and ctx.cfg["packs"]["in_tout"]):
+    if command == "boosters" and not ctx.opens_packs:
+        print(f"\n== Boosters ==\n  pas de booster sur ce compte (packs.accounts : {', '.join(ctx.cfg['packs']['accounts'])})")
+    elif command == "boosters":
         print("\n== Boosters ==")
-        open_packs(ctx)
+        open_packs(ctx)  # demandé : même si « tout » les a arrêtés (packs.max_blocks)
+    elif command == "tout" and ctx.cfg["packs"]["in_tout"] and ctx.opens_packs:
+        print("\n== Boosters ==")
+        packs_in_tout(ctx)
     if command == "acheter":
         print("\n== Achats aux enchères ==")
         ctx.sniper.next_scan = 0  # relecture du marché tout de suite
@@ -3376,15 +4042,21 @@ def run_command(ctx, command):
         "analyser": [("Analyse des prix et étiquettes", plan_analyse)],
         "vendre": [("Ventes aux enchères", plan_sell)],
         "defausser": [("Défausses", plan_discard)],
-        "tout": TOUT_PHASES,
+        "envoyer": [(f"Envoi de cartes à {ctx.recipient[0]}", send_cards)] if ctx.recipient else [],
+        "tout": tout_phases(ctx),
     }[command]
     try:
         for n, (title, plan) in enumerate(phases):
             print(f"\n== {title} ==")
             batches = plan(ctx, cards)
-            if isinstance(batches, list):  # sinon : générateur de lots (défausses, prix relus au fur et à mesure)
+            if isinstance(batches, set):  # envois : faits par l'étape elle-même, ces exemplaires sont partis
+                runner.consumed |= batches
+                cards = [c for c in cards if c.copy_id not in runner.consumed]
+                continue
+            # Une liste d'étapes, ou un générateur de lots (défausses, prix relus au fur et à mesure).
+            acted, long_step = False, not isinstance(batches, list)
+            if not long_step:
                 batches = [batches]
-            acted = False
             for steps in batches:
                 acted = acted or bool(steps)
                 if steps and not runner.run(steps):
@@ -3392,6 +4064,8 @@ def run_command(ctx, command):
                     if skipped:
                         print(f"  Étape(s) non lancée(s) pour cette raison : {', '.join(skipped)}.")
                     return
+                if long_step and command == "tout":  # défausses par lots : places d'enchère libérées remplies
+                    top_up_sales(ctx, runner, cards)
             if not acted:
                 print("  rien à faire")
             cards = [c for c in cards if c.copy_id not in runner.consumed and c.copy_id not in runner.failed]
@@ -3496,6 +4170,30 @@ def buying_accounts(cfg, cfg_file):
         sys.exit(f"buy.accounts : compte(s) inconnu(s) {', '.join(unknown)} (comptes enregistrés : "
                  f"{', '.join(accounts) or 'aucun'}). Corrigez {PERSO_FILE}.")
     return [folded[a.casefold()] for a in wanted]
+
+
+def send_recipient(cfg, cfg_file, account, required):
+    """(nom, id sur le site) du compte qui reçoit les envois (send.to), ou None si c'est ce compte-ci.
+
+    Seulement un de vos comptes enregistrés : une faute de frappe ne doit jamais offrir vos cartes à un autre joueur.
+    required : commande « envoyer » ; sinon « tout » avec send.in_tout, où le compte qui reçoit n'envoie rien (le même
+    perso.yaml sert aux deux comptes).
+    """
+    to = cfg["send"].get("to")
+    if not to:
+        sys.exit(f"À quel compte envoyer les cartes ? Précisez-le, ex. « {cmd('envoyer --compte ' + account)} --vers "
+                 f"AUTRECOMPTE », ou send.to dans {PERSO_FILE}.")
+    found = next(((name, uid) for uid, name in account_user_ids(cfg_file).items() if name.casefold() == to.casefold()),
+                 None)
+    if not found:
+        sys.exit(f"send.to : « {to} » n'est pas un de vos comptes enregistrés (comptes : "
+                 f"{', '.join(known_accounts(cfg_file)) or 'aucun'}) : le script n'envoie de cartes qu'à vos propres "
+                 f"comptes. Ajoutez-le d'abord avec « {cmd('login')} ».")
+    if found[0].casefold() == account.casefold():
+        if required:
+            sys.exit(f"Le compte {account} ne peut pas s'envoyer ses cartes : choisissez celui qui envoie avec --compte.")
+        return None  # c'est le compte qui reçoit : il vend, il n'envoie rien
+    return found
 
 
 def cmd_login(cfg, cfg_file):
@@ -3638,6 +4336,9 @@ def daily_report(journal, day):
     ]
     if count("mise") or count("achat"):
         lines.append(f"Achats : {count('achat')} carte(s) pour {total('achat'):g} wikibidous, {count('perdue')} perdue(s)")
+    sent = sum(1 for r in rows if r.get("action") == "envoi" and str(r.get("resultat", "")).startswith("OK"))
+    if sent:
+        lines.append(f"Envois : {sent} carte(s) à l'autre compte")
     blocked = sum(1 for r in rows if "anti-robot" in str(r.get("resultat", "")))
     if blocked:
         lines.append(f"Vérifications anti-robot : {blocked}")
@@ -3701,10 +4402,20 @@ def main():
     parser.add_argument("--fresh", action="store_true",
                         help="relire tous les prix sur le site au lieu du cache (pour actualiser les étiquettes)")
     parser.add_argument("--verbose", action="store_true", help="tout afficher (cartes protégées, en attente…)")
+    parser.add_argument("--vers", metavar="COMPTE", help="envoyer : compte qui reçoit les cartes (remplace send.to)")
+    parser.add_argument("--etiquette", action="append", metavar="ÉTIQUETTE",
+                        help="envoyer : les cartes de cette étiquette (option répétable ; remplace send.tags)")
     parser.add_argument("--config", default="config.yaml", help="fichier de règles (par défaut config.yaml)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if (args.vers or args.etiquette) and args.command != "envoyer":
+        parser.error("--vers et --etiquette ne servent qu'avec la commande « envoyer »")
+    if isinstance(cfg.get("send"), dict):
+        if args.vers:
+            cfg["send"]["to"] = args.vers
+        if args.etiquette:
+            cfg["send"]["tags"] = args.etiquette
     check_config(cfg)
     if args.command == "login":
         try:
@@ -3735,6 +4446,8 @@ def main():
         state=SalesState(folder / "ventes.json", set_aside=args.execute),
         purchases=PurchaseState(folder / "achats.json", set_aside=args.execute),
     )
+    if args.command == "envoyer" or (args.command == "tout" and cfg["send"]["in_tout"]):
+        ctx.recipient = send_recipient(cfg, args.config, folder.name, required=args.command == "envoyer")
     keywords = cfg["buy"]["keywords"] + cfg["buy"]["names"]
     if args.command == "acheter" and not keywords:
         sys.exit(f"buy.keywords est vide : rien à chercher sur le marché. Ajoutez vos mots-clés dans {PERSO_FILE}, "
@@ -3761,6 +4474,33 @@ def main():
         lock.acquire()
     keep_awake()
 
+    known = {a.casefold() for a in known_accounts(args.config)}
+    for section_name in ("sell", "discard", "packs"):
+        allowed = cfg[section_name].get("accounts")
+        if allowed is None:
+            continue
+        unknown = [a for a in allowed if a.casefold() not in known]
+        if unknown:
+            sys.exit(f"{section_name}.accounts : compte(s) inconnu(s) {', '.join(unknown)} (comptes enregistrés : "
+                     f"{', '.join(known_accounts(args.config))}). Corrigez {PERSO_FILE}.")
+        setattr(ctx, {"sell": "sells", "discard": "discards", "packs": "opens_packs"}[section_name],
+                folder.name.casefold() in {a.casefold() for a in allowed})
+    if cfg["safety"]["shared_market"] and len(known_accounts(args.config)) > 1:
+        ctx.shared = SharedMarket(config_path(args.config, ACCOUNTS_DIR) / MARKET_FILE, folder.name)
+        ctx.others_buy = any(b.casefold() != folder.name.casefold() for b in buyers)
+    limit = cfg["safety"].get("market_limit")
+    if args.execute and limit:  # actions déjà faites avant ce lancement (redémarrage du script)
+        ctx.market_times, ctx.bid_times = recent_market_actions(ctx.journal, limit["minutes"] * 60)
+        if ctx.shared:
+            ctx.shared.record(ctx.market_times, ctx.bid_times, replace=True)
+    if args.execute and ctx.shared and ctx.shared.pause_until():
+        # Relancer le script lève la pause, comme pour un seul compte (après la vérification faite à la main sur le
+        # site) ; sans elle, le blocage suivant durera plus longtemps.
+        print(f"Pause anti-robot commune levée par ce lancement (jusqu'à {clock_time(ctx.shared.pause_until())}) : si "
+              "le site la demande encore, passez la vérification à la main.")
+        ctx.shared.clear(keep_strikes=True)
+    if args.execute:  # boosters ouverts ou bloqués avant ce lancement (packs.max_blocks, packs.every_minutes)
+        ctx.pack_events, ctx.packs_tried_at = recent_pack_events(ctx.journal)
     alerts = telegram and (args.execute or telegram["notify_on_dry_run"])
     if alerts:
         ctx.notify = lambda text: send_telegram(telegram, telegram_alert(client.username, text))
@@ -3831,11 +4571,12 @@ def main():
                     if text:
                         title = f"📊 Bilan du {time.strftime('%d/%m', local)}"
                         send_telegram(telegram, telegram_alert(client.username, f"{title}\n{text}"))
-                # Cartes en attente d'une place : le passage suivant a lieu dès qu'une enchère se termine.
-                waiting = ctx.summary["no_slot"] and not antibot_until(ctx, "auction")
+                # Cartes en attente d'une place : le passage suivant a lieu dès qu'une enchère se termine (et que
+                # safety.market_limit le permet).
+                sale_at = None if antibot_until(ctx, "auction") else next_sale_at(ctx)
                 # Rien fait et rien de reporté : la nuit, inutile de revenir toutes les 15 minutes (voir plus bas).
                 idle = not any(ctx.summary[k] for k in ("tag_add", "tag_remove", "discard", "auction", "pack",
-                                                        "deferred"))
+                                                        "trade", "deferred"))
                 # Nouveau bilan dès maintenant : les mises faites pendant la pause de --loop iront dans le suivant.
                 ctx.summary = new_summary()
                 ctx.journal.lost = ctx.journal.diverted = 0
@@ -3856,10 +4597,10 @@ def main():
                 buying = " (les achats continuent)" if ctx.sniper and ctx.sniper.market else ""
                 print(f"\nNuit : plus rien à vendre ni à défausser, prochain passage à {night['end']}{buying} "
                       "(Ctrl+C pour quitter)")
-            elif outcome[0] == "ok" and waiting and (free := next_free_slot(ctx)) and free < now + args.loop * 60:
-                # Une place d'enchère se libère avant le passage prévu : il a lieu dès qu'elle est libre.
-                pause = max(MIN_LOOP_SECONDS, free - now)
-                print(f"\nUne place d'enchère se libère vers {clock_time(free)} : prochain passage dans "
+            elif outcome[0] == "ok" and sale_at and sale_at < now + args.loop * 60:
+                # Une place d'enchère (ou la limite du marché) se libère avant le passage prévu : il a lieu à ce moment.
+                pause = max(MIN_LOOP_SECONDS, sale_at - now)
+                print(f"\nVentes en attente, possibles vers {clock_time(sale_at)} : prochain passage dans "
                       f"{pause / 60:.0f} minute(s)… (Ctrl+C pour quitter)")
             else:
                 pause = args.loop * 60
@@ -3897,6 +4638,8 @@ def print_summary(summary, execute):
         parts.append(f"{summary['pack']} booster(s) ouvert(s)")
     if summary["bid"]:
         parts.append(f"{summary['bid']} mise(s) sur le marché")
+    if summary["sent"]:
+        parts.append(f"{summary['sent']} carte(s) envoyée(s) en {summary['trade']} échange(s)")
     others = [
         f"{len(summary['protect'])} protégée(s)",
         f"{len(summary['skip'] - summary['protect'])} ignorée(s)",

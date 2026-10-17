@@ -35,6 +35,8 @@ protection:
   starred: true         # cartes mises en favori (étoile)
   shiny: true           # cartes shiny
   rarities: ["SR", "L"] # raretés à ne jamais toucher (vues sur le site : C, PC, R, SR, L)
+  unprotected_rarities: []  # parmi elles, celles traitées comme les autres cartes (étiquette de prix, vente,
+                            # défausse), ex. ["SR"] : perso.yaml ne peut pas retirer une rareté de la liste ci-dessus
   name_contains: []     # ex. ["Lyon", "Olympique"] : nom de carte contenant un de ces mots
   # Les cartes engagées dans un échange en cours sont toujours protégées.
 
@@ -60,10 +62,16 @@ price_tags:
     - { tag: "+1000",    from: 1000,              color: "#16a34a" }
   unknown_tag: "inconnu"       # étiquette pour les cartes jamais vendues, ex. "inconnu" (null = ne rien poser)
   remove_outdated: true   # retirer l'ancienne étiquette de prix quand la carte change de tranche
-  tag_protected: false    # true = étiqueter aussi les cartes protégées (elles restent protégées)
+  retired: []             # étiquettes d'une tranche supprimée, retirées par « analyser », ex. ["+5"] après avoir
+                          # fusionné « +5 » dans « defausse » (n'oubliez pas sell.tags)
+  tag_protected: false    # true = étiqueter aussi les cartes protégées (elles restent protégées) ; false = une carte
+                          # protégée n'a pas d'étiquette de prix : celles qu'elle a sont retirées (un filtre par
+                          # prix sur le site, pour un échange, ne la montre plus)
 
 # Étiquettes supplémentaires posées par « analyser » selon des conditions (combinées en ET).
-# Conditions : name_contains (un texte, ou une liste : l'un d'eux), rarity_in, shiny, min_value, max_value.
+# Conditions : name_contains (un texte, ou une liste : l'un d'eux), name_words (noms en mots entiers),
+# text_contains / text_excludes (titre ou description de la carte, en début de mot : « pnl » trouve
+# « chanson de PNL »), rarity_in, shiny, min_value, max_value.
 # Une règle sans min_value ni max_value s'applique aussi aux cartes protégées. Exemples :
 #   - tag: "à surveiller"
 #     color: "#eab308"
@@ -77,6 +85,7 @@ auto_tags: []
 # ----------------------------------------------------------------------------
 discard:
   tags: ["defausse"]      # défausse les cartes portant une de ces étiquettes (posées par analyser ou à la main)
+  accounts: null          # comptes qui défaussent, ex. ["moncompte"] (null = tous) ; les autres gardent tout
   max_value: 5            # garde-fou : ne défausse jamais une carte dont le prix moyen actuel est >= 5 (null = pas de vérification ;
                           # une carte « inconnu » qui s'est vendue depuis n'est alors jamais défaussée)
   unknown_rarities: ["C", "PC", "R"]  # cartes jamais vendues (étiquette « inconnu ») défaussées aussi, pour ces
@@ -95,6 +104,8 @@ discard:
 # ----------------------------------------------------------------------------
 sell:
   tags: ["+1000", "+500", "+100", "+10", "+5"]   # met aux enchères les cartes portant une de ces étiquettes
+  accounts: null          # comptes qui mettent des cartes aux enchères, ex. ["moncompte"] (null = tous) ; les
+                          # autres font seulement le bilan de leurs enchères en cours (et défaussent)
   order: "random"         # random : au hasard | value : les plus chères d'abord | tags : dans l'ordre de la liste, puis par prix
   price_factor: 0.75      # mise de départ = prix moyen × 0,75…
   rounding: "floor"       # … arrondie à l'inférieur (floor), au plus proche (round) ou au supérieur (ceil)
@@ -111,6 +122,11 @@ sell:
   # relance, et aucune enchère lancée avant ne s'y termine. Boosters, défausses et achats continuent.
   # Heures entre guillemets ; null = vendre à toute heure.
   night: { start: "23:00", end: "08:00" }
+  # Heures de pointe : enchères plus courtes entre ces deux heures (celles de l'ordinateur), ex.
+  # { start: "18:00", end: "22:00", duration_minutes: 10 }. Les mises en vente partent alors une par une, toutes les
+  # 6 min (safety.market_limit réparti sur l'heure) : il y en a toujours une en cours. market_limit: 30 remplace
+  # safety.market_limit.count pendant ce créneau (compte qui vend) : les 5 places restent pleines. null = jamais.
+  peak: null
   # Relance des invendus : une carte revenue sans acheteur est remise en vente moins cher.
   relist:
     enabled: true
@@ -124,6 +140,13 @@ sell:
 # ----------------------------------------------------------------------------
 packs:
   in_tout: false          # true = « tout » ouvre d'abord les boosters disponibles (leurs cartes sont triées ensuite)
+  accounts: null          # comptes qui ouvrent des boosters, ex. ["moncompte"] (null = tous) : chaque booster compte
+                          # dans safety.market_limit, donc moins de ventes pour un compte qui vend
+  every_minutes: null     # « tout » n'essaie d'en ouvrir qu'une fois toutes les N minutes, ex. 180 (null = à chaque passage)
+  max_blocks: 3           # après N vérifications anti-robot de suite à leur ouverture (une ouverture réussie remet le
+                          # compte à zéro), « tout » arrête les boosters… (null = ne jamais arrêter)
+  retry_hours: 6          # … et n'en essaie plus qu'un seul toutes les N heures, pour voir si c'est encore bloqué.
+                          # Ouvert, tout repart normalement. La commande « boosters » les ouvre quand même
   max_per_run: 10         # au plus N boosters ouverts par passage
   delay_seconds: 12       # pause entre deux boosters : enchaînés en quelques secondes, ils déclenchent la
                           # vérification anti-robot du site (les boosters sont alors en pause 1 h, puis 2 h, 4 h…)
@@ -154,12 +177,26 @@ buy:
   snipe_seconds: 20       # mise quand il reste N secondes (10 au moins)
   last_check_seconds: 6   # dernière vérification (et surenchère si dépassé) quand il reste N secondes
   bid_on_sight: false     # true = première mise dès que l'annonce est repérée, sans attendre snipe_seconds
-  max_bids: { count: 8, minutes: 30 }  # au plus N mises par compte en M minutes : le site bloque le marché (ventes
-                          # comprises) après une dizaine de mises rapprochées (null = pas de limite)
   exclude: []             # annonces ignorées si leur titre ou catégorie contient un de ces mots, ex. ["Lyons"]
   scan_minutes: 5         # le marché est relu toutes les N minutes
   accounts: null          # comptes qui achètent, ex. ["moncompte"] (noms : ./wm comptes) ; les autres n'achètent
                           # rien. null = tous vos comptes
+
+# ----------------------------------------------------------------------------
+# Envoi de cartes à un autre de VOS comptes (commande « envoyer », ou pendant « tout » avec in_tout: true), par
+# échanges sans contrepartie, pour que ce soit lui qui les vende. Les deux comptes doivent être amis sur le site et
+# enregistrés ici (./wm login) : le script n'envoie jamais rien à un autre joueur. Une carte protégée n'est jamais
+# envoyée (ses étiquettes ne la suivent pas). Les cartes n'arrivent qu'une fois l'échange accepté par l'autre compte.
+# ----------------------------------------------------------------------------
+send:
+  to: null                # compte qui reçoit, ex. "moncompte2" (noms : ./wm comptes), ou --vers NOM
+  tags: null              # étiquettes des cartes envoyées, ex. ["+10"], ou --etiquette +10 (null = sell.tags)
+  in_tout: false          # true = « tout » envoie ces cartes avant les ventes, sur tous les comptes sauf celui qui
+                          # reçoit (le même perso.yaml sert aux deux)
+  batch_size: 20          # cartes par échange : le site a refusé 100 cartes d'un coup (16/10/2026). Après un
+                          # refus, les cartes sont reproposées par lots deux fois plus petits
+  max_per_run: 100        # au plus N cartes envoyées par passage (la suite au passage suivant)
+  delay_seconds: 20       # pause entre deux échanges
 
 # ----------------------------------------------------------------------------
 # Garde-fous et rythme.
@@ -172,6 +209,13 @@ safety:
   read_delay_seconds: 1.8         # pause après chaque lecture de prix
   max_consecutive_errors: 3       # arrêt après N actions refusées d'affilée
   max_consecutive_read_failures: 5  # arrêt après N prix illisibles d'affilée
+  market_limit: { count: 10, minutes: 60, bids: 4 }  # par compte, au plus « count » actions sur le marché
+                          # (mises, mises en vente, boosters) en « minutes », dont au plus « bids » nouvelles
+                          # mises : le reste est pour les ventes. Plus vite, le site bloque tout le marché du
+                          # compte (vu le 16/10/2026 : 10 actions en 25 min). null = pas de limite
+  shared_market: false    # true = vos comptes lancés sur cet ordinateur partagent cette limite et la pause anti-robot.
+                          # Inutile a priori : le site bloque chaque compte séparément (17/10/2026 : un compte bloqué
+                          # sur un booster, l'autre ouvrait et misait encore juste après)
 
 # ----------------------------------------------------------------------------
 # Journal : une ligne par action réelle (étiquettes, ventes, relances, défausses, ventes terminées).

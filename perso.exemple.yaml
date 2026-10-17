@@ -25,6 +25,12 @@
 #   tag: "lyon"
 #   accounts: ["moncompte"]   # seuls ces comptes achètent (noms : ./wm comptes) ; sinon tous
 
+# Envoi des cartes à vendre à un autre de vos comptes, qui les vend (commande « envoyer », ou dans « tout » avec
+# in_tout). Les deux comptes doivent être amis sur le site ; acceptez ensuite les échanges avec l'autre compte.
+# send:
+#   to: "moncompte2"
+#   in_tout: true
+
 # Pas de mise en vente la nuit (config.yaml : de 23:00 à 08:00). null = vendre à toute heure.
 # sell:
 #   night: { start: "00:00", end: "07:00" }

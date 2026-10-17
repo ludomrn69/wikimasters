@@ -56,10 +56,11 @@ Le script empêche l'ordinateur de se mettre en veille tout seul, mais **pas qua
 | `./wm defausser` | Défausse les cartes `defausse` et les `inconnu` de rareté C, PC ou R |
 | `./wm boosters` | Ouvre les boosters disponibles |
 | `./wm acheter` | Mise à la dernière seconde sur les enchères du marché qui correspondent à vos mots-clés |
+| `./wm envoyer` | Envoie les cartes à vendre à un autre de vos comptes, qui les vendra (voir [Envoyer des cartes à un autre compte](#envoyer-des-cartes-à-un-autre-compte)) |
 | `./wm login` | Ajoute un compte, ou le reconnecte |
 | `./wm comptes` | Liste vos comptes enregistrés |
 
-Options, à ajouter à `tout`, `analyser`, `vendre`, `defausser`, `boosters` ou `acheter` :
+Options, à ajouter à `tout`, `analyser`, `vendre`, `defausser`, `boosters`, `acheter` ou `envoyer` :
 
 | Option | Effet |
 |---|---|
@@ -68,6 +69,8 @@ Options, à ajouter à `tout`, `analyser`, `vendre`, `defausser`, `boosters` ou 
 | `--compte NOM` | Choisir le compte, si vous en avez plusieurs. |
 | `--fresh` | Relire tous les prix sur le site au lieu de ceux gardés depuis moins de 24 h. |
 | `--verbose` | Tout afficher, y compris les cartes protégées. |
+| `--vers NOM` | `envoyer` seulement : le compte qui reçoit les cartes. |
+| `--etiquette TAG` | `envoyer` seulement : n'envoyer que les cartes de cette étiquette (répétable). |
 
 ## Ce que fait `tout`, étape par étape
 
@@ -87,9 +90,13 @@ Options, à ajouter à `tout`, `analyser`, `vendre`, `defausser`, `boosters` ou 
 | 1000 et plus | `+1000` | vendue |
 | jamais vendue | `inconnu` | défaussée si de rareté C, PC ou R, gardée sinon |
 
-Si le prix d'une carte change de tranche, l'ancienne étiquette est remplacée.
+Si le prix d'une carte change de tranche, l'ancienne étiquette est remplacée. Une carte protégée n'a pas d'étiquette de prix : celles qu'elle porte sont retirées (sauf avec `price_tags.tag_protected: true`), pour qu'un filtre par prix sur le site, par exemple pour un échange, ne la montre pas.
 
 **2. Vendre.** Le script fait d'abord le bilan des enchères précédentes (vendue ou invendue). Il relance ensuite les invendus à 80 % de la mise précédente (3 essais au plus), puis remplit les places libres avec des cartes tirées au hasard, à 75 % de leur prix moyen (`sell.price_factor`), pour 30 minutes (`sell.duration_minutes` ; `sell.long_duration` donne plus de temps aux cartes chères, par exemple 30 min à partir de 100). Seul le prix des cartes tirées est lu : la vente n'attend pas la relecture des centaines d'autres. Avec `--loop`, quand des cartes attendent une place, le passage suivant a lieu dès qu'une enchère du script se termine (1 minute après sa fin, le temps que le site la règle) au lieu d'attendre 15 minutes.
+
+**Aux heures de pointe, des enchères de 10 min.** Avec `sell.peak: { start: "18:00", end: "22:00", duration_minutes: 10 }`, les enchères durent 10 min dans ce créneau (30 min le reste du temps). Lancées toutes d'un coup, les 10 actions de l'heure (`safety.market_limit`) partiraient en un quart d'heure et les places resteraient vides ensuite : le script les lance donc une par une, toutes les 6 min, et `--loop` revient pour chacune. Il y a ainsi toujours une enchère en cours. Avec `market_limit: 30` dans `sell.peak`, le compte qui vend a droit à 30 mises en vente par heure pendant ce créneau : les 5 places restent pleines (plus d'actions, donc plus de risque de vérification anti-robot).
+
+**Pendant les défausses, il continue de vendre.** Une défausse relit le prix de la carte (environ 7 s) : 200 défausses prennent 25 minutes. Dans `tout`, une place d'enchère libérée pendant ce temps est remplie dans la minute.
 
 **La nuit, il ne vend rien.** De 23 h à 8 h (heure de l'ordinateur), il ne met aucune carte en vente et ne relance aucun invendu, et il ne lance pas d'enchère qui se terminerait dans ce créneau (donc plus rien après 22 h 30 avec des enchères de 30 minutes). Il continue d'ouvrir les boosters, de poser les étiquettes, de défausser et d'acheter. Avec `--loop`, dès qu'un passage de nuit n'a plus rien fait (ni défausse, ni étiquette), le passage suivant n'a lieu qu'à la fin de la nuit au lieu de revenir toutes les 15 minutes ; les achats, eux, continuent toute la nuit, et une carte gagnée reçoit sa protection au début de ce passage, avant tout tri. Pour changer les heures, dans `perso.yaml` :
 
@@ -106,6 +113,8 @@ discard:
 ```
 
 **3. Défausser.** Par lots de 10 cartes : le prix des 10 cartes est relu sur le site, puis elles sont défaussées, et ainsi de suite. Une carte qui vaut maintenant 5 ou plus est épargnée. Le script fait au plus 200 défausses par passage ; la suite au passage suivant. Le site répond lentement (environ 7 secondes par prix) : comptez environ 40 minutes pour 200 défausses.
+
+**Traiter les SR comme les autres cartes.** Avec `protection.unprotected_rarities: ["SR"]`, les SR reçoivent une étiquette de prix, sont vendues et défaussées comme les autres (ajoutez `SR` à `discard.unknown_rarities` pour défausser aussi les jamais vendues). Une SR protégée par une étiquette (`garder`, `lyon`…) reste intouchable.
 
 **Pour garder une carte**, ajoutez-lui l'étiquette `garder` sur le site. Retirer `defausse` ne suffit pas : le passage suivant la remettrait.
 
@@ -127,6 +136,15 @@ protection:
 
 **Boosters.** `./wm boosters --execute` ouvre les boosters disponibles, 10 au plus, espacés d'environ 12 secondes. Si le site répond « Plus de paquets disponibles » (il en annonce parfois plus qu'il n'en accorde), le script arrête d'ouvrir des boosters et continue le passage. Si le site demande la vérification anti-robot, le script s'arrête et attend 1 h avant de réessayer (puis 2 h, 4 h…). Passez la vérification à la main sur le site pour reprendre plus tôt.
 
+**Boosters de temps en temps.** Avec `packs.every_minutes: 180`, `tout` n'essaie d'ouvrir les boosters qu'une fois toutes les 3 h. Après 3 vérifications anti-robot **de suite** à leur ouverture (`packs.max_blocks` ; une ouverture réussie remet le compte à zéro), il les arrête : il n'essaie plus qu'**un seul** booster toutes les 6 h (`packs.retry_hours`), pour voir si c'est encore bloqué. S'il passe, tout repart normalement. Le compte est relu dans le journal : un redémarrage du script ne le remet pas à zéro. `./wm boosters --execute` les ouvre quand même. Chaque booster compte dans les 10 actions par heure sur le marché (`safety.market_limit`) : `packs.max_per_run: 3` en laisse pour les ventes et les mises, et `packs.accounts: ["compte1"]` réserve les boosters à ce compte : celui qui vend garde toutes ses actions pour ses ventes.
+
+```yaml
+packs:
+  in_tout: true
+  every_minutes: 180
+  max_per_run: 3
+```
+
 **Achats.** Toutes les 5 minutes, le script cherche sur le marché les annonces qui se terminent bientôt et dont le titre ou la catégorie contient un mot commençant par un de vos mots-clés (« lyon » trouve « lyonnais » ou « To-Lyon », pas « Elyon »). Pour chacune :
 
 - il ignore les cartes que vous avez déjà, celles déjà trop chères, et celles qui ne se sont jamais vendues (prix inconnu), sauf avec `buy.buy_unknown: true` ;
@@ -136,7 +154,7 @@ protection:
 - une mise de dernière minute fait prolonger l'enchère par le site : le script la suit jusqu'à sa vraie fin, et remise à chaque fois que quelqu'un le dépasse ;
 - le plafond est le **prix moyen** de la carte multiplié par `buy.price_factor` (1 par défaut, 5 pour aller jusqu'à 5 fois le prix moyen), et `buy.max_price` peut ajouter une limite absolue. Avec `price_factor: null`, il n'y a plus de plafond lié au prix ;
 - une carte gagnée reçoit l'étiquette `buy.tag` au passage suivant, avant toute analyse : elle n'est donc jamais revendue ni défaussée. Tant que le résultat d'une mise n'est pas connu, la carte n'est pas touchée. Ce résultat est lu au début de chaque passage `--execute` (même sans `--loop`), et même pendant une pause anti-robot des achats.
-- **8 mises au plus par compte en 30 minutes** (`buy.max_bids`) : après une dizaine de mises rapprochées, le site bloque tout le marché du compte (ventes comprises) par une vérification anti-robot qui ne se lève souvent pas toute seule. Les 2 dernières mises de la fenêtre sont gardées pour répondre à une surenchère sur une enchère déjà commencée ; une nouvelle annonce attend, ou est laissée ;
+- les mises comptent dans la limite d'actions sur le marché (`safety.market_limit`, voir [Garde-fous](#garde-fous)). Quand un compte achète, les 2 dernières places de la limite sont gardées pour répondre à une surenchère sur une enchère déjà commencée ; une nouvelle annonce attend, ou est laissée ;
 - `buy.exclude` écarte les annonces dont le titre ou la catégorie contient un de ces mots (« lyon » trouve aussi « Marty Lyons » : `exclude: ["Lyons"]`). Les noms de `buy.names` sont cherchés en mots entiers (« Lucas Perri » ne trouve pas « Lucas Perrin ») ;
 - une même carte a souvent plusieurs annonces : le script n'en suit qu'une, et si elle devient trop chère ou qu'il la perd, il passe à une autre annonce de la même carte.
 
@@ -154,7 +172,7 @@ buy:
     compte2: { keywords: [], names: ["Rayan Cherki", "Maxence Caqueret"] }
 ```
 
-**Les cartes que vous avez déjà** reçoivent les mêmes étiquettes avec `auto_tags` (posées par l'analyse, même sur une carte déjà protégée). En YAML, `&ol` nomme la liste et `*ol` la reprend, pour ne pas l'écrire deux fois :
+**Les cartes que vous avez déjà** sont reconnues par leur titre ou leur description (`text_contains` : « pnl » trouve « Au DD », décrite « chanson de PNL ») et reçoivent une étiquette de protection : elles ne sont jamais défaussées ni vendues, même arrivées sans étiquette. Elles reçoivent aussi les mêmes étiquettes que les achats avec `auto_tags` (posées par l'analyse, même sur une carte déjà protégée). En YAML, `&ol` nomme la liste et `*ol` la reprend, pour ne pas l'écrire deux fois :
 
 ```yaml
 buy:
@@ -165,8 +183,10 @@ buy:
   names_tags: ["lyon", "OL"]
 
 auto_tags:
-  - { tag: "OL", when: { name_contains: *ol } }
-  - { tag: "lyon", when: { name_contains: *ol } }
+  - { tag: "OL", when: { name_words: *ol } }
+  - { tag: "lyon", when: { name_words: *ol } }
+  - { tag: "lyon", when: { text_contains: ["lyon"], text_excludes: ["Lyons"] } }
+  - { tag: "pnl", when: { text_contains: ["pnl"] } }
 
 protection:
   tags: ["garder", "favori", "lyon", "OL", "pnl", "plk"]
@@ -216,7 +236,34 @@ Faites `./wm login` une fois par compte : chacun a son dossier dans `comptes/`, 
 
 Deux comptes peuvent tourner en même temps, dans deux terminaux. Ils sollicitent alors deux fois plus le site : si les erreurs 503 ou 525 reviennent souvent, faites-les tourner l'un après l'autre.
 
+**Chaque compte a sa limite et sa pause anti-robot.** Le site bloque les comptes séparément : le 17/10/2026, un compte bloqué sur un booster n'empêchait pas l'autre d'ouvrir des boosters et de miser quelques secondes après. Avec `safety.shared_market: true`, vos comptes lancés sur le même ordinateur partagent la limite de 10 actions par heure et la pause anti-robot (dans `comptes/marche_commun.json`) : quand l'un est bloqué, les autres s'arrêtent aussi. Relancer un compte lève alors la pause pour tous ; si le site la demande encore, la pause suivante dure plus longtemps.
+
 Pour qu'un seul d'entre eux achète, voir `buy.accounts` dans [Boosters et achats](#boosters-et-achats-aux-enchères). S'ils font tous les deux des achats, ils se partagent les annonces : le premier qui repère une enchère la suit, l'autre la laisse (« suivie par votre compte … »). Ils ne misent donc jamais l'un contre l'autre. Ce partage passe par `comptes/achats_en_cours.json` : les comptes doivent tourner sur le même ordinateur. Une simulation ne réserve rien.
+
+## Envoyer des cartes à un autre compte
+
+`./wm envoyer` donne les cartes à vendre (`+5`, `+10`, `+100`, `+500`, `+1000` : les étiquettes de `sell.tags`) d'un compte à un autre de **vos** comptes, par échanges sans contrepartie. C'est alors l'autre compte qui les vend : par exemple, un compte achète et l'autre vend (`sell.accounts`).
+
+```bash
+./wm envoyer --compte compte1 --vers compte2              # simulation : montre les échanges prévus
+./wm envoyer --compte compte1 --vers compte2 --execute    # propose les échanges pour de vrai
+./wm envoyer --compte compte1 --vers compte2 --etiquette +10   # seulement les cartes +10
+```
+
+- Les deux comptes doivent être **amis sur le site**, et enregistrés avec `./wm login` : le script n'envoie jamais rien à un autre joueur, même par faute de frappe.
+- **Il faut ensuite accepter les échanges** sur le site avec l'autre compte (page Échanges) : les cartes n'arrivent qu'à ce moment. Sans étiquette (les étiquettes restent sur le compte qui envoie), elles sont étiquetées par l'analyse de l'autre compte puis vendues.
+- Une carte protégée (`garder`, favori, étoile, shiny, SR, L…), déjà dans un échange en attente ou en vente aux enchères n'est jamais envoyée.
+- Les cartes partent par échanges de 20 (`send.batch_size`), 20 secondes d'écart, 100 au plus par passage (`send.max_per_run`) : le site a refusé 100 cartes d'un coup (« Erreur serveur »). Si un échange est refusé, le script vérifie qu'il n'a pas été créé quand même, puis propose les cartes par lots deux fois plus petits ; après 3 refus de suite, la suite attend le passage suivant.
+
+**Automatiquement dans `tout`.** Avec ces réglages, `tout` envoie les cartes à vendre de vos autres comptes vers `compte2` à chaque passage, avant les ventes. Le même `perso.yaml` sert aux deux comptes : celui qui reçoit n'envoie rien et vend.
+
+```yaml
+send:
+  to: "compte2"      # le compte qui reçoit et vend (noms : ./wm comptes)
+  in_tout: true
+sell:
+  accounts: ["compte2"]
+```
 
 ## Vos réglages : `perso.yaml`
 
@@ -285,6 +332,7 @@ Chaque action réelle est inscrite dans **`journal.csv`** (date, compte, carte, 
 - Une carte déjà en vente n'est pas remise en vente. Une enchère que vous annulez vous-même n'est pas relancée.
 - Deux passages `--execute` ne peuvent pas tourner en même temps sur le même compte.
 - Le script fait une pause entre chaque action et chaque lecture, et il s'arrête après plusieurs échecs d'affilée.
+- **10 actions sur le marché au plus par compte et par heure** (`safety.market_limit` : mises, mises en vente et boosters ensemble ; pour tous vos comptes ensemble avec `safety.shared_market: true`). Plus vite, le site bloque tout le marché du compte par une vérification anti-robot qui ne se lève souvent pas toute seule (vu le 16/10/2026 : 10 actions en 25 minutes). Les ventes en attente reprennent dès que la limite le permet ; la limite tient compte des actions faites avant un redémarrage du script.
 - Aucune mise en vente la nuit (`sell.night`, de 23 h à 8 h), et aucune enchère ne s'y termine.
 - Les mises en vente sont espacées de 45 secondes (`safety.auction_delay_seconds`) : enchaînées en quelques secondes, elles déclenchent la vérification anti-robot du site.
 - Si le site demande une vérification anti-robot, le script n'insiste pas : ce type d'action attend, le reste continue.

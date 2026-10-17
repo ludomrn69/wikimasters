@@ -78,6 +78,7 @@ auto_tags: []
 # ----------------------------------------------------------------------------
 discard:
   tags: ["defausse"]      # défausse les cartes portant une de ces étiquettes (posées par analyser ou à la main)
+  accounts: null          # comptes qui défaussent, ex. ["moncompte"] (null = tous) ; les autres gardent tout
   max_value: 10           # garde-fou : ne défausse jamais une carte dont le prix moyen actuel est >= 10 (null = pas de vérification)
   unknown_rarities: []    # cartes jamais vendues à défausser (aucune dans les tests de base)
   max_per_run: 200        # au plus N défausses par passage (la suite au passage suivant)
@@ -91,6 +92,8 @@ discard:
 # ----------------------------------------------------------------------------
 sell:
   tags: ["+1000", "+500", "+100", "+10"]   # met aux enchères les cartes portant une de ces étiquettes
+  accounts: null          # comptes qui mettent des cartes aux enchères, ex. ["moncompte"] (null = tous) ; les
+                          # autres font seulement le bilan de leurs enchères en cours (et défaussent)
   order: "random"         # random : au hasard | value : les plus chères d'abord | tags : dans l'ordre de la liste, puis par prix
   price_factor: 0.75      # mise de départ = prix moyen × 0,75…
   rounding: "floor"       # … arrondie à l'inférieur (floor), au plus proche (round) ou au supérieur (ceil)
@@ -117,6 +120,10 @@ sell:
 # ----------------------------------------------------------------------------
 packs:
   in_tout: false          # true = « tout » ouvre d'abord les boosters disponibles (leurs cartes sont triées ensuite)
+  accounts: null          # comptes qui ouvrent des boosters (null = tous)
+  every_minutes: null     # « tout » n'essaie d'en ouvrir qu'une fois toutes les N minutes (null = à chaque passage)
+  max_blocks: 3           # arrêt après N vérifications anti-robot de suite à leur ouverture…
+  retry_hours: 6          # … puis un seul booster essayé toutes les N heures
   max_per_run: 10         # au plus N boosters ouverts par passage
   delay_seconds: 12       # pause entre deux boosters : enchaînés en quelques secondes, ils déclenchent la
                           # vérification anti-robot du site (les boosters sont alors en pause 1 h, puis 2 h, 4 h…)
@@ -143,11 +150,18 @@ buy:
   snipe_seconds: 20       # mise quand il reste N secondes (10 au moins)
   last_check_seconds: 6   # dernière vérification (et surenchère si dépassé) quand il reste N secondes
   bid_on_sight: false     # true = première mise dès que l'annonce est repérée, sans attendre snipe_seconds
-  max_bids: null  # au plus N mises par compte en M minutes : le site bloque le marché (ventes
-                          # comprises) après une dizaine de mises rapprochées (null = pas de limite)
   exclude: []             # annonces ignorées si leur titre ou catégorie contient un de ces mots, ex. ["Lyons"]
   scan_minutes: 5         # le marché est relu toutes les N minutes
   accounts: null          # tous les comptes achètent
+
+# Envoi de cartes à un autre de vos comptes (commande « envoyer »).
+send:
+  to: null
+  tags: null              # null = sell.tags
+  in_tout: false
+  batch_size: 20
+  max_per_run: 100
+  delay_seconds: 20
 
 # ----------------------------------------------------------------------------
 # Garde-fous et rythme.
@@ -160,6 +174,10 @@ safety:
   read_delay_seconds: 1.8         # pause après chaque lecture de prix
   max_consecutive_errors: 3       # arrêt après N actions refusées d'affilée
   max_consecutive_read_failures: 5  # arrêt après N prix illisibles d'affilée
+  market_limit: null  # au plus N actions sur le marché (mises, mises en vente, boosters)
+                          # par compte en M minutes : plus vite, le site bloque tout le marché du compte (vu le
+                          # 16/10/2026 : 10 actions en 25 min). null = pas de limite
+  shared_market: true     # limite et pause anti-robot communes à vos comptes de cet ordinateur
 
 # ----------------------------------------------------------------------------
 # Journal : une ligne par action réelle (étiquettes, ventes, relances, défausses, ventes terminées).
