@@ -112,6 +112,7 @@ sell:
     enabled: true
     factor: 0.8           # nouvelle mise = mise précédente × 0,8 (arrondie comme ci-dessus)
     min_start_price: 1    # mise minimale d'une relance
+    stop_below: null      # ex. 8 : pas de relance sous 8
     max_attempts: 3       # au-delà de 3 mises en vente sans acheteur, on ne relance plus
     first: true           # les relances passent avant les nouvelles ventes
 
@@ -150,6 +151,7 @@ buy:
   snipe_seconds: 20       # mise quand il reste N secondes (10 au moins)
   last_check_seconds: 6   # dernière vérification (et surenchère si dépassé) quand il reste N secondes
   bid_on_sight: false     # true = première mise dès que l'annonce est repérée, sans attendre snipe_seconds
+  ignore_market_limit: false  # true = mises sans limite (safety.market_limit)
   exclude: []             # annonces ignorées si leur titre ou catégorie contient un de ces mots, ex. ["Lyons"]
   scan_minutes: 5         # le marché est relu toutes les N minutes
   accounts: null          # tous les comptes achètent

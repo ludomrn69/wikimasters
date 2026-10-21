@@ -96,7 +96,7 @@ Si le prix d'une carte change de tranche, l'ancienne étiquette est remplacée. 
 
 **Aux heures de pointe, des enchères de 10 min.** Avec `sell.peak: { start: "18:00", end: "22:00", duration_minutes: 10 }`, les enchères durent 10 min dans ce créneau (30 min le reste du temps). Lancées toutes d'un coup, les 10 actions de l'heure (`safety.market_limit`) partiraient en un quart d'heure et les places resteraient vides ensuite : le script les lance donc une par une, toutes les 6 min, et `--loop` revient pour chacune. Il y a ainsi toujours une enchère en cours. Avec `market_limit: 30` dans `sell.peak`, le compte qui vend a droit à 30 mises en vente par heure pendant ce créneau : les 5 places restent pleines (plus d'actions, donc plus de risque de vérification anti-robot).
 
-**Pendant les défausses, il continue de vendre.** Une défausse relit le prix de la carte (environ 7 s) : 200 défausses prennent 25 minutes. Dans `tout`, une place d'enchère libérée pendant ce temps est remplie dans la minute.
+**Pendant les longues étapes, il continue de vendre.** Une défausse relit le prix de la carte (environ 7 s) : 200 défausses prennent 25 minutes, et quand les prix gardés expirent, l'analyse relit toute la collection (1 à 3 heures). Dans `tout`, une place d'enchère libérée pendant ces étapes (lecture des prix, étiquettes, défausses) est remplie dans la minute.
 
 **La nuit, il ne vend rien.** De 23 h à 8 h (heure de l'ordinateur), il ne met aucune carte en vente et ne relance aucun invendu, et il ne lance pas d'enchère qui se terminerait dans ce créneau (donc plus rien après 22 h 30 avec des enchères de 30 minutes). Il continue d'ouvrir les boosters, de poser les étiquettes, de défausser et d'acheter. Avec `--loop`, dès qu'un passage de nuit n'a plus rien fait (ni défausse, ni étiquette), le passage suivant n'a lieu qu'à la fin de la nuit au lieu de revenir toutes les 15 minutes ; les achats, eux, continuent toute la nuit, et une carte gagnée reçoit sa protection au début de ce passage, avant tout tri. Pour changer les heures, dans `perso.yaml` :
 
@@ -110,6 +110,13 @@ sell:
 ```yaml
 discard:
   unsold_max_value: 10   # défausser au lieu de relancer les invendues qui valent moins de 10 (null = toujours relancer)
+```
+
+**Pas de relance à prix bradé.** Une carte qui vaut 10, mise en vente à 5, serait relancée à 4 puis 3 : le 21/10/2026, 9 relances sous 8 wikicoins n'ont vendu qu'une carte (pour 5), chacune prenant une action sur le marché et une place d'enchère. Avec `sell.relist.stop_below`, une relance qui partirait sous ce prix n'est pas faite : la carte n'est plus remise en vente et reste dans la collection (elle est défaussée si elle vaut moins de `discard.unsold_max_value`). Désactivé par défaut ; dans `perso.yaml` :
+
+```yaml
+sell:
+  relist: { stop_below: 8 }   # pas de relance sous 8 (null = relancer jusqu'à min_start_price)
 ```
 
 **3. Défausser.** Par lots de 10 cartes : le prix des 10 cartes est relu sur le site, puis elles sont défaussées, et ainsi de suite. Une carte qui vaut maintenant 5 ou plus est épargnée. Le script fait au plus 200 défausses par passage ; la suite au passage suivant. Le site répond lentement (environ 7 secondes par prix) : comptez environ 40 minutes pour 200 défausses.
@@ -161,6 +168,8 @@ packs:
 **Des étiquettes selon la carte.** `buy.keyword_tags` donne une ou plusieurs étiquettes (à mettre aussi dans `protection.tags`) aux cartes dont le titre ou la catégorie contient un texte ; les autres reçoivent `buy.tag`. La recherche porte sur le titre et la courte description de la carte : « pnl » trouve « PNL (groupe) », mais aussi « Au DD (chanson de PNL) » ou « Deux Frères (album de PNL) ». Avec `"olympique lyonnais": ["lyon", "OL"]`, une « Saison 2019-2020 de l'Olympique lyonnais » trouvée par « lyon » reçoit les deux.
 
 **Des cartes par leur nom.** Un footballeur est décrit seulement comme « footballeur français », sans son club : pour acheter les joueurs de l'OL, il faut donner leurs noms dans `buy.names` ; ils reçoivent `buy.names_tags` (sinon `buy.tag`). Chaque recherche prend parfois 30 secondes : chaque nom est cherché à son tour, environ toutes les `buy.names_minutes` (60 par défaut), et toutes ses annonces jusqu'à son tour suivant sont suivies.
+
+**Une liste de noms qui se vide toute seule.** Avec `buy.names_file: "joueurs_a_acheter.txt"`, les noms à chercher sont dans ce fichier, un par ligne (lignes `#` : commentaires). Le script en retire un nom dès que la carte est achetée ou arrive dans la collection d'un de vos comptes : il ne cherche plus ce que vous avez déjà. Gardez la liste complète dans `auto_tags` (`name_words`) : c'est elle qui protège vos cartes, et leurs prochains exemplaires.
 
 **Répartir les achats entre vos comptes.** Tous les comptes de `buy.accounts` achètent, et une même annonce n'est suivie que par l'un d'eux. Pour qu'ils ne fassent pas les mêmes recherches, `buy.by_account` remplace les mots-clés et les noms d'un compte : moins de recherches et de mises par compte, donc moins de vérifications anti-robot.
 
@@ -236,6 +245,8 @@ Faites `./wm login` une fois par compte : chacun a son dossier dans `comptes/`, 
 
 Deux comptes peuvent tourner en même temps, dans deux terminaux. Ils sollicitent alors deux fois plus le site : si les erreurs 503 ou 525 reviennent souvent, faites-les tourner l'un après l'autre.
 
+**Chaque compte a son navigateur.** Au premier lancement `--execute` (ou au `login`), chaque compte reçoit un navigateur (User-Agent) différent de celui de vos autres comptes, par exemple Safari sur Mac pour l'un et Edge sous Windows pour l'autre. Il est gardé dans `comptes/<nom>/navigateur.txt` et annoncé au site à chaque lancement. Pour en changer, remplacez la ligne du fichier, par exemple par celle de votre propre navigateur. Les comptes gardent la même adresse IP : ils tournent sur la même connexion.
+
 **Chaque compte a sa limite et sa pause anti-robot.** Le site bloque les comptes séparément : le 17/10/2026, un compte bloqué sur un booster n'empêchait pas l'autre d'ouvrir des boosters et de miser quelques secondes après. Avec `safety.shared_market: true`, vos comptes lancés sur le même ordinateur partagent la limite de 10 actions par heure et la pause anti-robot (dans `comptes/marche_commun.json`) : quand l'un est bloqué, les autres s'arrêtent aussi. Relancer un compte lève alors la pause pour tous ; si le site la demande encore, la pause suivante dure plus longtemps.
 
 Pour qu'un seul d'entre eux achète, voir `buy.accounts` dans [Boosters et achats](#boosters-et-achats-aux-enchères). S'ils font tous les deux des achats, ils se partagent les annonces : le premier qui repère une enchère la suit, l'autre la laisse (« suivie par votre compte … »). Ils ne misent donc jamais l'un contre l'autre. Ce partage passe par `comptes/achats_en_cours.json` : les comptes doivent tourner sur le même ordinateur. Une simulation ne réserve rien.
@@ -286,6 +297,8 @@ Chaque réglage possible est expliqué en commentaire dans `config.yaml`. Le scr
 
 Le script vous écrit sur Telegram **seulement quand il faut agir** : aussitôt quand le site demande une vérification anti-robot (avec l'heure de reprise et quoi faire), et à la fin d'un passage arrêté par une erreur, un plantage ou une mise en veille (une seule fois pour un même problème, même s'il dure des heures). En plus, s'il est réglé, un bilan de la journée par compte (ventes, défausses, achats, solde).
 
+**Répondez « ok » pour reprendre après une vérification anti-robot.** Une fois la vérification passée à la main sur le site, envoyez « ok » au bot (ou « /ok », « c'est bon »…) : le script le lit dans la minute, lève la pause et reprend ventes, achats et boosters sans attendre la fin de la pause (1 h, puis 2 h, 4 h…). Il vous le confirme par « ▶️ Reprise ». « ok » vaut pour tous vos comptes en pause ; « ok moncompte » pour celui-là seulement. Seuls les messages envoyés après le blocage comptent. Si le site redemande la vérification, vous êtes prévenu à nouveau et la pause suivante est plus longue.
+
 1. Créez un bot avec [@BotFather](https://t.me/BotFather) et notez son jeton. Obtenez votre identifiant avec [@userinfobot](https://t.me/userinfobot).
 2. Ajoutez dans `perso.yaml` :
 
@@ -313,7 +326,7 @@ Le jeton ne va **jamais** dans `config.yaml` : le script refuse de démarrer s'i
 | `PLANTAGE` | Un bug, ou une réponse du site que le script ne sait pas lire. Avec `--loop`, seul le passage en cours (ou l'enchère concernée, pendant les achats) est abandonné : le script continue et réessaie au passage suivant. Sans `--loop`, il s'arrête. Copiez le message (il dit où ça a planté) pour le faire corriger. |
 | `places d'enchère illisibles` | Le site, surchargé, n'a pas donné le nombre de places d'enchère libres. Les ventes attendent le passage suivant, le reste continue. Si ça dure plusieurs heures, le site a peut-être changé : signalez-le. |
 | `enchère retirée du site` | Le site supprime les enchères terminées au bout de quelques minutes. Le résultat est alors déduit de la collection : carte revenue = invendue (achat : carte arrivée = gagnée), sinon vendue (achat : perdue). Le prix final n'est plus connu. |
-| `le site demande une vérification anti-robot` | Le site soupçonne un robot, en général après trop de mises rapprochées. Le blocage vaut pour tout le marché du compte : ventes, achats et boosters sont mis en pause ensemble (1 h, puis 2 h, 4 h, 8 h si le site insiste) ; défausses et étiquettes continuent. Il ne se lève souvent pas tout seul : passez la vérification à la main. Pour reprendre plus tôt : ouvrez le site avec ce compte, faites l'action à la main (passez la vérification si elle s'affiche), puis relancez le script. |
+| `le site demande une vérification anti-robot` | Le site soupçonne un robot, en général après trop de mises rapprochées. Le blocage vaut pour tout le marché du compte : ventes, achats et boosters sont mis en pause ensemble (1 h, puis 2 h, 4 h, 8 h si le site insiste) ; défausses et étiquettes continuent. Il ne se lève souvent pas tout seul : passez la vérification à la main. Pour reprendre plus tôt : ouvrez le site avec ce compte, faites l'action à la main (passez la vérification si elle s'affiche), puis répondez « ok » au bot Telegram (reprise dans la minute) ou relancez le script. |
 | `permission denied: ./wm` | Lancez `sh wm login`, ou une fois `chmod +x wm`. |
 | `l'ordinateur s'est mis en veille` | Le script était figé pendant la veille (capot fermé sur batterie, batterie vide) : rien n'a été fait pendant ce temps. Branchez l'ordinateur et laissez le capot ouvert. |
 | `Le compte … n'achète pas` ou `buy.accounts : compte(s) inconnu(s)` | Ce compte n'est pas dans `buy.accounts`, ou un nom y est mal écrit : comparez avec `./wm comptes`. |
@@ -337,7 +350,7 @@ Chaque action réelle est inscrite dans **`journal.csv`** (date, compte, carte, 
 - Les mises en vente sont espacées de 45 secondes (`safety.auction_delay_seconds`) : enchaînées en quelques secondes, elles déclenchent la vérification anti-robot du site.
 - Si le site demande une vérification anti-robot, le script n'insiste pas : ce type d'action attend, le reste continue.
 - Si le serveur du site peine, le script attend, réessaie et ralentit. Une défausse ou une vente n'est renvoyée que si le serveur n'a certainement rien fait. Pendant ces attentes, les achats continuent de miser ; une mise, elle, n'attend que quelques secondes.
-- Une mise sur le marché ne dépasse jamais le prix moyen de la carte × `buy.price_factor` (ni `buy.max_price`). Le script mise toujours le minimum accepté, 20 s puis 6 s avant la fin, et aussitôt si sa mise est refusée parce qu'un autre joueur vient de miser.
+- Une mise sur le marché ne dépasse jamais le prix moyen de la carte × `buy.price_factor` (ni `buy.max_price`). Avec `buy.ignore_market_limit: true`, les mises ne sont plus limitées par heure (plus de mises, mais plus de vérifications anti-robot). Le script mise toujours le minimum accepté, 20 s puis 6 s avant la fin, et aussitôt si sa mise est refusée parce qu'un autre joueur vient de miser.
 - Une carte gagnée aux enchères reçoit son étiquette de protection avant d'être analysée, et une carte dont le résultat n'est pas encore connu n'est pas touchée : le script ne revend pas ce qu'il vient d'acheter.
 - Une simulation lancée pendant qu'un `--execute` tourne sur le même compte reprend la session qu'il a renouvelée, au lieu de la renouveler une seconde fois (ce qui la ferait révoquer).
 - Un résumé s'affiche toujours à la fin, même après une interruption.

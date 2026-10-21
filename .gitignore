@@ -21,3 +21,5 @@ __pycache__/
 # Réglages locaux de Claude Code (chemins personnels)
 .claude/settings.local.json
 .wikimasters.lock
+# Liste personnelle des cartes à acheter (buy.names_file)
+joueurs_a_acheter.txt

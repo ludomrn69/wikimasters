@@ -37,6 +37,7 @@ import threading
 import time
 import traceback
 import unicodedata
+import zlib
 from dataclasses import dataclass, field
 from numbers import Real
 from urllib.parse import unquote, urlparse
@@ -71,6 +72,10 @@ MAX_SLOWDOWN = 8
 # Vérification anti-robot demandée par le site : ce type d'action est mis en pause 1 h, puis 2 h, 4 h, 8 h
 # si le site la redemande. Le reste du passage continue.
 ANTIBOT_PAUSES = (3600, 7200, 14400, 28800)
+# Pendant une pause anti-robot, les réponses au bot Telegram sont lues au plus toutes les N secondes : « ok », envoyé
+# après la vérification passée à la main sur le site, lève la pause sans attendre sa fin (unblock_by_reply).
+REPLY_POLL_SECONDS = 60
+UNBLOCK_WORDS = {"ok", "oki", "okay", "go", "fait", "bon", "reprise", "reprends", "debloque", "debloquer"}
 ANTIBOT_CODE = "human_verification_required"
 ANTIBOT_HINT = ("Ouvrez wiki-masters.com dans votre navigateur avec ce compte et faites l'action à la main "
                 "(passez la vérification si elle s'affiche), puis relancez le script.")
@@ -117,6 +122,18 @@ ACCOUNTS_DIR = "comptes"
 CLAIMS_FILE = "achats_en_cours.json"
 # Dans ACCOUNTS_DIR : actions sur le marché et pause anti-robot communes à vos comptes (safety.shared_market).
 MARKET_FILE = "marche_commun.json"
+# Dans le dossier du compte : le navigateur (User-Agent) annoncé au site, le même à chaque lancement.
+BROWSER_FILE = "navigateur.txt"
+# Navigateurs tirés au premier lancement d'un compte, chaque compte le sien (DEFAULT_USER_AGENT s'ils sont tous pris).
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:143.0) Gecko/20100101 Firefox/143.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0",
+]
+DEFAULT_USER_AGENT = USER_AGENTS[0]
 # Commande affichée dans les messages : le lanceur (./wm ou wm) la précise.
 CMD = os.environ.get("WM_CMD") or "python wikimasters.py"
 
@@ -465,13 +482,15 @@ def check_config(cfg):
     if not isinstance(relist, dict):
         err("sell.relist : section manquante ou mal écrite")
     else:
-        unknown_keys(relist, "sell.relist", ("enabled", "factor", "min_start_price", "max_attempts", "first"))
+        unknown_keys(relist, "sell.relist", ("enabled", "factor", "min_start_price", "stop_below", "max_attempts",
+                                             "first"))
         boolean(relist, "sell.relist", "enabled")
         boolean(relist, "sell.relist", "first")
         number(relist, "sell.relist", "factor", 0, strict=True)
         if _is_number(relist.get("factor")) and relist["factor"] > 1:
             err("sell.relist.factor doit être <= 1 (une relance ne se fait pas plus cher)")
         number(relist, "sell.relist", "min_start_price", 1, integer=True)
+        number(relist, "sell.relist", "stop_below", 1, integer=True, allow_none=True)
         number(relist, "sell.relist", "max_attempts", 1, integer=True)
     night = sell.get("night")
     if night is not None and not isinstance(night, dict):
@@ -509,7 +528,8 @@ def check_config(cfg):
     number(packs, "packs", "max_per_run", 0, integer=True)
     number(packs, "packs", "delay_seconds", 0)
 
-    buy = section("buy", ("keywords", "tag", "keyword_tags", "names", "names_tags", "names_minutes", "price_factor",
+    buy = section("buy", ("keywords", "tag", "keyword_tags", "names", "names_file", "names_tags", "names_minutes",
+                          "ignore_market_limit", "price_factor",
                           "max_price", "buy_unknown", "skip_owned", "snipe_seconds", "last_check_seconds",
                           "bid_on_sight", "exclude", "scan_minutes", "accounts", "by_account"))
     str_list(buy, "buy", "exclude")
@@ -523,6 +543,9 @@ def check_config(cfg):
             unknown_keys(over, f"buy.by_account.{account}", BY_ACCOUNT_KEYS)
     keywords = str_list(buy, "buy", "keywords")
     names = str_list(buy, "buy", "names")
+    if buy.get("names_file") is not None and (not isinstance(buy["names_file"], str) or not buy["names_file"].strip()):
+        err("buy.names_file doit être un nom de fichier, ex. \"joueurs_a_acheter.txt\" (ou null)")
+    searching = bool(keywords or names or buy.get("names_file"))  # achats actifs : buy.tag doit protéger
     number(buy, "buy", "names_minutes", 1)
     if buy.get("accounts") is not None:
         str_list(buy, "buy", "accounts", allow_empty=False)
@@ -536,10 +559,11 @@ def check_config(cfg):
             and buy["last_check_seconds"] >= buy["snipe_seconds"]:
         err("buy.last_check_seconds doit être plus petit que buy.snipe_seconds (la vérification suit la mise)")
     boolean(buy, "buy", "bid_on_sight")
+    boolean(buy, "buy", "ignore_market_limit")
     number(buy, "buy", "scan_minutes", 1)
     if buy.get("tag") is not None and (not isinstance(buy["tag"], str) or not buy["tag"].strip()):
         err("buy.tag doit être un texte (ou null)")
-    elif (keywords or names) and norm(buy.get("tag") or "") not in {norm(t) for t in prot_tags}:
+    elif searching and norm(buy.get("tag") or "") not in {norm(t) for t in prot_tags}:
         # Sans elle, « analyser » mettrait en vente ou défausserait les cartes que le script vient d'acheter.
         err("buy.tag doit être une étiquette de protection.tags (ex. « garder ») : elle protège les cartes achetées")
     protecting = {norm(t) for t in prot_tags}
@@ -1184,7 +1208,7 @@ def _json_body(resp):
 
 
 class WikiMastersClient:
-    def __init__(self, site_cfg, store, session=None, page_delay=0):
+    def __init__(self, site_cfg, store, session=None, page_delay=0, user_agent=None):
         self.base_url = site_cfg["base_url"].rstrip("/")
         self.supabase_url = site_cfg["supabase_url"].rstrip("/")
         self.anon_key = site_cfg["supabase_anon_key"]
@@ -1192,7 +1216,7 @@ class WikiMastersClient:
         self.store = store
         self.page_delay = page_delay
         self.http = requests.Session()
-        self.http.headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+        self.http.headers["User-Agent"] = user_agent or DEFAULT_USER_AGENT
         self.http.headers["Accept"] = "application/json"
         self.session_lost = None  # raison si la session ne peut plus être utilisée
         self.slowdown = 1.0  # multiplie toutes les pauses après une erreur du serveur
@@ -2074,7 +2098,8 @@ class SharedMarket(SharedFile):
     Chaque compte inscrit ici ses actions sur le marché (safety.market_limit vaut pour tous ensemble) et sa pause
     anti-robot : les autres s'arrêtent aussi. Désactivé par défaut : le 16/10/2026, 7 blocages sur 8 touchaient les deux
     comptes à quelques minutes d'écart, mais leurs pauses étaient synchronisées (reprise ensemble à la fin de la nuit) ;
-    le 17/10, un compte bloqué sur un booster n'empêchait pas l'autre d'ouvrir et de miser 7 s plus tard.
+    le 17/10, un compte bloqué sur un booster n'empêchait pas l'autre d'ouvrir et de miser 7 s plus tard ; le 21/10,
+    les deux étaient bloqués à 55 s d'écart après 22 actions en 20 min à eux deux.
     """
 
     RISK = "chaque compte compte seul ses actions sur le marché et sa pause anti-robot"
@@ -2095,9 +2120,13 @@ class SharedMarket(SharedFile):
             data["actions"] = sorted(kept + [[t, self.account, t in bids] for t in times], key=lambda e: e[0])
         self._change(change)
 
+    def pause(self):
+        """Pause commune en cours : {"until", "at" (premier blocage), "strikes", "account"}, ou None."""
+        pause = as_dict(self._read().get("pause"))
+        return pause if _is_number(pause.get("until")) and pause["until"] > time.time() else None
+
     def pause_until(self):
-        until = as_dict(self._read().get("pause")).get("until")
-        return until if _is_number(until) and until > time.time() else None
+        return (self.pause() or {}).get("until")
 
     def strike(self, local):
         """Un compte est bloqué : pause commune, plus longue à chaque blocage depuis la dernière action acceptée.
@@ -2108,7 +2137,7 @@ class SharedMarket(SharedFile):
             if _is_number(pause.get("until")) and pause["until"] > now and strikes:
                 return pause["until"], strikes  # déjà en pause (un autre compte bloqué au même moment) : on s'y range
             until = now + ANTIBOT_PAUSES[min(strikes, len(ANTIBOT_PAUSES) - 1)]
-            data["pause"] = {"until": until, "strikes": strikes + 1, "account": self.account}
+            data["pause"] = {"until": until, "strikes": strikes + 1, "account": self.account, "at": now}
             return until, strikes + 1
         return self._change(change)
 
@@ -2124,6 +2153,64 @@ class SharedMarket(SharedFile):
             else:
                 data.pop("pause", None)
         self._change(change)
+
+
+class NamesFile:
+    """buy.names_file : cartes cherchées par leur nom sur le marché, une par ligne (lignes vides et « # … » ignorées).
+
+    Un nom est retiré du fichier dès que sa carte est achetée ou arrive dans la collection d'un de vos comptes : on ne
+    cherche plus ce qu'on a déjà (chaque recherche prend parfois 30 s). La protection des cartes que vous avez (auto_tags)
+    ne dépend pas de ce fichier.
+    """
+
+    def __init__(self, path):
+        self.path = pathlib.Path(path)
+
+    def names(self):
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            sys.exit(f"buy.names_file : {self.path} introuvable. Créez-le (un nom par ligne) ou retirez ce réglage de "
+                     f"{PERSO_FILE}.")
+        except (OSError, UnicodeDecodeError) as e:
+            sys.exit(f"buy.names_file : {self.path} illisible ({type(e).__name__}).")
+        return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+
+    def remove(self, titles):
+        """Retire les noms présents (en mots entiers) dans ces titres de cartes ; retourne ceux retirés."""
+        texts = [norm(t) for t in titles if t]
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return []
+        kept, removed = [], []
+        for line in lines:
+            name = line.strip()
+            if name and not name.startswith("#") and any(found_in(name, text, whole=True) for text in texts):
+                removed.append(name)
+            else:
+                kept.append(line)
+        if removed:
+            try:
+                fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.stem}.", suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write("\n".join(kept) + "\n")
+                os.replace(tmp, self.path)
+            except OSError as e:
+                print(f"Attention : {self.path.name} non modifié ({type(e).__name__}).")
+                return []
+        return removed
+
+
+def drop_names(ctx, titles, why):
+    """Ces cartes sont à nous : leurs noms sortent de buy.names_file et des recherches en cours (pas en simulation)."""
+    if not (ctx.names_file and ctx.execute):
+        return
+    removed = ctx.names_file.remove(titles)
+    if removed:
+        names = ctx.cfg["buy"]["names"]
+        names[:] = [n for n in names if n not in removed]  # même liste que celle des achats (Sniper.buy)
+        print(f"  {len(removed)} nom(s) retiré(s) de {ctx.names_file.path.name} ({why}) : {', '.join(removed)}")
 
 
 @dataclass
@@ -2151,7 +2238,8 @@ class Context:
     collection: list = field(default_factory=list)  # ces mêmes exemplaires (Card)
     on_sale: set = field(default_factory=set)  # exemplaires dont l'enchère est confirmée en cours
     # Vérification anti-robot demandée par le site : groupe d'actions -> {"until": fin de la pause, "strikes": n}.
-    # Gardé d'un cycle de --loop à l'autre ; relancer le script la lève (après une vérification faite à la main).
+    # Gardé d'un cycle de --loop à l'autre ; relancer le script la lève (après une vérification faite à la main), une
+    # réponse « ok » au bot Telegram aussi (unblock_by_reply).
     antibot: dict = field(default_factory=dict)
     purchases: object = None  # PurchaseState : enchères du marché où le script a misé
     sniper: object = None  # Sniper, quand les achats sont actifs (« acheter », ou « tout --loop » avec buy.keywords)
@@ -2165,8 +2253,15 @@ class Context:
     pack_events: list = field(default_factory=list)  # (moment, ouvert ?) : boosters ouverts / bloqués (anti-robot)
     packs_tried_at: float = 0.0  # dernier essai d'ouverture de boosters (packs.every_minutes)
     next_top_up: float = 0.0  # prochaine vérification des places d'enchère pendant les défausses (top_up_sales)
+    names_file: object = None  # NamesFile (buy.names_file) : noms à chercher, retirés une fois la carte à nous
+    top_up: object = None  # pendant « tout », sur un compte qui vend : remplit une place libérée (top_up_sales)
+    topping_up: bool = False
     shared: object = None  # SharedMarket : limite et pause anti-robot communes à vos comptes (safety.shared_market)
     others_buy: bool = False  # un autre de vos comptes achète, sur le même marché commun (places gardées, BID_RESERVE)
+    telegram: object = None  # réglages Telegram : une réponse « ok » lève la pause anti-robot (unblock_by_reply)
+    accounts: list = field(default_factory=list)  # vos comptes enregistrés : « ok <compte> » ne lève que sa pause
+    replies_read_at: float = 0.0  # dernière lecture des réponses Telegram (REPLY_POLL_SECONDS)
+    resume_now: bool = False  # pause levée par une réponse : le passage suivant de --loop a lieu tout de suite
 
 
 # --- Commandes --------------------------------------------------------------
@@ -2202,6 +2297,7 @@ def clock_time(timestamp):
 def antibot_until(ctx, kind):
     """Fin de la pause anti-robot de ce type d'action, ou None s'il n'est pas en pause."""
     group = ANTIBOT_GROUPS[kind]
+    unblock_by_reply(ctx)
     entry = ctx.antibot.get(group) or {}
     until = entry.get("until") or 0
     if group == MARKET_GROUP and ctx.shared and not entry.get("local"):
@@ -2311,6 +2407,7 @@ def antibot_strike(ctx, kind):
         entry["until"] = time.time() + ANTIBOT_PAUSES[min(entry["strikes"], len(ANTIBOT_PAUSES) - 1)]
         entry["strikes"] += 1
         entry["local"] = True
+    entry["at"] = time.time()  # seules les réponses Telegram envoyées après ce moment lèvent la pause
     ctx.summary["paused"][group] = entry["until"]
     everyone = " pour tous vos comptes" if shared else ""
     print(f"     Le site demande une vérification anti-robot : {group} en pause jusqu'à {clock_time(entry['until'])}"
@@ -2319,17 +2416,75 @@ def antibot_strike(ctx, kind):
     if ctx.notify:
         # Le blocage ne se lève souvent pas tout seul (vu le 16/10/2026 : encore là au matin, 7 h plus tard).
         again = f" ({entry['strikes']}e fois de suite)" if entry["strikes"] > 1 else ""
+        reply = (f" Une fois fait, répondez « ok » ici (ou « ok {ctx.client.username} » pour ce compte seul) : le "
+                 "script reprend dans la minute." if ctx.telegram else "")
         ctx.notify(f"🛑 {group.capitalize()} bloqués : le site demande une vérification anti-robot{again}. Il faut la "
                    f"passer à la main, souvent ça ne repart pas tout seul : sur wiki-masters.com avec ce compte, "
-                   f"faites une action (mise ou mise en vente) et validez la vérification. Le script réessaie à "
-                   f"{clock_time(entry['until'])} ; les défausses continuent.")
+                   f"faites une action (mise ou mise en vente) et validez la vérification.{reply} Sinon le script "
+                   f"réessaie à {clock_time(entry['until'])} ; les défausses continuent.")
 
 
-def read_values(client, cards, cfg, cache, since=0, quiet=False):
+def paused_groups(ctx):
+    """Pauses anti-robot en cours : groupe -> {"until", "at"…}, dont la pause commune à vos comptes
+    (safety.shared_market), même posée par un autre compte."""
+    now, paused = time.time(), {}
+    for group, entry in ctx.antibot.items():
+        if group == MARKET_GROUP and ctx.shared and not entry.get("local"):
+            continue  # commune : lue dans le fichier, un autre compte l'a peut-être levée
+        if (entry.get("until") or 0) > now:
+            paused[group] = entry
+    shared = ctx.shared.pause() if ctx.shared and MARKET_GROUP not in paused else None
+    if shared:
+        paused[MARKET_GROUP] = shared
+    return paused
+
+
+def unblock_reply(text, username, accounts):
+    """Réponse Telegram qui lève la pause de ce compte : « ok » (ou « /ok », « c'est bon »…) pour tous vos comptes,
+    « ok <compte> » pour celui-là seulement."""
+    text = norm(text)
+    named = [a for a in accounts if norm(a) in text]
+    if named:
+        return any(norm(a) == norm(username) for a in named)
+    return bool(set(re.findall(r"\w+", text)) & UNBLOCK_WORDS)
+
+
+def unblock_by_reply(ctx):
+    """Vérification anti-robot passée à la main, puis « ok » répondu au bot Telegram : la pause est levée tout de suite
+    au lieu d'attendre sa fin (1 h, 2 h, 4 h…). Lu au plus toutes les REPLY_POLL_SECONDS, seulement pendant une pause.
+    Les blocages de suite restent comptés : si le site redemande la vérification, la pause suivante sera plus longue."""
+    now = time.time()
+    if not ctx.telegram or now < ctx.replies_read_at + REPLY_POLL_SECONDS:
+        return
+    paused = paused_groups(ctx)
+    if not paused:
+        return
+    ctx.replies_read_at = now
+    replies = [date for date, text in telegram_replies(ctx.telegram)
+               if unblock_reply(text, ctx.client.username, ctx.accounts)]
+    lifted = [group for group, entry in paused.items() if any(date >= entry.get("at", now) for date in replies)]
+    for group in lifted:
+        paused[group]["until"] = 0
+        ctx.summary["paused"].pop(group, None)
+        if group == MARKET_GROUP and ctx.shared and not paused[group].get("local"):
+            ctx.antibot.get(group, {})["until"] = 0
+            ctx.shared.clear(keep_strikes=True)  # pause commune : levée pour tous vos comptes
+    if lifted:
+        ctx.resume_now = True
+        names = ", ".join(lifted)
+        print(f"\n  Réponse reçue sur Telegram : pause anti-robot levée ({names}), reprise tout de suite.")
+        if ctx.notify:
+            ctx.notify(f"▶️ Reprise : {names} (pause anti-robot levée par votre réponse). Si le site redemande la "
+                       "vérification, vous serez prévenu.")
+
+
+def read_values(client, cards, cfg, cache, since=0, quiet=False, on_progress=None):
     """Prix moyen de chaque carte (par card_id) ; FAILED si illisible. Lecture seule.
 
     since : les prix lus avant ce moment sont relus sur le site (garde-fou avant une action irréversible).
     quiet : pas d'annonce ni de progression (petits lots).
+    on_progress : appelé après chaque prix lu sur le site (top_up_sales : une relecture de toute la collection prend
+    des heures, les places d'enchère libérées entre-temps sont remplies).
     """
     safety = cfg["safety"]
     values, failures_in_a_row = {}, 0
@@ -2365,6 +2520,8 @@ def read_values(client, cards, cfg, cache, since=0, quiet=False):
         finally:
             delay = safety["read_delay_seconds"]
             client.pause(random.uniform(delay * 0.8, delay * 1.5))
+            if on_progress:
+                on_progress()
     return values
 
 
@@ -2400,7 +2557,7 @@ def plan_analyse(ctx, cards):
             cleared += bool(stale)
             continue
         targets.append(card)
-    values = read_values(ctx.client, targets, cfg, ctx.cache)
+    values = read_values(ctx.client, targets, cfg, ctx.cache, on_progress=ctx.top_up)
     count_read_errors(targets, values, summary)
 
     spread = {}
@@ -2731,9 +2888,11 @@ def plan_sell(ctx, cards, tagged=None, top_up=False):
             summary["skip"].add(card.copy_id)
             print(f"  ignorée   {label(card, value)} : vaut moins de {sell['min_value']:g} (relancez analyser)")
             return None
-        if ctx.state.latest_for(card.copy_id, "abandoned"):
+        abandoned = ctx.state.latest_for(card.copy_id, "abandoned")
+        if abandoned:
             summary["skip"].add(card.copy_id)
-            print(f"  ignorée   {label(card, value)} : invendue {relist['max_attempts']} fois, on ne la remet plus en vente"
+            tries = abandoned[1].get("attempt") or relist["max_attempts"]
+            print(f"  ignorée   {label(card, value)} : invendue {tries} fois, on ne la remet plus en vente"
                   " (retirez-la de ventes.json pour réessayer)")
             return None
         cap = cfg["discard"]["unsold_max_value"]
@@ -2760,7 +2919,15 @@ def plan_sell(ctx, cards, tagged=None, top_up=False):
             ctx.state.set_status(auction_id, "abandoned")
             print(f"  ignorée   {label(card, value)} : invendue {attempt - 1} fois (sell.relist.max_attempts)")
             return None
-        return card, value, Offer(relist_price(entry["price"], value, sell), attempt, auction_id, duration)
+        price = relist_price(entry["price"], value, sell)
+        if relist.get("stop_below") and price < relist["stop_below"]:
+            # Vu le 21/10/2026 : 9 relances sous 8 wikibidous, 1 seule vendue (5), chacune une action sur le marché.
+            summary["skip"].add(card.copy_id)
+            ctx.state.set_status(auction_id, "abandoned")
+            print(f"  ignorée   {label(card, value)} : la relance partirait à {price}, moins de {relist['stop_below']} "
+                  "(sell.relist.stop_below) : on ne la remet plus en vente")
+            return None
+        return card, value, Offer(price, attempt, auction_id, duration)
 
     since = ctx.run_started if sell["fresh_price"] else 0
     if sell["order"] == "random":
@@ -2817,20 +2984,26 @@ def plan_sell(ctx, cards, tagged=None, top_up=False):
 TOP_UP_SECONDS = 60
 
 
-def top_up_sales(ctx, runner, cards):
-    """Une place d'enchère s'est libérée pendant une longue étape : une carte est remise en vente aussitôt."""
-    if not (ctx.execute and ctx.sells) or time.time() < ctx.next_top_up or ctx.summary["slots_unreadable"]:
+def top_up_sales(ctx, runner, pool):
+    """Une place d'enchère s'est libérée pendant une longue étape de « tout » (lecture des prix, étiquettes,
+    défausses) : une carte est remise en vente aussitôt. pool : {"cards": exemplaires de l'étape en cours}."""
+    if ctx.topping_up or not (ctx.execute and ctx.sells) or time.time() < ctx.next_top_up \
+            or ctx.summary["slots_unreadable"]:
         return
     ctx.next_top_up = time.time() + TOP_UP_SECONDS
     night = ctx.cfg["sell"].get("night")
     if at_night(time.time(), night) or antibot_until(ctx, "auction") or next_paced_sale(ctx) \
             or market_room(ctx, market_reserve(ctx)) <= 0 or not ctx.client.auction_slots():
         return
-    left = [c for c in cards if c.copy_id not in runner.consumed and c.copy_id not in runner.failed]
-    print("  -- place d'enchère libre pendant les défausses :")
-    steps = plan_sell(ctx, left, top_up=True)
-    if steps:
-        runner.run(steps)
+    ctx.topping_up = True  # ses propres lectures de prix et mises en vente ne le rappellent pas
+    try:
+        left = [c for c in pool["cards"] if c.copy_id not in runner.consumed and c.copy_id not in runner.failed]
+        print("  -- place d'enchère libre : mise en vente sans attendre la fin du passage")
+        steps = plan_sell(ctx, left, top_up=True)
+        if steps:
+            runner.run(steps)
+    finally:
+        ctx.topping_up = False
 
 
 def plan_discard(ctx, cards, tagged=None):
@@ -2868,7 +3041,8 @@ def plan_discard(ctx, cards, tagged=None):
     by_unsold = {}  # invendues retenues : exemplaire -> prix gardé (pour défausser les moins chères d'abord)
     if cap is not None:
         follow_returned_copies(ctx)  # une invendue revient sous un nouvel exemplaire (déjà fait par « tout »)
-        unsold = {e.get("copy_id") for status in ("unsold", "abandoned") for _, e in ctx.state.with_status(status)}
+        abandoned = {e.get("copy_id") for _, e in ctx.state.with_status("abandoned")}
+        unsold = abandoned | {e.get("copy_id") for _, e in ctx.state.with_status("unsold")}
         taken = {c.copy_id for c in candidates}
         # Étiquetées à vendre seulement : une invendue étiquetée « defausse » suit les règles de jour, ci-dessus.
         returned = [c for c in cards
@@ -2911,8 +3085,9 @@ def plan_discard(ctx, cards, tagged=None):
                 if value is None or value >= cap:
                     summary["skip"].add(card.copy_id)
                     worth = "jamais vendue" if value is None else f"vaut {value:g}"
+                    then = "gardée (plus de relance)" if card.copy_id in abandoned else "sera relancée"
                     print(f"  ignorée   {label(card, value)} : invendue, mais {worth} (pas moins de {cap:g}, "
-                          "discard.unsold_max_value) : sera relancée")
+                          f"discard.unsold_max_value) : {then}")
                     continue
                 steps.append((card, "discard", None, value))
                 continue
@@ -3012,6 +3187,8 @@ class Runner:
                 # Des mises en vente enchaînées en quelques secondes déclenchent la vérification anti-robot du site.
                 safety = self.cfg["safety"]
                 self.client.pause(safety["auction_delay_seconds"] if kind == "auction" else safety["delay_seconds"])
+                if self.ctx.top_up and kind in ("add_tag", "remove_tag"):  # des centaines d'étiquettes : 1 h parfois
+                    self.ctx.top_up()
         return True
 
     @staticmethod
@@ -3737,7 +3914,9 @@ class Sniper:
             self._finish(target)
         else:
             first = target.bid is None
-            free_at = market_wait(self.ctx, BID_RESERVE if first else 0, new_bid=first)
+            # buy.ignore_market_limit : les mises ne sont pas limitées (elles comptent quand même pour les boosters).
+            free_at = None if self.buy["ignore_market_limit"] \
+                else market_wait(self.ctx, BID_RESERVE if first else 0, new_bid=first)
             if free_at is not None:
                 # Limite de mises atteinte : une première mise attend qu'une place se libère (au plus tard
                 # buy.snipe_seconds avant la fin) ; sinon l'enchère est laissée.
@@ -3846,6 +4025,7 @@ class Sniper:
         if outcome == "sold" and auction.get("winner_id") == self.client.user_id:
             tags = ", ".join(f"« {t} »" for t in bought_tags(self.ctx, entry))
             self.say(f"ACHETÉE   {name} pour {final} wikibidous (étiquette {tags} au prochain tri)")
+            drop_names(self.ctx, [entry.get("name")], "achetée")
             self.ctx.journal.write("achat", entry.get("name", ""), entry.get("rarity", ""), "", entry.get("card_id", ""),
                                    entry.get("value"), price=final, auction_id=aid)
             status = "won"
@@ -3874,6 +4054,7 @@ def settle_vanished(ctx, all_cards):
         common = (entry.get("name", ""), entry.get("rarity", ""), "", entry.get("card_id", ""), entry.get("value"))
         if entry.get("card_id") in owned:
             print(f"  ACHETÉE   {name} : dans la collection (enchère retirée du site, notre dernière mise : {price})")
+            drop_names(ctx, [entry.get("name")], "achetée")
             ctx.journal.write("achat", *common, price=price, auction_id=aid, result="OK (déduit de la collection)")
             status = "won"
         else:
@@ -4009,6 +4190,7 @@ def run_command(ctx, command):
     if warning:
         print(f"Attention : {warning}")
     settle_vanished(ctx, cards)
+    drop_names(ctx, [c.name for c in cards], "déjà dans la collection")
     # Une ligne ×2, ×3… : on ne sait pas à quel exemplaire s'appliquent étiquettes et défausse, on n'y touche pas.
     all_cards = cards
     grouped = [c for c in cards if c.count > 1]
@@ -4045,8 +4227,12 @@ def run_command(ctx, command):
         "envoyer": [(f"Envoi de cartes à {ctx.recipient[0]}", send_cards)] if ctx.recipient else [],
         "tout": tout_phases(ctx),
     }[command]
+    pool = {"cards": cards}
+    if command == "tout":
+        ctx.top_up = lambda: top_up_sales(ctx, runner, pool)
     try:
         for n, (title, plan) in enumerate(phases):
+            pool["cards"] = cards
             print(f"\n== {title} ==")
             batches = plan(ctx, cards)
             if isinstance(batches, set):  # envois : faits par l'étape elle-même, ces exemplaires sont partis
@@ -4064,12 +4250,13 @@ def run_command(ctx, command):
                     if skipped:
                         print(f"  Étape(s) non lancée(s) pour cette raison : {', '.join(skipped)}.")
                     return
-                if long_step and command == "tout":  # défausses par lots : places d'enchère libérées remplies
-                    top_up_sales(ctx, runner, cards)
+                if long_step and ctx.top_up:  # défausses par lots : places d'enchère libérées remplies
+                    ctx.top_up()
             if not acted:
                 print("  rien à faire")
             cards = [c for c in cards if c.copy_id not in runner.consumed and c.copy_id not in runner.failed]
     finally:
+        ctx.top_up = None
         ctx.cache.save()  # même en dry-run : un --execute juste après ne relit pas tous les prix
         if ctx.execute:
             ctx.state.save()
@@ -4096,6 +4283,32 @@ def account_dir(cfg_file, name):
     """Dossier du compte : session, suivi des ventes et verrou (le nom est nettoyé pour le système de fichiers)."""
     safe = re.sub(r"[^\w.@-]", "_", name).strip("._") or "compte"
     return config_path(cfg_file, ACCOUNTS_DIR) / safe
+
+
+def _read_browser(folder):
+    try:
+        return (folder / BROWSER_FILE).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def account_user_agent(folder, save=True):
+    """Navigateur annoncé au site par ce compte : celui de navigateur.txt (modifiable à la main), sinon un navigateur
+    qu'aucun de vos autres comptes n'annonce, choisi d'après le nom du compte et enregistré (save) pour les lancements
+    suivants. Une simulation n'enregistre rien, mais annonce le même navigateur que le lancement --execute qui suit."""
+    agent = _read_browser(folder)
+    if agent:
+        return agent
+    others = [p for p in folder.parent.iterdir() if p.is_dir() and p != folder] if folder.parent.is_dir() else []
+    taken = {_read_browser(p) for p in others}
+    free = [a for a in USER_AGENTS if a not in taken]
+    agent = free[zlib.crc32(folder.name.encode()) % len(free)] if free else DEFAULT_USER_AGENT
+    if save:
+        try:
+            (folder / BROWSER_FILE).write_text(agent + "\n", encoding="utf-8")
+        except OSError:
+            pass  # pas enregistré : il sera choisi de nouveau au prochain lancement
+    return agent
 
 
 def known_accounts(cfg_file):
@@ -4211,7 +4424,7 @@ def cmd_login(cfg, cfg_file):
     except OSError as e:
         sys.exit(f"Impossible de créer {folder} ({type(e).__name__}).")
     store = SessionStore(folder / "session.json")
-    client = WikiMastersClient(cfg["site"], store, session=session)
+    client = WikiMastersClient(cfg["site"], store, session=session, user_agent=account_user_agent(folder))
     try:
         client.store.save(client.session)
     except SessionSaveError as e:
@@ -4382,6 +4595,41 @@ def send_telegram(settings, message):
         print(f"Telegram : message refusé (erreur {resp.status_code})")
 
 
+def telegram_replies(settings):
+    """Messages reçus par le bot dans telegram.chat_id : [(date, texte)] ; [] si illisibles. Ils ne sont pas marqués
+    comme lus : vos autres comptes lancés en même temps les voient aussi (Telegram les efface après 24 h)."""
+    url = f"https://api.telegram.org/bot{settings['bot_token']}/getUpdates"
+    try:
+        resp = requests.get(url, params={"timeout": 0}, timeout=10)
+        updates = resp.json().get("result") if resp.ok else None
+    except (requests.RequestException, ValueError, AttributeError):
+        return []  # jamais str(e) : l'URL contient le jeton
+    replies = []
+    for update in updates if isinstance(updates, list) else []:
+        message = update.get("message") if isinstance(update, dict) else None
+        if isinstance(message, dict) and str((message.get("chat") or {}).get("id")) == settings["chat_id"] \
+                and isinstance(message.get("text"), str) and _is_number(message.get("date")):
+            replies.append((message["date"], message["text"]))
+    return replies
+
+
+def loop_wait(ctx, seconds):
+    """Pause de --loop (achats compris). Pendant une pause anti-robot, les réponses Telegram sont lues chaque minute :
+    « ok » écourte cette attente, le passage suivant (ventes, boosters) a lieu aussitôt."""
+    wait, deadline, left = ctx.sniper.wait if ctx.sniper else time.sleep, time.time() + seconds, seconds
+    while left > 0:
+        if ctx.resume_now:  # levée pendant cette attente, ou pendant le passage (après ses ventes, peut-être)
+            ctx.resume_now = False
+            print("Pause anti-robot levée : passage suivant tout de suite.")
+            return
+        if not (ctx.telegram and paused_groups(ctx)):
+            wait(left)
+            return
+        wait(min(left, REPLY_POLL_SECONDS))
+        unblock_by_reply(ctx)
+        left = deadline - time.time()
+
+
 def loop_minutes(text):
     try:
         value = int(text)
@@ -4430,7 +4678,8 @@ def main():
     folder = account_dir(args.config, choose_account(args.config, args.compte))
     cfg = account_buy(cfg, args.config, folder.name)
     client = WikiMastersClient(cfg["site"], SessionStore(folder / "session.json"),
-                               page_delay=cfg["safety"]["read_delay_seconds"])
+                               page_delay=cfg["safety"]["read_delay_seconds"],
+                               user_agent=account_user_agent(folder, save=args.execute))
     telegram = telegram_settings(cfg)
     journal_cfg = cfg["journal"]
     ctx = Context(
@@ -4446,6 +4695,9 @@ def main():
         state=SalesState(folder / "ventes.json", set_aside=args.execute),
         purchases=PurchaseState(folder / "achats.json", set_aside=args.execute),
     )
+    if cfg["buy"].get("names_file"):
+        ctx.names_file = NamesFile(config_path(args.config, cfg["buy"]["names_file"]))
+        cfg["buy"]["names"] = list(dict.fromkeys(cfg["buy"]["names"] + ctx.names_file.names()))
     if args.command == "envoyer" or (args.command == "tout" and cfg["send"]["in_tout"]):
         ctx.recipient = send_recipient(cfg, args.config, folder.name, required=args.command == "envoyer")
     keywords = cfg["buy"]["keywords"] + cfg["buy"]["names"]
@@ -4504,6 +4756,8 @@ def main():
     alerts = telegram and (args.execute or telegram["notify_on_dry_run"])
     if alerts:
         ctx.notify = lambda text: send_telegram(telegram, telegram_alert(client.username, text))
+        if args.execute:  # « ok » répondu au bot après une vérification anti-robot passée à la main
+            ctx.telegram, ctx.accounts = telegram, known_accounts(args.config)
     outcome, cycle, reported = ("ok", None), 0, time.time()
     last_problem, report_day = None, None
     try:
@@ -4607,7 +4861,7 @@ def main():
                 print(f"\nProchain passage dans {args.loop} minute(s)… (Ctrl+C pour quitter)")
             deadline = time.time() + pause
             try:
-                (ctx.sniper.wait if ctx.sniper else time.sleep)(pause)
+                loop_wait(ctx, pause)
             except ApiError as e:  # session perdue pendant les achats (les autres erreurs n'arrêtent que la mise)
                 print(f"\nARRÊT : {e}")
                 print_summary(ctx.summary, args.execute)
