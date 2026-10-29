@@ -18,6 +18,7 @@ Sous Windows : wm à la place de ./wm. Sans le lanceur : python wikimasters.py �
 import argparse
 import base64
 import binascii
+import collections
 import csv
 import datetime
 import difflib
@@ -76,6 +77,21 @@ ANTIBOT_PAUSES = (3600, 7200, 14400, 28800)
 # après la vérification passée à la main sur le site, lève la pause sans attendre sa fin (unblock_by_reply).
 REPLY_POLL_SECONDS = 60
 UNBLOCK_WORDS = {"ok", "oki", "okay", "go", "fait", "bon", "reprise", "reprends", "debloque", "debloquer"}
+# Messages Telegram retirés de la file du bot après ce délai : elle n'en rend que 100, et vos comptes la lisent chaque
+# minute (ils les ont vus). Telegram les efface de toute façon après 24 h.
+TELEGRAM_FORGET_AFTER = 3 * 3600
+# Session perdue, avec Telegram et --loop : le script attend le cookie envoyé au bot, lu toutes les N secondes.
+LOGIN_POLL_SECONDS = 30
+# Cookie trop long pour un message Telegram (4096 caractères) : recollé d'au plus N messages. Un début de cookie
+# toujours illisible après N secondes est signalé (copie tronquée).
+COOKIE_MESSAGES, COOKIE_WAIT = 4, 120
+# « ajoute <nom> » sur Telegram : le nom est vérifié sur Wikipédia, dont les cartes sont les articles (titre exact).
+# Wikipédia demande un User-Agent qui dise qui l'appelle ; rien ne le relie à vos comptes du site.
+WIKI_API = "https://fr.wikipedia.org/w/api.php"
+WIKI_USER_AGENT = "wikimasters/1.0 (script personnel : vérifie les noms ajoutés depuis Telegram)"
+# Mise refusée pour solde insuffisant (52 fois du 24 au 29/10/2026, le compte à 0) : plus aucune mise de ce montant
+# ou plus pendant ce temps, sauf si un solde suffisant est lu entre-temps (défausse, mise acceptée).
+LOW_FUNDS_PAUSE = 1800
 ANTIBOT_CODE = "human_verification_required"
 ANTIBOT_HINT = ("Ouvrez wiki-masters.com dans votre navigateur avec ce compte et faites l'action à la main "
                 "(passez la vérification si elle s'affiche), puis relancez le script.")
@@ -122,6 +138,10 @@ ACCOUNTS_DIR = "comptes"
 CLAIMS_FILE = "achats_en_cours.json"
 # Dans ACCOUNTS_DIR : actions sur le marché et pause anti-robot communes à vos comptes (safety.shared_market).
 MARKET_FILE = "marche_commun.json"
+# Dans ACCOUNTS_DIR : messages Telegram qui ne nomment pas de compte (« aide »…), pour qu'un seul compte y réponde.
+TELEGRAM_FILE = "telegram.json"
+# Dans le dossier du compte : achat ou vente, choisi sur Telegram ou selon le solde (auto_switch).
+MODE_FILE = "mode.json"
 # Dans le dossier du compte : le navigateur (User-Agent) annoncé au site, le même à chaque lancement.
 BROWSER_FILE = "navigateur.txt"
 # Navigateurs tirés au premier lancement d'un compte, chaque compte le sien (DEFAULT_USER_AGENT s'ils sont tous pris).
@@ -341,7 +361,7 @@ def check_config(cfg):
 
     if isinstance(cfg, dict):
         unknown_keys(cfg, "", ("site", "protection", "price", "price_tags", "auto_tags", "discard", "sell", "packs",
-                               "buy", "send", "safety", "journal", "display", "telegram"))
+                               "buy", "auto_switch", "send", "safety", "journal", "display", "telegram"))
 
     site_keys = ("base_url", "supabase_url", "supabase_anon_key")
     site = section("site", site_keys)
@@ -653,6 +673,15 @@ def check_config(cfg):
     number(safety, "safety", "read_delay_seconds", 0)
     number(safety, "safety", "max_consecutive_errors", 1, integer=True)
     number(safety, "safety", "max_consecutive_read_failures", 1, integer=True)
+
+    switch = section("auto_switch", ("accounts", "sell_below", "buy_above"))
+    str_list(switch, "auto_switch", "accounts")
+    number(switch, "auto_switch", "sell_below", 0)
+    number(switch, "auto_switch", "buy_above", 0)
+    if _is_number(switch.get("sell_below")) and _is_number(switch.get("buy_above")) \
+            and switch["buy_above"] <= switch["sell_below"]:
+        err("auto_switch.buy_above doit être plus grand que auto_switch.sell_below (sinon le compte changerait de "
+            "mode à chaque passage)")
 
     display = cfg.get("display", {})
     if isinstance(display, dict):
@@ -1330,6 +1359,30 @@ class WikiMastersClient:
                            fatal=True) from None
         except (ValueError, KeyError, TypeError):
             raise ApiError("réponse de renouvellement de session inattendue", fatal=True) from None
+
+    def adopt_login(self, session):
+        """Session tirée d'un cookie envoyé sur Telegram : elle remplace la session perdue (ou en cours), une fois
+        acceptée par le site. ValueError si c'est le cookie d'un autre compte ou s'il est inutilisable, ApiError si le
+        site la refuse (l'ancienne est alors gardée si elle marchait), SessionSaveError si l'écriture échoue."""
+        try:
+            claims, _ = self._session_expiry(session)
+        except (KeyError, TypeError):
+            raise ValueError("session inutilisable") from None
+        if claims["sub"] != self.user_id:
+            raise ValueError(f"c'est le cookie du compte {account_name(claims)}")
+        previous, lost = self.session, self.session_lost
+        # Écrite d'abord : sinon refresh() reprendrait celle de session.json (_adopt_saved_session).
+        self._use_session(session)
+        self.session_lost, self._last_refresh = None, None
+        try:
+            self.auction_slots()  # le site accepte-t-il cette session ? (renouvelée au passage si besoin)
+        except ApiError:
+            if lost:
+                self.session_lost = self.session_lost or lost
+            else:  # l'ancienne marchait : on la garde
+                self._use_session(previous)
+                self.session_lost = None
+            raise
 
     def ensure_fresh(self):
         if self.session_lost:
@@ -2161,24 +2214,69 @@ class NamesFile:
     Un nom est retiré du fichier dès que sa carte est achetée ou arrive dans la collection d'un de vos comptes : on ne
     cherche plus ce qu'on a déjà (chaque recherche prend parfois 30 s). La protection des cartes que vous avez (auto_tags)
     ne dépend pas de ce fichier.
+
+    Une ligne « [twitch] » (ou « [rap, garder] ») donne ces étiquettes aux noms qui la suivent, jusqu'à la suivante, à
+    la place de buy.names_tags : les noms placés avant la première section reçoivent buy.names_tags.
     """
+
+    SECTION = re.compile(r"\[(.*)\]")
 
     def __init__(self, path):
         self.path = pathlib.Path(path)
+        self.mtime = None  # date du fichier à la dernière lecture (reload_names)
 
-    def names(self):
+    def entries(self, quit=True):
+        """[(nom, étiquettes de sa section, [] hors section)], dans l'ordre du fichier. Illisible : arrêt du script
+        (quit), sinon None."""
         try:
+            self.mtime = self.path.stat().st_mtime
             lines = self.path.read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
-            sys.exit(f"buy.names_file : {self.path} introuvable. Créez-le (un nom par ligne) ou retirez ce réglage de "
-                     f"{PERSO_FILE}.")
+            if not quit:
+                return None
+            sys.exit(f"buy.names_file : {self.path} introuvable. Copiez joueurs_a_acheter.exemple.txt sous ce nom (un "
+                     f"nom par ligne), ou retirez ce réglage de {PERSO_FILE}.")
         except (OSError, UnicodeDecodeError) as e:
+            if not quit:
+                return None
             sys.exit(f"buy.names_file : {self.path} illisible ({type(e).__name__}).")
-        return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+        found, tags = [], []
+        for line in (line.strip() for line in lines):
+            if not line or line.startswith("#"):
+                continue
+            section = self.SECTION.fullmatch(line)
+            if section:
+                tags = self._tags(section)
+            else:
+                found.append((line, tags))
+        return found
 
-    def remove(self, titles):
-        """Retire les noms présents (en mots entiers) dans ces titres de cartes ; retourne ceux retirés."""
-        texts = [norm(t) for t in titles if t]
+    @staticmethod
+    def _tags(section):
+        return [t.strip() for t in section.group(1).split(",") if t.strip()]
+
+    def sections(self):
+        """Étiquettes de chaque section du fichier, dans l'ordre : [["lyon", "OL"], ["twitch"], …]."""
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return []
+        return [self._tags(m) for m in (self.SECTION.fullmatch(line.strip()) for line in lines) if m]
+
+    def _write(self, lines):
+        """Écriture atomique ; False (et un message) si elle échoue."""
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.stem}.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            os.replace(tmp, self.path)
+        except OSError as e:
+            print(f"Attention : {self.path.name} non modifié ({type(e).__name__}).")
+            return False
+        return True
+
+    def _drop_lines(self, wanted):
+        """Retire les lignes de nom pour lesquelles wanted(nom) est vrai ; retourne les noms retirés."""
         try:
             lines = self.path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError):
@@ -2186,20 +2284,91 @@ class NamesFile:
         kept, removed = [], []
         for line in lines:
             name = line.strip()
-            if name and not name.startswith("#") and any(found_in(name, text, whole=True) for text in texts):
+            if name and not name.startswith("#") and not self.SECTION.fullmatch(name) and wanted(name):
                 removed.append(name)
             else:
                 kept.append(line)
-        if removed:
-            try:
-                fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.stem}.", suffix=".tmp")
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write("\n".join(kept) + "\n")
-                os.replace(tmp, self.path)
-            except OSError as e:
-                print(f"Attention : {self.path.name} non modifié ({type(e).__name__}).")
-                return []
-        return removed
+        return removed if removed and self._write(kept) else []
+
+    def remove(self, titles):
+        """Retire les noms dont l'un de ces titres est la carte : le nom lui-même, ou suivi d'une précision entre
+        parenthèses (« Jeffinho (football) »). Pas « Sélection naturelle (album de Kalash Criminel) » : la carte du
+        rappeur reste cherchée. Retourne les noms retirés."""
+        texts = [norm(t) for t in titles if t]
+        return self._drop_lines(lambda name: any(is_card_of(name, text) for text in texts))
+
+    def drop(self, name):
+        """« retire » sur Telegram : retire ce nom, écrit avec ou sans sa précision (« Jul » retire « Jul (rappeur) »).
+        Retourne les noms retirés."""
+        return self._drop_lines(lambda line: is_card_of(name, norm(line)))
+
+    def add(self, name, tags):
+        """« ajoute » sur Telegram : ajoute name à la fin de la section de ces étiquettes (créée à la fin du fichier
+        s'il n'y en a pas). False si l'écriture échoue."""
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return False
+        wanted, start = {norm(t) for t in tags}, None
+        for i, line in enumerate(lines):
+            section = self.SECTION.fullmatch(line.strip())
+            if section and start is None and {norm(t) for t in self._tags(section)} == wanted:
+                start = i
+            elif section and start is not None:
+                end = i
+                break
+        else:
+            end = len(lines)
+        if start is None:
+            while lines and not lines[-1].strip():
+                lines.pop()
+            return self._write(lines + ["", f"[{', '.join(tags)}]", name])
+        last = max((i for i in range(start, end) if lines[i].strip()), default=start)  # avant les lignes vides
+        return self._write(lines[:last + 1] + [name] + lines[last + 1:])
+
+
+def is_card_of(name, text):
+    """text (titre normalisé) est-il la carte de ce nom : le nom lui-même, ou suivi d'une précision entre parenthèses
+    (« Jeffinho (football) ») ?"""
+    return text == norm(name) or text.startswith(norm(name) + " (")
+
+
+def load_names(ctx, quit=False):
+    """Noms à chercher : buy.names (réglages), puis ceux de buy.names_file, avec les étiquettes de leur section. Au
+    lancement (quit), une étiquette de section absente de protection.tags arrête le script ; ensuite (fichier modifié
+    en route), ses noms sont seulement laissés de côté. Retourne les noms qui n'étaient pas encore cherchés."""
+    entries = ctx.names_file.entries(quit=quit)
+    if entries is None:
+        return []
+    protecting = {norm(t) for t in ctx.cfg["protection"]["tags"]}
+    unknown = sorted({t for _, tags in entries for t in tags if norm(t) not in protecting})
+    if unknown:
+        problem = (f"buy.names_file : {ctx.names_file.path.name} donne les étiquettes {', '.join(unknown)}, absentes "
+                   f"de protection.tags. Ajoutez-les dans {PERSO_FILE} : elles protègent les cartes achetées.")
+        if quit:
+            sys.exit(problem)
+        print(f"Attention : {problem} Leurs noms ne sont pas cherchés.")
+        entries = [(n, tags) for n, tags in entries if all(norm(t) in protecting for t in tags)]
+    buy, before = ctx.cfg["buy"], set(ctx.cfg["buy"]["names"])
+    buy["names"] = list(dict.fromkeys(ctx.cfg_names + [name for name, _ in entries]))
+    buy["name_tags"] = {norm(name): tags for name, tags in entries if tags}
+    return [name for name in buy["names"] if name not in before]
+
+
+def reload_names(ctx):
+    """buy.names_file relu s'il a changé (« ajoute » sur Telegram, ou modifié à la main) : un nom nouveau est cherché
+    dès la prochaine relecture du marché, sans attendre son tour (buy.names_minutes)."""
+    names_file = ctx.names_file
+    try:
+        if not names_file or names_file.path.stat().st_mtime == names_file.mtime:
+            return
+    except OSError:
+        return
+    new = load_names(ctx)
+    if new:
+        print(f"  {len(new)} nom(s) ajouté(s) à {names_file.path.name} : {', '.join(new)}")
+        if ctx.sniper:
+            ctx.sniper.search_soon(new)
 
 
 def drop_names(ctx, titles, why):
@@ -2261,7 +2430,24 @@ class Context:
     telegram: object = None  # réglages Telegram : une réponse « ok » lève la pause anti-robot (unblock_by_reply)
     accounts: list = field(default_factory=list)  # vos comptes enregistrés : « ok <compte> » ne lève que sa pause
     replies_read_at: float = 0.0  # dernière lecture des réponses Telegram (REPLY_POLL_SECONDS)
-    resume_now: bool = False  # pause levée par une réponse : le passage suivant de --loop a lieu tout de suite
+    # Raison d'avancer le passage suivant de --loop (pause levée, mode changé… sur Telegram), sinon "".
+    resume_now: str = ""
+    # Rôle du compte d'après les réglages (sell.accounts, buy.accounts) ; mode.json le remplace (apply_mode).
+    cfg_sells: bool = True
+    cfg_buys: bool = False
+    can_buy: bool = False  # les achats peuvent tourner (« tout --loop » ou « acheter », avec buy.keywords)
+    mode: object = None  # AccountMode : comptes/<compte>/mode.json
+    looping: bool = False  # --loop : une session perdue peut être reprise par un cookie envoyé sur Telegram
+    balance: float = None  # dernier solde lu dans une réponse du site (mise, défausse), et son heure
+    balance_at: float = 0.0
+    short_of: dict = None  # {"amount", "at"} : mise refusée pour solde insuffisant (LOW_FUNDS_PAUSE)
+    user_paused: bool = False  # « pause » sur Telegram : plus aucune action sur le site jusqu'à « reprise »
+    tg_since: float = 0.0  # commandes Telegram envoyées depuis ce moment (lancement du script)
+    tg_polled_at: float = 0.0  # dernière lecture des commandes Telegram (REPLY_POLL_SECONDS)
+    tg_handled: set = field(default_factory=set)  # messages Telegram déjà traités (update_id)
+    tg_cookies: set = field(default_factory=set)  # messages déjà recollés en cookie (update_id)
+    tg_claims: object = None  # TelegramClaims : un seul compte répond à « aide »
+    cfg_names: list = field(default_factory=list)  # buy.names des réglages, avant ceux de buy.names_file
 
 
 # --- Commandes --------------------------------------------------------------
@@ -2441,27 +2627,29 @@ def paused_groups(ctx):
 
 def unblock_reply(text, username, accounts):
     """Réponse Telegram qui lève la pause de ce compte : « ok » (ou « /ok », « c'est bon »…) pour tous vos comptes,
-    « ok <compte> » pour celui-là seulement."""
+    « ok <compte> » pour celui-là seulement. Nommer le compte sans mot de reprise (« etat <compte> ») ne lève rien."""
     text = norm(text)
+    if "auth-token" in text or not set(re.findall(r"\w+", text)) & UNBLOCK_WORDS:
+        return False  # un cookie collé peut contenir « ok » ou « go » par hasard
     named = [a for a in accounts if norm(a) in text]
-    if named:
-        return any(norm(a) == norm(username) for a in named)
-    return bool(set(re.findall(r"\w+", text)) & UNBLOCK_WORDS)
+    return not named or any(norm(a) == norm(username) for a in named)
 
 
-def unblock_by_reply(ctx):
+def unblock_by_reply(ctx, replies=None):
     """Vérification anti-robot passée à la main, puis « ok » répondu au bot Telegram : la pause est levée tout de suite
-    au lieu d'attendre sa fin (1 h, 2 h, 4 h…). Lu au plus toutes les REPLY_POLL_SECONDS, seulement pendant une pause.
-    Les blocages de suite restent comptés : si le site redemande la vérification, la pause suivante sera plus longue."""
+    au lieu d'attendre sa fin (1 h, 2 h, 4 h…). Lu au plus toutes les REPLY_POLL_SECONDS, seulement pendant une pause
+    (replies : [(date, texte)] déjà lus par telegram_poll). Les blocages de suite restent comptés : si le site redemande
+    la vérification, la pause suivante sera plus longue."""
     now = time.time()
-    if not ctx.telegram or now < ctx.replies_read_at + REPLY_POLL_SECONDS:
+    if replies is None and (not ctx.telegram or now < ctx.replies_read_at + REPLY_POLL_SECONDS):
         return
     paused = paused_groups(ctx)
     if not paused:
         return
-    ctx.replies_read_at = now
-    replies = [date for date, text in telegram_replies(ctx.telegram)
-               if unblock_reply(text, ctx.client.username, ctx.accounts)]
+    if replies is None:
+        ctx.replies_read_at = now
+        replies = telegram_replies(ctx.telegram)
+    replies = [date for date, text in replies if unblock_reply(text, ctx.client.username, ctx.accounts)]
     lifted = [group for group, entry in paused.items() if any(date >= entry.get("at", now) for date in replies)]
     for group in lifted:
         paused[group]["until"] = 0
@@ -2470,12 +2658,126 @@ def unblock_by_reply(ctx):
             ctx.antibot.get(group, {})["until"] = 0
             ctx.shared.clear(keep_strikes=True)  # pause commune : levée pour tous vos comptes
     if lifted:
-        ctx.resume_now = True
+        ctx.resume_now = "Pause anti-robot levée"
         names = ", ".join(lifted)
         print(f"\n  Réponse reçue sur Telegram : pause anti-robot levée ({names}), reprise tout de suite.")
         if ctx.notify:
             ctx.notify(f"▶️ Reprise : {names} (pause anti-robot levée par votre réponse). Si le site redemande la "
                        "vérification, vous serez prévenu.")
+
+
+# --- Mode achat / vente -----------------------------------------------------
+
+
+def note_balance(ctx, balance):
+    """Solde lu dans une réponse du site (mise acceptée, défausse) : pour auto_switch, « etat » sur Telegram, et pour
+    reprendre les mises refusées faute de solde dès qu'il suffit."""
+    if not _is_number(balance):
+        return
+    ctx.balance, ctx.balance_at = float(balance), time.time()
+    if ctx.short_of and balance >= ctx.short_of["amount"]:
+        ctx.short_of = None
+
+
+def journal_balance(journal):
+    """(dernier solde de ce compte dans le journal, son heure), ou (None, 0) : auto_switch en tient compte dès le
+    lancement."""
+    found = None
+    try:
+        with open(journal.path, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f, delimiter=journal.delimiter):
+                if row.get("compte") == journal.account and _is_price(row.get("solde")):
+                    found = row
+    except OSError:
+        return None, 0.0
+    if not found:
+        return None, 0.0
+    try:
+        at = time.mktime(time.strptime(found["date"], "%Y-%m-%d %H:%M:%S"))
+    except (TypeError, ValueError):
+        at = 0.0
+    return float(found["solde"]), at
+
+
+class AccountMode:
+    """comptes/<compte>/mode.json : « achat » ou « vente », choisi sur Telegram (manual) ou selon le solde
+    (auto_switch). Sans lui, le rôle du compte vient des réglages (sell.accounts, buy.accounts). Gardé en mémoire ; le
+    fichier sert au prochain lancement."""
+
+    def __init__(self, path):
+        self.path = pathlib.Path(path)
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        self.data = data if isinstance(data, dict) and data.get("mode") in ("achat", "vente") else {}
+
+    def write(self, mode, manual, why=""):
+        self.data = {"mode": mode, "manual": manual, "why": why, "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.stem}.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            print(f"Attention : {self.path.name} non enregistré ({type(e).__name__}) : le mode {mode} vaut jusqu'à "
+                  "l'arrêt du script seulement.")
+
+    def clear(self):
+        self.data = {}
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"Attention : {self.path.name} non supprimé ({type(e).__name__}) : il reviendra au prochain lancement.")
+
+
+def roles(ctx):
+    """(achète, vend) : d'après mode.json s'il y en a un, sinon d'après les réglages."""
+    mode = ctx.mode.data.get("mode") if ctx.mode else None
+    if mode is None:
+        return ctx.cfg_buys, ctx.cfg_sells
+    return mode == "achat", mode == "vente"
+
+
+def apply_mode(ctx):
+    """Applique le rôle du compte : mises en vente, et achats quand ils peuvent tourner (« tout --loop »)."""
+    buys, ctx.sells = roles(ctx)
+    sniper = ctx.sniper
+    if sniper and ctx.can_buy and buys != sniper.market:
+        (sniper.start_buying if buys else sniper.stop_buying)()
+
+
+def mode_text(ctx):
+    buys, sells = roles(ctx)
+    what = "ACHAT et VENTE" if buys and sells else "ACHAT" if buys else "VENTE" if sells else "ni achat ni vente"
+    data = ctx.mode.data if ctx.mode else {}
+    how = "choisi sur Telegram" if data.get("manual") else f"automatique : {data.get('why')}" if data else "réglages"
+    return f"{what} ({how})"
+
+
+def auto_switch(ctx):
+    """auto_switch : un compte qui achète passe en vente quand son solde descend sous sell_below, et revient aux achats
+    à partir de buy_above. Un mode choisi sur Telegram (« achat », « vente ») l'emporte, jusqu'à « auto »."""
+    rules, name = ctx.cfg["auto_switch"], ctx.client.username
+    if not ctx.mode or ctx.balance is None or not ctx.cfg_buys or ctx.mode.data.get("manual") \
+            or norm(name) not in {norm(a) for a in rules["accounts"]}:
+        return
+    balance, selling = ctx.balance, ctx.mode.data.get("mode") == "vente"
+    if not selling and balance < rules["sell_below"]:
+        ctx.mode.write("vente", manual=False, why=f"solde {balance:g} sous {rules['sell_below']:g}")
+        text = (f"💸 Solde {balance:g} (sous {rules['sell_below']:g}) : {name} passe en VENTE, il ne mise plus. Retour "
+                f"aux achats dès {rules['buy_above']:g}, ou avec « achat {name} ».")
+    elif selling and balance >= rules["buy_above"]:
+        ctx.mode.clear()
+        text = f"🛒 Solde {balance:g} (dès {rules['buy_above']:g}) : {name} repasse aux ACHATS."
+    else:
+        return
+    print(f"\n  {text}")
+    if ctx.notify:
+        ctx.notify(text)
+    apply_mode(ctx)
 
 
 def read_values(client, cards, cfg, cache, since=0, quiet=False, on_progress=None):
@@ -2821,7 +3123,9 @@ def plan_sell(ctx, cards, tagged=None, top_up=False):
         follow_returned_copies(ctx)
     if not ctx.sells:
         if tagged != "during":
-            print(f"  pas de mise en vente sur ce compte (sell.accounts : {', '.join(sell['accounts'])})")
+            why = f"mode {mode_text(ctx)}" if ctx.mode and ctx.mode.data \
+                else f"sell.accounts : {', '.join(sell['accounts'] or [])}"
+            print(f"  pas de mise en vente sur ce compte ({why})")
         return []
     # La nuit, presque personne n'achète : ni mise en vente ni relance, et aucune enchère ne doit s'y terminer.
     # Le bilan ci-dessus continue ; les invendus seront relancés au matin.
@@ -3222,6 +3526,7 @@ class Runner:
             balance = as_dict(self.client.discard(card)).get("balance")
             self.ctx.state.close_copy(card.copy_id, "gone")  # invendue défaussée la nuit : plus rien à relancer
             self._log(card, kind, arg, value, "OK", balance=balance)
+            note_balance(self.ctx, balance)
             return f"OK, solde : {'?' if balance is None else balance}"
         duration = arg.duration or self.cfg["sell"]["duration_minutes"]
         market_action(self.ctx)  # même refusée, elle compte peut-être pour le site
@@ -3533,6 +3838,9 @@ def send_cards(ctx, cards, tagged=None):
     return sent
 
 
+NO_MATCH = "mot-clé absent du titre et de la catégorie"  # annonce écartée par les achats (Sniper._reject)
+
+
 @dataclass
 class Target:
     """Enchère du marché suivie par les achats : mise à fin - buy.snipe_seconds (ou dès sight_at, voir
@@ -3572,6 +3880,8 @@ class Sniper:
         # card_id -> {auction_id: (annonce, fin)} : autres annonces d'une carte déjà suivie, reprises si elle est perdue
         self.spares = {}
         self.name_turn = 0  # prochain nom de buy.names à chercher
+        self.soon = []  # noms ajoutés en route (« ajoute » sur Telegram) : cherchés à la prochaine relecture
+        self.unmatched = set()  # annonces écartées faute de mot-clé ou de nom : revues si un nom est ajouté
         self.last_sight = 0.0  # buy.bid_on_sight : moment prévu de la dernière première mise
         self.results = {}  # auction_id -> moment de lire le résultat d'une enchère où le script a misé
         self.next_scan = 0.0
@@ -3616,7 +3926,42 @@ class Sniper:
             self.wait(max(0.0, due - time.time()), scan=False)
 
     def _paused(self):
-        return antibot_until(self.ctx, "bid") is not None
+        return self.ctx.user_paused or antibot_until(self.ctx, "bid") is not None
+
+    def stop_buying(self):
+        """Mode vente : plus de lecture du marché ni de mise, même sur les enchères déjà suivies (pas de surenchère).
+        Celles où le script a déjà misé attendent leur résultat : une carte gagnée doit recevoir sa protection."""
+        self.market = False
+        for target in list(self.targets.values()):
+            self._finish(target)
+        self.spares.clear()
+
+    def start_buying(self):
+        self.market, self.next_scan = True, 0.0  # relecture du marché tout de suite
+
+    def search_soon(self, names):
+        """Noms ajoutés en route (« ajoute » sur Telegram, fichier modifié) : cherchés à la prochaine relecture du
+        marché, sans attendre leur tour (buy.names_minutes)."""
+        self.soon += [name for name in names if name not in self.soon]
+        for aid in self.unmatched:  # écartées faute de nom : peut-être celui-ci
+            self.ignored.pop(aid, None)
+        self.unmatched.clear()
+
+    def _short_of_funds(self, amount):
+        """Mise refusée pour solde insuffisant : plus de mise de ce montant ou plus pendant LOW_FUNDS_PAUSE (sauf solde
+        suffisant lu entre-temps), au lieu d'enchaîner des mises que le site refuserait aussi."""
+        ctx, first = self.ctx, self.ctx.short_of is None
+        ctx.short_of = {"amount": min(amount, (ctx.short_of or {}).get("amount", amount)), "at": time.time()}
+        until = clock_time(ctx.short_of["at"] + LOW_FUNDS_PAUSE)
+        self.say(f"   solde insuffisant : plus de mise à {ctx.short_of['amount']} ou plus avant {until}")
+        if first and ctx.notify:
+            name = self.client.username
+            ctx.notify(f"💸 Solde insuffisant pour miser {amount} : plus de mise de ce montant ou plus avant {until}. "
+                       f"« vente {name} » pour le faire vendre en attendant.")
+
+    def _cannot_afford(self, need):
+        short = self.ctx.short_of
+        return short is not None and need >= short["amount"] and time.time() < short["at"] + LOW_FUNDS_PAUSE
 
     def _due(self, target):
         if target.stage == 0:
@@ -3707,6 +4052,7 @@ class Sniper:
         self.next_scan = now + self.buy["scan_minutes"] * 60
         horizon = now + 2 * self.buy["scan_minutes"] * 60 + self.buy["snipe_seconds"]
         self.ignored = {aid: end for aid, end in self.ignored.items() if end > now}
+        self.unmatched &= set(self.ignored)
         self.spares = {cid: kept for cid, spares in self.spares.items()
                        if (kept := {aid: v for aid, v in spares.items() if v[1] > now})}
         searches = [(keyword, horizon) for keyword in self.buy["keywords"]]
@@ -3716,6 +4062,8 @@ class Sniper:
             for _ in range(turn):  # ses annonces sont suivies jusqu'à son tour suivant
                 searches.append((names[self.name_turn % len(names)], horizon + self.buy["names_minutes"] * 60))
                 self.name_turn += 1
+        searches += [(name, horizon + self.buy["names_minutes"] * 60) for name in self.soon if name in names]
+        self.soon = []
         found = {}
         for query, until in searches:
             for page in range(1, MAX_SCAN_PAGES + 1):
@@ -3787,6 +4135,8 @@ class Sniper:
                 reason = self._taken(aid, end, take=self.ctx.execute)
         if reason:
             self.ignored[aid] = end
+            if reason == NO_MATCH:
+                self.unmatched.add(aid)  # reprise si un nom est ajouté en route (search_soon)
             if self.ctx.verbose or not quiet:
                 self.say(f"ignorée   {label(card, value)} : {reason}")
             return read
@@ -3814,7 +4164,7 @@ class Sniper:
                for _, e in self.ctx.purchases.with_status(status)):
             return "même carte déjà misée ou achetée"
         if not self._match(auction, info):
-            return "mot-clé absent du titre et de la catégorie"
+            return NO_MATCH
         excluded = next((x for x in self.buy["exclude"] if found_in(x, self._text(auction, info))), None)
         if excluded:
             return f"« {excluded} » dans le titre ou la catégorie (buy.exclude)"
@@ -3837,19 +4187,22 @@ class Sniper:
 
     def _tags_for(self, auction, info):
         """Étiquettes de protection de la carte gagnée : celles de buy.keyword_tags dont le texte est dans son titre ou
-        sa catégorie, celles de buy.names_tags si elle a été trouvée par son nom, sinon buy.tag."""
+        sa catégorie, celles de la section du nom qui l'a trouvée (« [twitch] » dans buy.names_file) ou sinon
+        buy.names_tags, et à défaut buy.tag."""
         text, tags = self._text(auction, info), []
         for key, value in (self.buy.get("keyword_tags") or {}).items():
             if found_in(key, text):
                 tags += text_list(value)
-        if any(found_in(name, text, whole=True) for name in self.buy["names"]):
-            tags += text_list(self.buy.get("names_tags")) or [self.buy["tag"]]
+        for name in self.buy["names"]:
+            if found_in(name, text, whole=True):
+                tags += (self.buy.get("name_tags") or {}).get(norm(name)) or text_list(self.buy.get("names_tags")) \
+                    or [self.buy["tag"]]
         return list({norm(t): t for t in tags or [self.buy["tag"]] if t}.values())  # sans doublon, dans l'ordre
 
     def _promote(self, card_id):
         """L'annonce suivie de cette carte est perdue (ou trop chère) : une autre de ses annonces est suivie à la place."""
-        if self._paused():
-            return  # plus aucune mise pendant la pause : elles restent de côté
+        if self._paused() or not self.market:
+            return  # plus aucune mise pendant la pause (elles restent de côté), ni en mode vente
         for aid, (auction, end) in sorted(self.spares.pop(card_id, {}).items(), key=lambda x: x[1][1]):
             if end > time.time() + LAST_CHECK_SECONDS + 2 and aid not in self.targets and aid not in self.ignored:
                 self._consider(auction, end)  # suivie, ou remise de côté si une autre vient d'être reprise
@@ -3912,6 +4265,11 @@ class Sniper:
             self.say(f"trop chère {label(target.card, target.value)} : mise minimale {need} > plafond "
                      f"{target.ceiling}, on laisse")
             self._finish(target)
+        elif self._cannot_afford(need):
+            short = self.ctx.short_of
+            self.say(f"laissée   {label(target.card, target.value)} : solde insuffisant (mise de {short['amount']} "
+                     f"refusée à {clock_time(short['at'])})")
+            self._finish(target)
         else:
             first = target.bid is None
             # buy.ignore_market_limit : les mises ne sont pas limitées (elles comptent quand même pour les boosters).
@@ -3966,12 +4324,15 @@ class Sniper:
                 self.say(f"   ÉCHEC : {e}")
                 if e.antibot:
                     self._stand_down()
+                elif e.code == "insufficient_balance":
+                    self._short_of_funds(amount)
                 return
         target.bid = amount
         ctx.purchases.record(target, amount)
         ctx.purchases.save()  # tout de suite : un plantage ne doit pas faire oublier une mise
         balance = response.get("bidder_balance")
         self._log(target, amount, "OK", balance)
+        note_balance(ctx, balance)
         ctx.summary["bid"] += 1
         antibot_cleared(ctx, "bid")
         self.say(f"   OK, solde : {'?' if balance is None else balance}")
@@ -4595,38 +4956,458 @@ def send_telegram(settings, message):
         print(f"Telegram : message refusé (erreur {resp.status_code})")
 
 
-def telegram_replies(settings):
-    """Messages reçus par le bot dans telegram.chat_id : [(date, texte)] ; [] si illisibles. Ils ne sont pas marqués
-    comme lus : vos autres comptes lancés en même temps les voient aussi (Telegram les efface après 24 h)."""
+def telegram_updates(settings):
+    """Messages reçus par le bot dans telegram.chat_id : [{"update_id", "message_id", "date", "text"}] ; [] si
+    illisibles. Ils ne sont pas marqués comme lus : vos autres comptes lancés en même temps les voient aussi (retirés
+    de la file après TELEGRAM_FORGET_AFTER, voir telegram_forget)."""
     url = f"https://api.telegram.org/bot{settings['bot_token']}/getUpdates"
     try:
         resp = requests.get(url, params={"timeout": 0}, timeout=10)
         updates = resp.json().get("result") if resp.ok else None
     except (requests.RequestException, ValueError, AttributeError):
         return []  # jamais str(e) : l'URL contient le jeton
-    replies = []
+    found = []
     for update in updates if isinstance(updates, list) else []:
         message = update.get("message") if isinstance(update, dict) else None
         if isinstance(message, dict) and str((message.get("chat") or {}).get("id")) == settings["chat_id"] \
                 and isinstance(message.get("text"), str) and _is_number(message.get("date")):
-            replies.append((message["date"], message["text"]))
-    return replies
+            found.append({"update_id": update.get("update_id"), "message_id": message.get("message_id"),
+                          "date": message["date"], "text": message["text"]})
+    return found
+
+
+def telegram_replies(settings):
+    """[(date, texte)] des messages reçus par le bot (voir telegram_updates)."""
+    return [(u["date"], u["text"]) for u in telegram_updates(settings)]
+
+
+def telegram_call(settings, method, **params):
+    """Autre appel à l'API du bot (effacer un message…). Un échec ne fait jamais échouer le passage."""
+    try:
+        requests.post(f"https://api.telegram.org/bot{settings['bot_token']}/{method}", json=params, timeout=10)
+    except requests.RequestException:
+        pass  # jamais str(e) : l'URL contient le jeton
+
+
+def telegram_forget(settings, updates):
+    """Retire de la file du bot les messages de plus de TELEGRAM_FORGET_AFTER : getUpdates n'en rend que 100."""
+    old = [u["update_id"] for u in updates
+           if _is_int(u["update_id"]) and u["date"] < time.time() - TELEGRAM_FORGET_AFTER]
+    if old:
+        telegram_call(settings, "getUpdates", offset=max(old) + 1, limit=1, timeout=0)
+
+
+def telegram_cookies(updates, project_ref):
+    """Sessions des cookies collés dans ces messages : [(session, messages)]. Un cookie trop long pour un seul message
+    Telegram (4096 caractères) arrive en plusieurs : ils sont recollés dans l'ordre (au plus COOKIE_MESSAGES)."""
+    ordered = sorted(updates, key=lambda u: (u["date"], u["update_id"]))
+    found, i = [], 0
+    while i < len(ordered):
+        start, i = i, i + 1
+        if "auth-token" not in ordered[start]["text"]:
+            continue
+        for end in range(start + 1, min(start + COOKIE_MESSAGES, len(ordered)) + 1):
+            raw = "".join(u["text"] for u in ordered[start:end])
+            try:
+                session = supabase_session(parse_cookie_header(normalize_cookie_header(raw)), project_ref)
+            except ValueError:
+                continue
+            found.append((session, ordered[start:end]))
+            i = end
+            break
+    return found
+
+
+class TelegramClaims(SharedFile):
+    """comptes/telegram.json : messages Telegram sans nom de compte (« aide »…) déjà pris par l'un de vos comptes
+    lancés en même temps, pour qu'un seul y réponde."""
+
+    KEEP = 300
+    RISK = "vos comptes peuvent répondre deux fois au même message"
+
+    def take(self, update_id):
+        def change(data):
+            done = [u for u in data.get("done") or [] if _is_int(u)]
+            if update_id in done:
+                return False
+            data["done"] = (done + [update_id])[-self.KEEP:]
+            return True
+
+        return self._change(change) is not False  # fichier inaccessible : on répond quand même
+
+
+TELEGRAM_VERBS = {
+    **dict.fromkeys(("aide", "help", "start", "commandes", "menu"), "aide"),
+    **dict.fromkeys(("etat", "statut", "status", "solde", "infos"), "etat"),
+    **dict.fromkeys(("achat", "achats", "acheter"), "achat"),
+    **dict.fromkeys(("vente", "ventes", "vendre"), "vente"),
+    "auto": "auto",
+    **dict.fromkeys(("pause", "stop"), "pause"),
+    **dict.fromkeys(("reprise", "reprends", "reprendre"), "reprise"),
+    "bilan": "bilan",
+    **dict.fromkeys(("login", "cookie", "connexion", "reconnexion"), "login"),
+    **dict.fromkeys(("ajoute", "ajouter", "add"), "ajoute"),
+    **dict.fromkeys(("retire", "retirer", "enleve", "supprime"), "retire"),
+    **dict.fromkeys(("liste", "list"), "liste"),
+}
+TELEGRAM_HELP = """Commandes (sans nom de compte : tous vos comptes ; un nom peut être abrégé, ex. « vente ludob ») :
+etat : mode, solde, ventes et achats en cours, pauses, session, bilan du jour
+vente <compte> : ne fait plus que vendre, plus aucune mise
+achat <compte> : ne fait plus qu'acheter, plus de mise en vente
+auto <compte> : revient aux réglages (et au changement selon le solde, auto_switch)
+pause : plus aucune action sur le site jusqu'à « reprise »
+reprise : reprend tout de suite
+ok : après la vérification anti-robot passée à la main sur le site
+bilan : bilan de la journée
+login <compte> : comment reconnecter un compte, en envoyant son cookie ici
+ajoute <nom> <section> : carte à acheter, ex. « ajoute Tiakola rap » (nom vérifié sur Wikipédia)
+retire <nom> : la retire de la liste des cartes à acheter
+liste [section] : les cartes à acheter, par section"""
+LOGIN_TELEGRAM_STEPS = """Reconnecter {name} depuis ici (sur n'importe quel ordinateur) :
+1. Fenêtre de NAVIGATION PRIVÉE sur https://www.wiki-masters.com, connectez-vous avec {name}.
+2. Outils développeur (Cmd+Option+I sur Mac, F12 sur Windows) > Network (Réseau), page Collection, filtre my-collection, rechargez la page.
+3. Requête my-collection > Request Headers > clic droit sur « cookie » > Copy value.
+4. Collez-le ici et envoyez. Coupé en plusieurs messages, c'est normal : le script le recolle dans la minute, l'efface du chat et reprend.
+5. Fermez la fenêtre privée SANS vous déconnecter (se déconnecter couperait aussi la session du script)."""
+
+
+def telegram_command(text, accounts):
+    """(commande, comptes nommés, autres mots) d'un message, ou None si ce n'est pas une commande. « /vente@MonBot
+    ludob » -> ("vente", ["ludobrtmrn"], []) : un compte peut être abrégé (4 lettres au moins) si un seul commence
+    ainsi."""
+    words = norm(text).split()
+    verb = TELEGRAM_VERBS.get(words[0].lstrip("/").split("@")[0]) if words else None
+    if not verb:
+        return None
+    named, other = [], []
+    for word in words[1:]:
+        hits = [a for a in accounts if norm(a) == word] \
+            or [a for a in accounts if len(word) >= 4 and norm(a).startswith(word)]
+        (named if len(hits) == 1 else other).append(hits[0] if len(hits) == 1 else word)
+    return verb, named, other
+
+
+def telegram_poll(ctx, every=REPLY_POLL_SECONDS):
+    """Messages du bot, lus au plus toutes les `every` secondes (entre deux passages, et en attendant un cookie) :
+    « ok » après une vérification anti-robot, commandes (TELEGRAM_HELP), cookie pour reconnecter le compte."""
+    now = time.time()
+    if not ctx.telegram or now < ctx.tg_polled_at + every:
+        return
+    ctx.tg_polled_at = now
+    updates = telegram_updates(ctx.telegram)
+    unblock_by_reply(ctx, [(u["date"], u["text"]) for u in updates])
+    recent = [u for u in updates if u["date"] >= ctx.tg_since and _is_int(u["update_id"])]
+    for session, parts in telegram_cookies([u for u in recent if u["update_id"] not in ctx.tg_cookies],
+                                           ctx.client.ref):
+        ctx.tg_cookies |= {u["update_id"] for u in parts}
+        receive_cookie(ctx, session, parts)
+    for update in recent:
+        uid, text = update["update_id"], update["text"]
+        if uid in ctx.tg_cookies or uid in ctx.tg_handled:
+            continue
+        if "auth-token" in text:  # début de cookie illisible pour l'instant : la suite arrive peut-être
+            if now - update["date"] > COOKIE_WAIT:
+                ctx.tg_cookies.add(uid)
+                if ctx.notify and (ctx.tg_claims is None or ctx.tg_claims.take(uid)):
+                    ctx.notify("❌ Cookie reçu mais illisible (copie tronquée ?) : recopiez toute la valeur de « cookie » "
+                               "et renvoyez-la (« login » pour la marche à suivre).")
+            continue
+        ctx.tg_handled.add(uid)
+        if len(text) <= 300:  # plus long : un morceau de cookie, pas une commande
+            telegram_command_received(ctx, update)
+    telegram_forget(ctx.telegram, updates)
+
+
+def receive_cookie(ctx, session, parts):
+    """Cookie envoyé sur Telegram : s'il est de ce compte, sa session remplace l'ancienne (perdue ou non) et ses
+    messages sont effacés du chat. Celui d'un autre de vos comptes est laissé à ce compte-là."""
+    try:
+        if jwt_claims(session["access_token"])["sub"] != ctx.client.user_id:
+            return
+    except ValueError:
+        return
+    for part in parts:
+        if _is_int(part.get("message_id")):
+            telegram_call(ctx.telegram, "deleteMessage", chat_id=ctx.telegram["chat_id"], message_id=part["message_id"])
+    name = ctx.client.username
+    try:
+        ctx.client.adopt_login(session)
+    except (ValueError, ApiError, SessionSaveError) as e:
+        text = f"❌ Cookie de {name} reçu, mais refusé : {e}. Renvoyez un cookie tout frais (« login {name} »)."
+    else:
+        text = f"✅ {name} reconnecté avec le cookie reçu (effacé du chat) : reprise tout de suite."
+        ctx.resume_now = "Session reprise avec le cookie reçu sur Telegram"
+    print(f"\n  Telegram : {text}")
+    if ctx.notify:
+        ctx.notify(text)
+
+
+def telegram_command_received(ctx, update):
+    """Commande reçue sur Telegram (TELEGRAM_HELP). Celle qui nomme des comptes n'est traitée que par eux ; sans nom,
+    chaque compte répond pour lui (« etat », « pause »…), ou un seul (« aide »)."""
+    parsed = telegram_command(update["text"], ctx.accounts)
+    if not parsed:
+        return  # « ok » est lu par unblock_by_reply ; le reste n'est pas pour le script
+    verb, named, other = parsed
+    name = ctx.client.username
+    reply = ctx.notify or (lambda text: None)
+    if verb in ("ajoute", "retire", "liste"):  # la liste des noms est commune : un seul de vos comptes s'en charge
+        if ctx.tg_claims is None or ctx.tg_claims.take(update["update_id"]):
+            reply(names_command(ctx, verb, update["text"]))
+        return
+    if named and not any(norm(a) == norm(name) for a in named):
+        return
+
+    def once():  # un seul de vos comptes répond
+        return bool(named) or ctx.tg_claims is None or ctx.tg_claims.take(update["update_id"])
+
+    other = [w for w in other if len(w) >= 4 and w not in ("tous", "tout", "comptes")]
+    if other and not named:
+        if once():
+            reply(f"Compte inconnu : {', '.join(other)}. Vos comptes : {', '.join(ctx.accounts)}.")
+    elif verb == "aide":
+        if once():
+            reply(TELEGRAM_HELP)
+    elif verb == "etat":
+        reply(status_text(ctx))
+    elif verb == "bilan":
+        report = daily_report(ctx.journal, time.strftime("%Y-%m-%d"))
+        reply(f"📊 Bilan du {time.strftime('%d/%m')}\n{report or 'rien dans le journal aujourd’hui'}")
+    elif verb == "pause":
+        ctx.user_paused = True
+        reply("⏸ En pause : plus aucune action sur le site (ventes, mises, défausses) jusqu'à « reprise ».")
+    elif verb == "reprise":
+        if ctx.user_paused:
+            ctx.user_paused, ctx.resume_now = False, "Reprise demandée sur Telegram"
+            reply("▶️ Reprise : passage tout de suite.")
+    elif verb == "login":
+        if named or ctx.client.session_lost:
+            reply(LOGIN_TELEGRAM_STEPS.format(name=name))
+        elif once():
+            reply(LOGIN_TELEGRAM_STEPS.format(name="le compte"))
+    elif not named and len(ctx.accounts) > 1:  # achat, vente, auto : sur quel compte ?
+        if once():
+            reply(f"Précisez le compte, ex. « {verb} {ctx.accounts[0]} » (vos comptes : {', '.join(ctx.accounts)}).")
+    else:
+        reply(set_mode(ctx, verb))
+
+
+def wiki_get(params):
+    resp = requests.get(WIKI_API, params={"format": "json", **params}, headers={"User-Agent": WIKI_USER_AGENT},
+                        timeout=15)
+    if not resp.ok:
+        raise ValueError(f"Wikipédia : erreur {resp.status_code}")
+    return resp.json()["query"]
+
+
+def wiki_pages(titles):
+    """Pages Wikipédia de ces titres : titre -> {"title" (titre exact des cartes, redirection suivie), "description",
+    "ambiguous" (page d'homonymie)}, ou None si la page n'existe pas. Lève requests.RequestException, ValueError ou
+    KeyError si Wikipédia ne répond pas."""
+    data = wiki_get({"action": "query", "redirects": 1, "prop": "description|pageprops", "ppprop": "disambiguation",
+                     "titles": "|".join(titles)})
+    renamed = {n["from"]: n["to"] for n in data.get("normalized") or []}
+    redirected = {r["from"]: r["to"] for r in data.get("redirects") or []}
+    pages = {p.get("title"): p for p in (data.get("pages") or {}).values()}
+    found = {}
+    for title in titles:
+        page = pages.get(redirected.get(renamed.get(title, title), renamed.get(title, title))) or {}
+        found[title] = None if not page or "missing" in page or "invalid" in page else {
+            "title": page["title"], "description": page.get("description", ""),
+            "ambiguous": "disambiguation" in (page.get("pageprops") or {})}
+    return found
+
+
+def wiki_suggestions(text):
+    """Titres proches, 5 au plus : ceux qui commencent par « text ( » (« Jul » -> « Jul (rappeur) »), sinon ceux de la
+    recherche de Wikipédia. [] si Wikipédia ne répond pas."""
+    try:
+        found = wiki_get({"action": "query", "list": "prefixsearch", "pssearch": f"{text} (", "pslimit": 6})
+        titles = [p["title"] for p in found["prefixsearch"] if "homonymie" not in p["title"].lower()]
+        if not titles:
+            found = wiki_get({"action": "query", "list": "search", "srsearch": text, "srlimit": 5})
+            titles = [s["title"] for s in found["search"]]
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return []
+    return titles[:5]
+
+
+def names_command(ctx, verb, text):
+    """« ajoute », « retire » ou « liste » reçu sur Telegram : la liste des cartes à acheter (buy.names_file).
+    Retourne la réponse."""
+    if not ctx.names_file:
+        return "Pas de liste de cartes à acheter dans les réglages (buy.names_file)."
+    words = text.split()[1:]  # tels qu'écrits : majuscules et accents comptent pour le titre
+    sections = ctx.names_file.sections()
+    choices = " | ".join(tags[0] for tags in sections)
+
+    def section_of(word):
+        return next((tags for tags in sections if norm(word) in {norm(t) for t in tags}), None)
+
+    if verb == "liste":
+        entries = ctx.names_file.entries(quit=False) or []
+        if not words:
+            counts = collections.Counter(", ".join(tags) or "sans section" for _, tags in entries)
+            return ("📋 Cartes à acheter :\n" + "\n".join(f"[{s}] : {n}" for s, n in counts.items())
+                    + "\n« liste rap » pour les noms d'une section.")
+        tags = section_of(words[0])
+        if not tags:
+            return f"Section inconnue : {words[0]} (sections : {choices})."
+        names = [n for n, t in entries if {norm(x) for x in t} == {norm(x) for x in tags}]
+        listed = ", ".join(names)
+        return f"📋 [{', '.join(tags)}] : {len(names)} carte(s) à acheter\n" + (
+            listed if len(listed) <= 3500 else listed[:3500].rsplit(", ", 1)[0] + "…")
+    if verb == "retire":
+        if not words:
+            return "Écrivez le nom : « retire Tiakola »."
+        removed = ctx.names_file.drop(" ".join(words))
+        if not removed:
+            return f"« {' '.join(words)} » n'est pas dans la liste des cartes à acheter."
+        reload_names(ctx)
+        return f"➖ Retiré de la liste : {', '.join(removed)}."
+    return add_name(ctx, words, section_of, choices)
+
+
+def add_name(ctx, words, section_of, choices):
+    """« ajoute <nom> [section] » : le nom est vérifié sur Wikipédia, dont les cartes sont les articles (titre exact,
+    redirection suivie, page d'homonymie refusée), puis ajouté à sa section de buy.names_file. Le dernier mot est la
+    section s'il en nomme une et que le reste est un article (« ajoute Gare de Lyon » : pas de section)."""
+    if not words:
+        return f"Écrivez le nom puis la section : « ajoute Tiakola rap » (sections : {choices})."
+    candidates = ([(" ".join(words[:-1]), section_of(words[-1]))] if len(words) > 1 and section_of(words[-1]) else [])
+    candidates.append((" ".join(words), None))
+    note = ""
+    try:
+        pages = wiki_pages([name for name, _ in candidates])
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        pages, note = None, " (Wikipédia ne répond pas : titre non vérifié, écrivez-le exactement comme l'article)"
+    name, tags = next(((n, t) for n, t in candidates if pages and pages[n]), candidates[0])
+    page = pages[name] if pages else {"title": name, "description": "", "ambiguous": False}
+    if page is None:  # pas d'article de ce nom : une différence de majuscules ou d'accents ? (« kilian jornet »)
+        suggestions = wiki_suggestions(name)
+        same = next((t for t in suggestions if norm(t) == norm(name)), None)
+        if same:
+            try:
+                page = wiki_pages([same])[same]
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                page = None
+        if not page:
+            hint = f" Vouliez-vous dire : {', '.join(suggestions)} ?" if suggestions else ""
+            return (f"Pas d'article Wikipédia « {name} » : les cartes en sont les articles.{hint} Renvoyez "
+                    f"« ajoute <titre exact> {tags[0] if tags else '<section>'} ».")
+    if page["ambiguous"]:
+        suggestions = wiki_suggestions(page["title"])
+        return (f"« {page['title']} » désigne plusieurs articles : précisez"
+                + (f", par exemple : {', '.join(suggestions)}" if suggestions else "") + ".")
+    title = page["title"]
+    if not tags:
+        return f"Dans quelle section ? « ajoute {title} {choices.split(' | ')[0]} » (sections : {choices})."
+    protecting = {norm(t) for t in ctx.cfg["protection"]["tags"]}
+    missing = [t for t in tags if norm(t) not in protecting]
+    if missing:  # la carte achetée ne serait pas protégée, et le nom ne serait pas cherché (load_names)
+        return (f"« {title} » non ajouté : l'étiquette {', '.join(missing)} de cette section ne protège rien. Ajoutez-la "
+                f"à protection.tags dans {PERSO_FILE}, relancez le script, puis renvoyez « ajoute ».")
+    entries = ctx.names_file.entries(quit=False) or []
+    already = next(((n, t) for n, t in entries if norm(n) == norm(title)), None)
+    if already:
+        return f"« {title} » est déjà dans la liste ([{', '.join(already[1])}])."
+    if any(norm(c.name) == norm(title) for c in ctx.collection):
+        return f"« {title} » est déjà dans la collection de {ctx.client.username} : rien à acheter."
+    if not ctx.names_file.add(title, tags):
+        return f"« {title} » non ajouté : {ctx.names_file.path.name} n'a pas pu être modifié."
+    reload_names(ctx)
+    renamed = f" (« {name} » renvoie à « {title} », le titre des cartes)" if norm(name) != norm(title) else ""
+    about = f" : {page['description']}" if page["description"] else ""
+    labels = ", ".join(f"« {t} »" for t in tags)
+    return (f"➕ « {title} »{about} ajouté à [{', '.join(tags)}]{renamed}{note}. Cherché dès la prochaine relecture "
+            f"du marché (5 min) ; une fois achetée, la carte reçoit {labels}, qui la protège.")
+
+
+def set_mode(ctx, verb):
+    """« achat », « vente » ou « auto » reçu sur Telegram : appliqué tout de suite, et gardé après un redémarrage
+    (mode.json). Retourne la réponse."""
+    name = ctx.client.username
+    if verb == "auto":
+        ctx.mode.clear()
+        apply_mode(ctx)
+        auto_switch(ctx)  # le solde décide aussitôt (et le dit), si auto_switch concerne ce compte
+        rules = ctx.cfg["auto_switch"]
+        auto = (f" Changement selon le solde : vente sous {rules['sell_below']:g}, achat dès {rules['buy_above']:g}."
+                if norm(name) in {norm(a) for a in rules["accounts"]} else "")
+        text = f"🔄 {name} revient aux réglages : {mode_text(ctx)}.{auto}"
+    else:
+        ctx.mode.write(verb, manual=True, why="Telegram")
+        apply_mode(ctx)
+        if verb == "vente":
+            text = (f"✅ {name} en VENTE : plus aucune mise (celles déjà posées vont jusqu'au bout), ses cartes sont "
+                    "mises en vente.")
+        else:
+            text = (f"✅ {name} en ACHAT : plus de mise en vente (celles en cours vont jusqu'au bout), il mise sur vos "
+                    "mots-clés et noms.")
+            if not ctx.can_buy:
+                text += " Attention : ce lancement n'achète pas (achats seulement avec « tout --loop »)."
+        text += f" Jusqu'à « auto {name} »."
+    ctx.resume_now = f"Mode {verb} demandé sur Telegram"
+    return text
+
+
+def status_text(ctx):
+    """Réponse à « etat » sur Telegram."""
+    now, lines = time.time(), [f"Mode : {mode_text(ctx)}"]
+    if ctx.balance is not None:
+        lines.append(f"Solde : {ctx.balance:g}" + (f" (lu le {day_time(ctx.balance_at)})" if ctx.balance_at else ""))
+    if ctx.short_of and now < ctx.short_of["at"] + LOW_FUNDS_PAUSE:
+        lines.append(f"Mises de {ctx.short_of['amount']} ou plus suspendues (solde insuffisant) jusqu'à "
+                     f"{clock_time(ctx.short_of['at'] + LOW_FUNDS_PAUSE)}")
+    lines.append(f"Ventes en cours : {len(ctx.state.with_status('open'))}")
+    if ctx.sniper:
+        lines.append(f"Achats : {len(ctx.sniper.targets)} enchère(s) suivie(s), "
+                     f"{len(ctx.purchases.with_status('bid'))} mise(s) en attente du résultat")
+    for group, entry in paused_groups(ctx).items():
+        lines.append(f"🛑 Pause anti-robot ({group}) jusqu'à {clock_time(entry['until'])}")
+    if ctx.user_paused:
+        lines.append("⏸ En pause (Telegram) : « reprise » pour reprendre")
+    lines.append("Session : " + ("PERDUE, envoyez le cookie ici" if ctx.client.session_lost else "OK"))
+    report = daily_report(ctx.journal, time.strftime("%Y-%m-%d"))
+    if report:
+        lines.append(f"Aujourd'hui :\n{report}")
+    return "📋 État\n" + "\n".join(lines)
+
+
+def wait_for_login(ctx):
+    """Session perdue : avec Telegram et --loop, le script attend un cookie envoyé au bot au lieu de s'arrêter, sans
+    rien faire sur le site en attendant. True une fois reconnecté ; False sans Telegram (le script s'arrête)."""
+    client = ctx.client
+    if not (ctx.telegram and ctx.looping and ctx.notify):
+        return False
+    name = client.username
+    print(f"\nEn attente d'un cookie de {name} sur Telegram pour reprendre (ou Ctrl+C, puis « {cmd('login')} »)…")
+    ctx.notify(f"🔑 {name} est déconnecté du site (session révoquée ou expirée). Envoyez ici son cookie pour reprendre "
+               f"sans revenir à l'ordinateur du script : « login {name} » pour la marche à suivre. En attendant, rien "
+               "n'est fait sur le site.")
+    while client.session_lost:
+        time.sleep(LOGIN_POLL_SECONDS)
+        telegram_poll(ctx, every=LOGIN_POLL_SECONDS - 1)
+    return True
 
 
 def loop_wait(ctx, seconds):
-    """Pause de --loop (achats compris). Pendant une pause anti-robot, les réponses Telegram sont lues chaque minute :
-    « ok » écourte cette attente, le passage suivant (ventes, boosters) a lieu aussitôt."""
+    """Pause de --loop (achats compris). Avec Telegram, les messages du bot sont lus chaque minute (telegram_poll) :
+    « ok » après une vérification anti-robot ou une commande peuvent avancer le passage suivant. Le mode suit aussi le
+    solde (auto_switch)."""
     wait, deadline, left = ctx.sniper.wait if ctx.sniper else time.sleep, time.time() + seconds, seconds
     while left > 0:
-        if ctx.resume_now:  # levée pendant cette attente, ou pendant le passage (après ses ventes, peut-être)
-            ctx.resume_now = False
-            print("Pause anti-robot levée : passage suivant tout de suite.")
+        if ctx.resume_now:  # pendant cette attente, ou pendant le passage (après ses ventes, peut-être)
+            print(f"{ctx.resume_now} : passage suivant tout de suite.")
+            ctx.resume_now = ""
             return
-        if not (ctx.telegram and paused_groups(ctx)):
+        if not ctx.telegram:
             wait(left)
             return
         wait(min(left, REPLY_POLL_SECONDS))
-        unblock_by_reply(ctx)
+        telegram_poll(ctx)
+        reload_names(ctx)  # « ajoute » traité par un autre de vos comptes
+        auto_switch(ctx)
         left = deadline - time.time()
 
 
@@ -4695,9 +5476,10 @@ def main():
         state=SalesState(folder / "ventes.json", set_aside=args.execute),
         purchases=PurchaseState(folder / "achats.json", set_aside=args.execute),
     )
+    ctx.cfg_names = list(cfg["buy"]["names"])
     if cfg["buy"].get("names_file"):
         ctx.names_file = NamesFile(config_path(args.config, cfg["buy"]["names_file"]))
-        cfg["buy"]["names"] = list(dict.fromkeys(cfg["buy"]["names"] + ctx.names_file.names()))
+        load_names(ctx, quit=True)
     if args.command == "envoyer" or (args.command == "tout" and cfg["send"]["in_tout"]):
         ctx.recipient = send_recipient(cfg, args.config, folder.name, required=args.command == "envoyer")
     keywords = cfg["buy"]["keywords"] + cfg["buy"]["names"]
@@ -4715,9 +5497,10 @@ def main():
     pending = args.execute and bool(ctx.purchases.with_status("bid"))
     if sniping or pending:
         mine = account_user_ids(args.config)
-        # Plusieurs comptes qui achètent : chaque annonce n'est suivie que par l'un d'eux.
+        # Plusieurs comptes qui achètent : chaque annonce n'est suivie que par l'un d'eux. Même avec un seul acheteur
+        # dans les réglages : un autre peut passer en achat sur Telegram (mode.json).
         claims = BuyClaims(config_path(args.config, ACCOUNTS_DIR) / CLAIMS_FILE, folder.name) \
-            if len(buyers) > 1 else None
+            if len(known_accounts(args.config)) > 1 else None
         ctx.sniper = Sniper(ctx, one_shot=not args.loop, mine=mine, claims=claims, market=buys and sniping)
         client.waiter = ctx.sniper.wait
     mode = "EXÉCUTION RÉELLE" if args.execute else "SIMULATION (rien n'est modifié, ajoutez --execute pour agir)"
@@ -4737,6 +5520,12 @@ def main():
                      f"{', '.join(known_accounts(args.config))}). Corrigez {PERSO_FILE}.")
         setattr(ctx, {"sell": "sells", "discard": "discards", "packs": "opens_packs"}[section_name],
                 folder.name.casefold() in {a.casefold() for a in allowed})
+    # Rôle d'après les réglages ; mode.json (Telegram, auto_switch) le remplace à chaque passage (apply_mode).
+    ctx.cfg_sells, ctx.cfg_buys, ctx.can_buy, ctx.looping = ctx.sells, buys, sniping, bool(args.loop)
+    ctx.mode = AccountMode(folder / MODE_FILE)
+    if args.execute:  # dernier solde connu : auto_switch peut décider dès ce lancement
+        ctx.balance, ctx.balance_at = journal_balance(ctx.journal)
+    apply_mode(ctx)
     if cfg["safety"]["shared_market"] and len(known_accounts(args.config)) > 1:
         ctx.shared = SharedMarket(config_path(args.config, ACCOUNTS_DIR) / MARKET_FILE, folder.name)
         ctx.others_buy = any(b.casefold() != folder.name.casefold() for b in buyers)
@@ -4756,8 +5545,9 @@ def main():
     alerts = telegram and (args.execute or telegram["notify_on_dry_run"])
     if alerts:
         ctx.notify = lambda text: send_telegram(telegram, telegram_alert(client.username, text))
-        if args.execute:  # « ok » répondu au bot après une vérification anti-robot passée à la main
-            ctx.telegram, ctx.accounts = telegram, known_accounts(args.config)
+        if args.execute:  # « ok » après une vérification anti-robot, commandes, cookie (telegram_poll)
+            ctx.telegram, ctx.accounts, ctx.tg_since = telegram, known_accounts(args.config), time.time()
+            ctx.tg_claims = TelegramClaims(config_path(args.config, ACCOUNTS_DIR) / TELEGRAM_FILE, folder.name)
     outcome, cycle, reported = ("ok", None), 0, time.time()
     last_problem, report_day = None, None
     try:
@@ -4766,9 +5556,17 @@ def main():
             cycle += 1
             ctx.journal.merge_backup()
             print(f"\n=== [{time.strftime('%H:%M:%S')}] {args.command} — {mode} — compte {client.username} ===")
+            # Commandes Telegram arrivées pendant le passage précédent, puis rôle du compte pour celui-ci.
+            telegram_poll(ctx)
+            reload_names(ctx)
+            auto_switch(ctx)
+            apply_mode(ctx)
+            if cycle == 1 and ctx.mode.data:
+                print(f"Mode : {mode_text(ctx)} (comptes/{folder.name}/{MODE_FILE}).")
             if keywords and args.command == "tout" and cycle == 1:
-                if not buys:
-                    print(f"Achats aux enchères : pas sur ce compte (buy.accounts : {', '.join(buyers)}).")
+                if not roles(ctx)[0]:
+                    print(f"Achats aux enchères : pas sur ce compte (buy.accounts : {', '.join(buyers)}"
+                          + (", ou mode vente" if ctx.mode.data else "") + ").")
                 elif not args.loop:
                     print("Achats aux enchères (buy.keywords) : seulement avec --loop, ou avec la commande « acheter ».")
             if args.fresh and cycle == 1:  # les cycles suivants de --loop réutilisent ces prix
@@ -4776,7 +5574,10 @@ def main():
                 print("Option --fresh : tous les prix sont relus sur le site (cache ignoré).")
             outcome = ("ok", None)
             try:
-                run_command(ctx, args.command)
+                if ctx.user_paused:
+                    print("En pause depuis Telegram : aucun passage, ni mise (« reprise » pour reprendre).")
+                else:
+                    run_command(ctx, args.command)
             except ApiError as e:
                 outcome = ("error", str(e))
                 print(f"\nARRÊT : {e}")
@@ -4813,7 +5614,9 @@ def main():
                 # Telegram : un message seulement quand il faut agir (arrêt, plantage, veille), une fois par problème
                 # (un site en panne des heures n'envoie pas un message par passage), sauf telegram.every_pass.
                 problem = (outcome[1] if outcome[0] in ("error", "crash") else None) or asleep
-                if alerts and (telegram["every_pass"] or (problem and problem != last_problem)):
+                # Session perdue avec Telegram et --loop : wait_for_login prévient lui-même (cookie à envoyer).
+                relogin = bool(client.session_lost and ctx.telegram and ctx.looping)
+                if alerts and not relogin and (telegram["every_pass"] or (problem and problem != last_problem)):
                     send_telegram(telegram, telegram_message(client.username, args.command, outcome, summary_text))
                 last_problem = problem
                 # Bilan de la journée, une fois par jour, au premier passage après telegram.daily_report.
@@ -4838,7 +5641,9 @@ def main():
             if client.session_lost:
                 if client.session_lost != outcome[1]:  # sinon déjà affiché par « ARRÊT »
                     print(f"\nAttention : {client.session_lost}")
-                sys.exit(1)
+                if not wait_for_login(ctx):
+                    sys.exit(1)
+                continue  # reconnecté par un cookie envoyé sur Telegram : passage suivant tout de suite
             if outcome[0] == "error" and not args.loop:
                 sys.exit(1)
             if not args.loop:
@@ -4865,7 +5670,9 @@ def main():
             except ApiError as e:  # session perdue pendant les achats (les autres erreurs n'arrêtent que la mise)
                 print(f"\nARRÊT : {e}")
                 print_summary(ctx.summary, args.execute)
-                sys.exit(1)
+                if not (client.session_lost and wait_for_login(ctx)):
+                    sys.exit(1)
+                ctx.resume_now = ""  # le passage suivant a lieu tout de suite
             except Exception as e:  # plantage des achats : la pause se finit sans eux, le passage suivant a lieu
                 print(f"\n[achats] PLANTAGE : {crash_report(e)}")
                 time.sleep(max(0.0, deadline - time.time()))

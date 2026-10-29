@@ -156,6 +156,12 @@ buy:
   scan_minutes: 5         # le marché est relu toutes les N minutes
   accounts: null          # tous les comptes achètent
 
+# Changement achat <-> vente selon le solde (aucun compte : jamais tout seul).
+auto_switch:
+  accounts: []
+  sell_below: 50
+  buy_above: 300
+
 # Envoi de cartes à un autre de vos comptes (commande « envoyer »).
 send:
   to: null

@@ -6,9 +6,10 @@
 # sauf dans « protection » : là, elle s'AJOUTE à celle de config.yaml, pour ne jamais retirer une protection.
 # Un réglage mal orthographié est refusé au démarrage, avec le nom correct.
 
-# Étiquettes qui protègent une carte (jamais vendue ni défaussée), en plus de garder et favori :
+# Étiquettes qui protègent une carte (jamais vendue ni défaussée), en plus de garder et favori. Avec une liste de
+# cartes à acheter (buy.names_file, plus bas), ajoutez l'étiquette de chaque section que vous utilisez :
 # protection:
-#   tags: ["lyon"]
+#   tags: ["lyon", "rap", "twitch", "youtube", "trail"]
 
 # Cartes jamais vendues (« inconnu ») à défausser : [] pour n'en défausser aucune.
 # discard:
@@ -20,10 +21,21 @@
 
 # Achats aux enchères (commande « acheter », ou « tout --loop ») : mise à 20 s de la fin, jamais au-dessus
 # du prix moyen. L'étiquette « tag » protège les cartes gagnées : ajoutez-la aussi à protection.tags.
+# Les achats ne tournent qu'avec « tout --execute --loop » (ou « acheter --execute »).
 # buy:
-#   keywords: ["lyon"]
-#   tag: "lyon"
+#   keywords: ["lyon"]        # cartes dont le titre ou la description contient ce mot
+#   tag: "lyon"               # étiquette des cartes gagnées ("garder" si vous n'avez pas de mot-clé)
 #   accounts: ["moncompte"]   # seuls ces comptes achètent (noms : ./wm comptes) ; sinon tous
+#   price_factor: 2           # jusqu'à 2 × le prix moyen de la carte (1 par défaut)
+#   max_price: 300            # et jamais plus de 300 par carte
+#   names_file: "joueurs_a_acheter.txt"   # cartes cherchées par leur nom : copiez joueurs_a_acheter.exemple.txt
+
+# Un compte qui achète passe en vente quand son solde descend sous 50, et revient aux achats dès 300.
+# Sur Telegram : « vente moncompte », « achat moncompte », « auto moncompte » (retour à cette règle).
+# auto_switch:
+#   accounts: ["moncompte"]
+#   sell_below: 50
+#   buy_above: 300
 
 # Envoi des cartes à vendre à un autre de vos comptes, qui les vend (commande « envoyer », ou dans « tout » avec
 # in_tout). Les deux comptes doivent être amis sur le site ; acceptez ensuite les échanges avec l'autre compte.
@@ -35,9 +47,13 @@
 # sell:
 #   night: { start: "00:00", end: "07:00" }
 
-# Notifications Telegram à la fin de chaque passage :
-#   jeton du bot : @BotFather sur Telegram ; votre chat_id : @userinfobot.
+# Telegram (conseillé) : alertes quand il faut agir (vérification anti-robot, compte déconnecté), commandes depuis
+# le téléphone (envoyez « aide » au bot), reconnexion d'un compte en envoyant son cookie au bot.
+#   1. Sur Telegram, @BotFather > /newbot : notez le jeton (bot_token).
+#   2. Ouvrez la conversation avec votre nouveau bot et envoyez /start (sinon il ne peut pas vous écrire).
+#   3. Votre chat_id : @userinfobot.
 # telegram:
 #   bot_token: "123456789:AAH..."
 #   chat_id: "123456789"
+#   daily_report: "22:00"      # bilan de la journée de chaque compte (null = jamais)
 #   notify_on_dry_run: false   # true = aussi pour les simulations

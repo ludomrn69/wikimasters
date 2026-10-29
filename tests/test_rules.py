@@ -97,12 +97,34 @@ class FakeSite:
         self.on_post = None
         self.telegram = []  # (url, corps) des notifications
         self.replies = []  # (date, texte) des messages envoyés au bot (getUpdates)
+        self.wiki = {}  # titre -> {"description", "ambiguous"} : articles de Wikipédia (« ajoute » sur Telegram)
+        self.wiki_redirects = {}  # titre -> titre de l'article vers lequel il renvoie
+
+    def wikipedia(self, params):
+        if params.get("list") == "prefixsearch":
+            base = params["pssearch"]
+            return FakeResponse(200, {"query": {"prefixsearch": [{"title": t} for t in self.wiki if t.startswith(base)]}})
+        if params.get("list") == "search":
+            wanted = w.norm(params["srsearch"])
+            return FakeResponse(200, {"query": {"search": [{"title": t} for t in self.wiki if wanted in w.norm(t)]}})
+        pages, redirects = {}, []
+        for n, title in enumerate(params["titles"].split("|")):
+            final = self.wiki_redirects.get(title, title)
+            if final != title:
+                redirects.append({"from": title, "to": final})
+            page = self.wiki.get(final)
+            pages[str(-1 - n) if page is None else str(n + 1)] = {"title": final, "missing": ""} if page is None else {
+                "title": final, "description": page.get("description", ""),
+                **({"pageprops": {"disambiguation": ""}} if page.get("ambiguous") else {})}
+        return FakeResponse(200, {"query": {"pages": pages, "redirects": redirects}})
 
     def __call__(self, method, url, timeout=None, params=None, json=None, headers=None, allow_redirects=True,
                  **kwargs):
+        if "wikipedia.org" in url:
+            return self.wikipedia(params)
         if url.endswith("/getUpdates"):
             return FakeResponse(200, {"ok": True, "result": [
-                {"update_id": n, "message": {"chat": {"id": 1}, "date": date, "text": text}}
+                {"update_id": n, "message": {"message_id": 1000 + n, "chat": {"id": 1}, "date": date, "text": text}}
                 for n, (date, text) in enumerate(self.replies)]})
         if "api.telegram.org" in url:
             self.telegram.append((url, json))
@@ -2183,7 +2205,9 @@ class EndToEndTest(MainHarness, unittest.TestCase):
 
         def sleep(seconds):
             clock.now += seconds + 1
-            if seconds == 60:  # pause de --loop lue minute par minute pendant le blocage
+            if seconds == 60:  # pause de --loop lue minute par minute (Telegram)
+                if len(site.sells()) == 3:
+                    raise KeyboardInterrupt  # pause après la reprise
                 cycles.append(len(site.sells()))
                 if len(cycles) == 2:
                     site.replies.append((clock.now, "C'est bon !"))
@@ -2206,6 +2230,8 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertTrue(w.unblock_reply("ok B2", "b2", ["a1", "b2"]))
         self.assertFalse(w.unblock_reply("ok b2", "a1", ["a1", "b2"]))  # l'autre compte seulement
         self.assertFalse(w.unblock_reply("salut", "a1", ["a1"]))
+        self.assertFalse(w.unblock_reply("etat a1", "a1", ["a1", "b2"]))  # nommer le compte ne suffit pas
+        self.assertFalse(w.unblock_reply(f"sb-{REF}-auth-token=ok", "a1", ["a1"]))  # un cookie collé
 
     def test_same_problem_is_reported_once_in_loop(self):
         site, clock, pauses = standard_site(tags=SORTED), Clock(), []
@@ -2213,13 +2239,17 @@ class EndToEndTest(MainHarness, unittest.TestCase):
 
         def sleep(seconds):
             clock.now += seconds
-            if seconds >= 600:
-                pauses.append(seconds)
-                if len(pauses) == 3:
-                    raise KeyboardInterrupt
 
-        output, code = self.run_main(site, "tout", execute=True, args=["--loop"], sleep=sleep, clock=clock,
-                                     perso=self.TELEGRAM)
+        def loop_wait(ctx, seconds):  # pause de --loop, lue minute par minute (Telegram) : 3 passages
+            pauses.append(seconds)
+            if len(pauses) == 3:
+                raise KeyboardInterrupt
+            real_loop_wait(ctx, seconds)
+
+        real_loop_wait = w.loop_wait
+        with mock.patch.object(w, "loop_wait", loop_wait):
+            output, code = self.run_main(site, "tout", execute=True, args=["--loop"], sleep=sleep, clock=clock,
+                                         perso=self.TELEGRAM)
         self.assertEqual(output.count("ARRÊT : réponse inattendue"), 3)
         self.assertEqual(len(site.telegram), 1)
 
@@ -2230,14 +2260,19 @@ class EndToEndTest(MainHarness, unittest.TestCase):
 
         def sleep(seconds):
             clock.now += seconds
+
+        def loop_wait(ctx, seconds):  # pause de --loop, lue minute par minute (Telegram) : 4 passages
             if seconds >= 120:
                 pauses.append(seconds)
                 if len(pauses) == 4:
                     raise KeyboardInterrupt
+            real_loop_wait(ctx, seconds)
 
+        real_loop_wait = w.loop_wait
         perso = {"telegram": {"bot_token": "1:x", "chat_id": 1, "daily_report": "22:00"}}
-        output, code = self.run_main(site, "vendre", execute=True, args=["--loop"], sleep=sleep, clock=clock,
-                                     perso=perso)
+        with mock.patch.object(w, "loop_wait", loop_wait):
+            output, code = self.run_main(site, "vendre", execute=True, args=["--loop"], sleep=sleep, clock=clock,
+                                         perso=perso)
         self.assertEqual(code, 0, output)
         reports = [b["text"] for _, b in site.telegram if "Bilan du 16/10" in b["text"]]
         self.assertEqual(len(reports), 1)  # pas avant 22:00, puis une seule fois
@@ -2467,6 +2502,8 @@ class Market:
         auction.update(current_bid=amount, current_bidder_id=bidder)
 
     def __call__(self, method, url, timeout=None, params=None, json=None, headers=None, allow_redirects=True, **kw):
+        if "api.telegram.org" in url or "wikipedia.org" in url:
+            return self.site(method, url, timeout=timeout, params=params, json=json, headers=headers, **kw)
         path = url.split(".com", 1)[1] if ".com" in url else url.split(".co", 1)[1]
         self._update()
         reply = self._market(method, path, params, json)
@@ -3144,6 +3181,27 @@ class MarketTest(MainHarness, unittest.TestCase):
                          {"mk-S": ["lyon", "OL"], "mk-C": ["lyon", "OL"], "mk-R": ["lyon"]})
         self.assertIn("(étiquette « lyon », « OL » au prochain tri)", output)
 
+    def test_names_file_sections_give_their_own_tags(self):
+        # Les noms avant la première section reçoivent buy.names_tags ; ceux sous « [twitch] », cette étiquette-là.
+        names = self.dir / "noms.txt"
+        names.write_text("Rayan Cherki\n[twitch]\nSqueezie\n[rap, garder]\nTiakola\n", encoding="utf-8")
+        m = self.market
+        m.add("mk-C", "Rayan Cherki", 300, current=10, value=20, category="footballeur français")
+        m.add("mk-S", "Squeezie", 400, current=10, value=20, category="vidéaste web français")
+        m.add("mk-M", "Meuda (chanson de Tiakola)", 500, current=10, value=20, category="chanson de Tiakola")
+        perso = {"protection": {"tags": ["favori", "garder", "lyon", "OL", "twitch", "rap"]}}
+        buy = {"keywords": [], "names_file": "noms.txt", "names_tags": ["lyon", "OL"], "names_minutes": 5}
+        output, code = self.run_market("acheter", execute=True, buy=buy, perso=perso)
+        self.assertEqual(code, 0, output)
+        self.assertEqual({aid: e["tags"] for aid, e in self.purchases().items()},
+                         {"mk-C": ["lyon", "OL"], "mk-S": ["twitch"], "mk-M": ["rap", "garder"]})
+        # Les lignes de section restent ; Tiakola aussi : sa chanson le cite, mais sa carte reste à acheter.
+        self.assertEqual(names.read_text(encoding="utf-8"), "[twitch]\n[rap, garder]\nTiakola\n")
+        # Une étiquette de section qui ne protège pas : arrêt clair.
+        names.write_text("[youtube]\nSqueezie\n", encoding="utf-8")
+        _, code = self.run_market("acheter", buy=buy, perso=perso)
+        self.assertIn("youtube, absentes de protection.tags", str(code))
+
     def test_names_are_searched_in_turn_and_followed_until_their_next_turn(self):
         # Une recherche par nom renvoie toutes ses annonces, même lointaines, et le site met jusqu'à 30 s à répondre :
         # chaque nom est cherché à son tour (ici un par relecture), et ses annonces suivies jusqu'à son tour suivant.
@@ -3468,6 +3526,196 @@ class MarketTest(MainHarness, unittest.TestCase):
         self.assertTrue(end - 20 <= m.bids[0][0] < end - w.LAST_CHECK_SECONDS)
         self.assertIn("ACHETÉE", output)
         self.assertIn("1 mise(s) sur le marché", output)
+
+
+class TelegramControlTest(MainHarness, unittest.TestCase):
+    """Commandes Telegram (mode achat / vente, pause…), changement de mode selon le solde, reconnexion par cookie."""
+
+    TELEGRAM = {"telegram": {"bot_token": "1:x", "chat_id": 1}}
+    INSUFFICIENT = {"error": "Solde de wikibidous insuffisant", "code": "insufficient_balance"}
+
+    def setUp(self):
+        super().setUp()
+        other = self.dir / "comptes" / "moncompte2"  # le compte qui vend dans les réglages
+        other.mkdir()
+        session = make_session()
+        claims = {"sub": "00000000-0000-4000-8000-000000000002", "exp": session["expires_at"],
+                  "user_metadata": {"username": "moncompte2"}}
+        session["access_token"] = f"{b64({'alg': 'HS256'})}.{b64(claims)}.sig-autre"
+        w.SessionStore(other / "session.json").save(session)
+        self.clock = Clock()
+        self.market = Market(standard_site(tags=SORTED), self.clock)  # Chacana défaussée : le site donne le solde
+        self.market.add("mk-A", "Rue Émile-Zola (Lyon)", 400, current=10, value=20)
+
+    def run_loop(self, sleep=None, auto_switch=None, passes=2, extra=None):
+        """« tout --loop 10 » sur testeur, qui achète (buy.accounts) et ne vend pas (sell.accounts : moncompte2),
+        arrêté au début de la pause de --loop numéro `passes`."""
+        waits = []
+
+        def loop_wait(ctx, seconds):
+            waits.append(seconds)
+            if len(waits) == passes:
+                raise KeyboardInterrupt
+            real_loop_wait(ctx, seconds)
+
+        def mutate(cfg):
+            cfg["buy"].update(keywords=["lyon"], tag="lyon", accounts=["testeur"])
+            cfg["sell"]["accounts"] = ["moncompte2"]
+            cfg["safety"]["read_delay_seconds"] = 1
+            cfg["auto_switch"].update(auto_switch or {})
+            if extra:
+                extra(cfg)
+
+        def tick(seconds):
+            self.clock.now += seconds
+            if sleep:
+                sleep(seconds)
+
+        real_loop_wait = w.loop_wait
+        with mock.patch.object(w, "loop_wait", loop_wait):
+            return self.run_main(self.market, "tout", execute=True, mutate=mutate, clock=self.clock, sleep=tick,
+                                 args=["--compte", "testeur", "--loop", "10"], perso=self.TELEGRAM)
+
+    def sent(self):
+        return [b.get("text", "") for _, b in self.market.site.telegram]
+
+    def test_commands_are_read_with_their_account(self):
+        accounts = ["ludobrtmrn", "ludomrnbrt"]
+        self.assertEqual(w.telegram_command("vente ludobrtmrn", accounts), ("vente", ["ludobrtmrn"], []))
+        self.assertEqual(w.telegram_command("/Vente@MonBot ludob", accounts), ("vente", ["ludobrtmrn"], []))
+        self.assertEqual(w.telegram_command("État", accounts), ("etat", [], []))
+        self.assertEqual(w.telegram_command("achat ludo", accounts), ("achat", [], ["ludo"]))  # les deux commencent ainsi
+        self.assertIsNone(w.telegram_command("ok", accounts))  # lu par unblock_by_reply
+        self.assertIsNone(w.telegram_command("", accounts))
+
+    def test_a_cookie_cut_in_several_messages_is_put_back_together(self):
+        cookie = fake_cookie(session=make_session(refresh="neuf"))
+        half = len(cookie) // 2
+        updates = [{"update_id": 1, "message_id": 11, "date": 100, "text": cookie[:half]},
+                   {"update_id": 2, "message_id": 12, "date": 100, "text": cookie[half:]},
+                   {"update_id": 3, "message_id": 13, "date": 101, "text": "etat"}]
+        [(session, parts)] = w.telegram_cookies(updates, REF)
+        self.assertEqual((session["refresh_token"], [p["update_id"] for p in parts]), ("neuf", [1, 2]))
+        self.assertEqual(w.telegram_cookies(updates[:1], REF), [])  # la suite n'est pas encore arrivée
+
+    def test_vente_on_telegram_stops_the_bids_and_sells_at_once(self):
+        start, site = self.clock.now, self.market.site
+
+        def sleep(seconds):  # message envoyé une fois le premier passage fini, pendant les achats
+            if not site.replies and self.clock.now - start > 30:
+                site.replies.append((self.clock.now, "vente testeur"))
+
+        output, code = self.run_loop(sleep)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.market.bids, [])  # mk-A était suivie : laissée sans mise
+        self.assertTrue(site.sells())  # passage suivant tout de suite, en vente
+        self.assertIn("Mode vente demandé sur Telegram : passage suivant tout de suite.", output)
+        mode = json.loads((self.acc / "mode.json").read_text(encoding="utf-8"))
+        self.assertEqual((mode["mode"], mode["manual"]), ("vente", True))
+        self.assertTrue(any("testeur en VENTE" in t for t in self.sent()))
+
+    def test_low_balance_switches_to_selling_then_back_to_buying(self):
+        # Dernier solde connu (journal) : 20, sous sell_below. Les défausses du passage disent 100 : retour aux achats.
+        (self.dir / "journal.csv").write_text(
+            "﻿date;compte;commande;action;carte;rarete;exemplaire;carte_id;enchere_id;valeur_moyenne;prix;"
+            "duree_min;resultat;solde\n2026-10-29 10:14:00;testeur;tout;mise;X;C;;c;e;5;5;;OK;20\n", encoding="utf-8")
+        output, code = self.run_loop(auto_switch={"accounts": ["testeur"], "sell_below": 50, "buy_above": 80})
+        self.assertEqual(code, 0, output)
+        sent = self.sent()
+        self.assertTrue(any("Solde 20 (sous 50) : testeur passe en VENTE" in t for t in sent), sent)
+        self.assertTrue(self.market.site.sells())  # premier passage en vente
+        self.assertTrue(any("Solde 100 (dès 80) : testeur repasse aux ACHATS" in t for t in sent), sent)
+        self.assertFalse((self.acc / "mode.json").exists())
+
+    def test_insufficient_balance_stops_the_bids_for_a_while(self):
+        m = self.market
+        m.add("mk-B", "Place Bellecour (Lyon)", 500, current=10, value=20)
+        m.bid_replies = [FakeResponse(400, self.INSUFFICIENT)]
+
+        def mutate(cfg):
+            cfg["buy"].update(keywords=["lyon"], tag="lyon")
+            cfg["safety"]["read_delay_seconds"] = 1
+
+        output, code = self.run_main(m, "acheter", execute=True, mutate=mutate, clock=self.clock,
+                                     sleep=lambda s: setattr(self.clock, "now", self.clock.now + s),
+                                     args=["--compte", "testeur"], perso=self.TELEGRAM)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len([u for _, u, *_ in m.site.calls if u.endswith("/bid")]), 1)  # mk-B n'est pas tentée
+        self.assertIn("laissée   Place Bellecour (Lyon) [R] valeur=20 : solde insuffisant", output)
+        self.assertEqual(sum("💸 Solde insuffisant pour miser 12" in t for t in self.sent()), 1)
+
+    def test_names_file_gets_a_name_in_its_section_or_loses_it(self):
+        path = self.dir / "noms.txt"
+        path.write_text("# Noms\n[lyon, OL]\nRayan Cherki\n\n[rap]\n# Rappeurs\nNinho\nJul (rappeur)\n\n",
+                        encoding="utf-8")
+        names = w.NamesFile(path)
+        self.assertTrue(names.add("Tiakola", ["rap"]))
+        self.assertTrue(names.add("Houssem Aouar", ["OL", "lyon"]))  # l'ordre des étiquettes ne compte pas
+        self.assertTrue(names.add("Kílian Jornet", ["trail"]))  # section créée à la fin
+        self.assertEqual(path.read_text(encoding="utf-8"),
+                         "# Noms\n[lyon, OL]\nRayan Cherki\nHoussem Aouar\n\n[rap]\n# Rappeurs\nNinho\nJul (rappeur)\n"
+                         "Tiakola\n\n[trail]\nKílian Jornet\n")
+        self.assertEqual(names.drop("jul"), ["Jul (rappeur)"])  # sans sa précision, ni majuscule
+        self.assertEqual(names.drop("Booba"), [])
+        self.assertEqual(names.sections(), [["lyon", "OL"], ["rap"], ["trail"]])
+
+    def test_a_name_added_on_telegram_is_checked_on_wikipedia_then_bought(self):
+        site, start = self.market.site, self.clock.now
+        site.wiki.update({"Tiakola": {"description": "rappeur et chanteur français"}, "Jul": {"ambiguous": True},
+                          "Jul (rappeur)": {"description": "rappeur français"}})
+        site.wiki_redirects["Mister MV"] = "Xavier Dang"
+        site.wiki["Xavier Dang"] = {"description": "streameur français"}
+        site.wiki["Kílian Jornet"] = {"description": "ultra-traileur espagnol"}
+        # [trail] : étiquette absente de protection.tags, la carte achetée ne serait pas protégée
+        (self.dir / "noms.txt").write_text("[lyon, OL]\nRayan Cherki\n\n[rap]\nNinho\n\n[trail]\n", encoding="utf-8")
+        self.market.add("mk-T", "Tiakola", 600, current=10, value=20, category="rappeur et chanteur français")
+
+        def sleep(seconds):  # messages envoyés une fois le premier passage fini : mk-T a déjà été écartée
+            if not site.replies and self.clock.now - start > 30:
+                site.replies += [(self.clock.now, text) for text in
+                                 ("ajoute tiakola rap", "ajoute Jul rap", "ajoute Mister MV", "liste rap",
+                                  "ajoute Kílian Jornet trail")]
+
+        def names(cfg):
+            cfg["buy"].update(names_file="noms.txt", names_tags=["lyon", "OL"])
+            cfg["protection"]["tags"] += ["OL", "rap"]
+
+        output, code = self.run_loop(sleep, extra=names)
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.dir / "noms.txt").read_text(encoding="utf-8"),
+                         "[lyon, OL]\nRayan Cherki\n\n[rap]\nNinho\nTiakola\n\n[trail]\n")  # titre exact de Wikipédia
+        sent = "\n".join(self.sent())
+        self.assertIn("➕ « Tiakola » : rappeur et chanteur français ajouté à [rap]", sent)
+        self.assertIn("« Jul » désigne plusieurs articles : précisez, par exemple : Jul (rappeur)", sent)
+        self.assertIn("Dans quelle section ? « ajoute Xavier Dang lyon »", sent)  # le titre des cartes
+        self.assertIn("[rap] : 2 carte(s) à acheter\nNinho, Tiakola", sent)
+        self.assertIn("« Kílian Jornet » non ajouté : l'étiquette trail de cette section ne protège rien", sent)
+        self.assertIn(("mk-T", 12), [(aid, amount) for _, aid, amount in self.market.bids])
+        bought = json.loads((self.acc / "achats.json").read_text(encoding="utf-8"))["auctions"]
+        self.assertEqual(bought["mk-T"]["tags"], ["rap"])
+
+    def test_lost_session_is_taken_back_from_a_cookie_sent_on_telegram(self):
+        site = self.market.site
+        site.overrides[("POST", "/auth/v1/token")] = FakeResponse(400, {"error": "invalid_grant"})
+        cookie = fake_cookie(session=make_session(exp_offset=7200, refresh="neuf", now=self.clock.now))
+        half = len(cookie) // 2
+        self.store.save(make_session(exp_offset=-10))  # renouvellement refusé : session perdue au 1er passage
+
+        def sleep(seconds):
+            if seconds == w.LOGIN_POLL_SECONDS and not site.replies:
+                site.replies += [(self.clock.now, cookie[:half]), (self.clock.now, cookie[half:])]
+
+        with mock.patch.object(self, "store", mock.Mock()):  # run_main ne remet pas une session neuve
+            output, code = self.run_loop(sleep, passes=1)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(w.SessionStore(self.acc / "session.json").load()["refresh_token"], "neuf")
+        sent = self.sent()
+        self.assertTrue(any("🔑 testeur est déconnecté" in t for t in sent), sent)
+        self.assertTrue(any("✅ testeur reconnecté" in t for t in sent), sent)
+        self.assertFalse(any("Arrêt" in t for t in sent))  # pas de « relancez login » : le cookie suffit
+        deleted = [b["message_id"] for u, b in site.telegram if u.endswith("/deleteMessage")]
+        self.assertEqual(deleted, [1000, 1001])  # le cookie est effacé du chat
+        self.assertIn("exemplaire(s) dans la collection", output)  # le passage suivant a eu lieu
 
 
 OTHER_ID = "00000000-0000-4000-8000-000000000002"  # l'autre compte enregistré, qui reçoit les envois

@@ -186,6 +186,17 @@ buy:
   accounts: null          # comptes qui achètent, ex. ["moncompte"] (noms : ./wm comptes) ; les autres n'achètent
                           # rien. null = tous vos comptes
 
+
+# ----------------------------------------------------------------------------
+# Changement achat <-> vente selon le solde. Un compte de « accounts » qui achète (buy.accounts) passe en vente quand
+# son solde descend sous sell_below : il ne mise plus et met ses cartes en vente. Il revient aux achats à partir de
+# buy_above. Le solde est celui lu dans les réponses du site (mises, défausses). Sur Telegram, « vente <compte> » ou
+# « achat <compte> » choisit à la main (jusqu'à « auto <compte> »). Le mode est gardé dans comptes/<compte>/mode.json.
+# ----------------------------------------------------------------------------
+auto_switch:
+  accounts: []            # comptes concernés, ex. ["moncompte"] ([] = jamais tout seul ; Telegram marche quand même)
+  sell_below: 50          # solde sous lequel le compte passe en vente
+  buy_above: 300          # solde à partir duquel il revient aux achats (plus grand que sell_below)
 # ----------------------------------------------------------------------------
 # Envoi de cartes à un autre de VOS comptes (commande « envoyer », ou pendant « tout » avec in_tout: true), par
 # échanges sans contrepartie, pour que ce soit lui qui les vende. Les deux comptes doivent être amis sur le site et

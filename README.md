@@ -46,6 +46,40 @@ Le premier passage est long : le script lit le prix de chaque carte, avec une pa
 
 Le script empêche l'ordinateur de se mettre en veille tout seul, mais **pas quand on ferme le capot sur batterie, ni quand la batterie se vide** : l'ordinateur s'endort, et le script reste figé jusqu'au réveil (ni boosters, ni ventes, ni défausses, ni achats). Pour le laisser tourner la nuit, **branchez l'ordinateur et laissez le capot ouvert** (l'écran peut s'éteindre). Si une veille a eu lieu, le résumé du passage (et Telegram) le signale.
 
+Les étapes suivantes sont facultatives. Sans elles, le script trie, vend et défausse avec les règles de `config.yaml`, et n'achète rien.
+
+**5. Vos réglages.** Copiez `perso.exemple.yaml` sous le nom `perso.yaml`, dans le même dossier, puis retirez le `#` devant ce que vous voulez changer : défausses, ventes la nuit, achats, boosters, etc. Tout est expliqué dans le fichier. Le script refuse de démarrer si un réglage est mal écrit, et dit lequel. Voir [Vos réglages](#vos-réglages--persoyaml).
+
+**6. Telegram (conseillé).** Un bot Telegram à vous prévient quand il faut agir (vérification anti-robot, compte déconnecté), et vous pilotez le script depuis votre téléphone : `etat`, `pause`, `vente <compte>`, `ajoute <nom> <section>`… Il permet aussi de reconnecter un compte sans revenir à l'ordinateur. Comptez 5 minutes de mise en place : voir [Notifications Telegram](#notifications-telegram-facultatif).
+
+**7. Acheter des cartes précises.** Pour que le script achète des cartes par leur nom (des rappeurs, des streamers, des joueurs…) :
+
+1. Copiez `joueurs_a_acheter.exemple.txt` sous le nom `joueurs_a_acheter.txt`, et mettez vos noms sous la bonne section (ou plus tard, `ajoute <nom> <section>` sur Telegram).
+2. Ajoutez dans `perso.yaml` :
+
+   ```yaml
+   buy:
+     names_file: "joueurs_a_acheter.txt"
+     tag: "garder"         # étiquette des cartes achetées en dehors des sections
+     price_factor: 2       # jamais plus de 2 fois le prix moyen de la carte
+     max_price: 300        # ni plus de 300 par carte
+   protection:
+     tags: ["rap", "twitch", "youtube", "trail"]   # l'étiquette de chaque section : elle protège les cartes achetées
+   ```
+
+3. Lancez `./wm tout --execute --loop` : les achats ne tournent qu'avec `--loop`.
+
+Voir [Boosters et achats](#boosters-et-achats-aux-enchères) pour le détail (mots-clés, plafonds, plusieurs comptes).
+
+## Mettre à jour
+
+Arrêtez le script (Ctrl+C), puis :
+
+- **avec git** : `git pull` dans le dossier du script ;
+- **avec le ZIP** : téléchargez-le à nouveau, puis recopiez dans le nouveau dossier vos fichiers personnels : `perso.yaml`, `joueurs_a_acheter.txt`, le dossier `comptes/` (vos sessions), et si vous voulez garder l'historique et les prix déjà lus, `journal.csv` et `prix_cache.json`.
+
+Ces fichiers ne sont jamais sur GitHub : une mise à jour ne les touche pas. Relancez ensuite le script comme d'habitude (le premier lancement réinstalle ce qu'il faut si besoin). Si un réglage a changé de nom, le script le dit au démarrage.
+
 ## Les commandes
 
 | Commande | Ce qu'elle fait |
@@ -169,7 +203,9 @@ packs:
 
 **Des cartes par leur nom.** Un footballeur est décrit seulement comme « footballeur français », sans son club : pour acheter les joueurs de l'OL, il faut donner leurs noms dans `buy.names` ; ils reçoivent `buy.names_tags` (sinon `buy.tag`). Chaque recherche prend parfois 30 secondes : chaque nom est cherché à son tour, environ toutes les `buy.names_minutes` (60 par défaut), et toutes ses annonces jusqu'à son tour suivant sont suivies.
 
-**Une liste de noms qui se vide toute seule.** Avec `buy.names_file: "joueurs_a_acheter.txt"`, les noms à chercher sont dans ce fichier, un par ligne (lignes `#` : commentaires). Le script en retire un nom dès que la carte est achetée ou arrive dans la collection d'un de vos comptes : il ne cherche plus ce que vous avez déjà. Gardez la liste complète dans `auto_tags` (`name_words`) : c'est elle qui protège vos cartes, et leurs prochains exemplaires.
+**Une liste de noms qui se vide toute seule.** Avec `buy.names_file: "joueurs_a_acheter.txt"`, les noms à chercher sont dans ce fichier, un par ligne (lignes `#` : commentaires). Pour le créer, copiez `joueurs_a_acheter.exemple.txt`. Le script en retire un nom dès que la carte est achetée ou arrive dans la collection d'un de vos comptes : il ne cherche plus ce que vous avez déjà. Seule la carte de ce nom compte (« Jul (rappeur) » pour `Jul (rappeur)`, « Jeffinho (football) » pour `Jeffinho`) : un album « Sélection naturelle (album de Kalash Criminel) » ne retire pas `Kalash Criminel`. Gardez la liste complète dans `auto_tags` (`name_words`) : c'est elle qui protège vos cartes, et leurs prochains exemplaires.
+
+**Une étiquette par section.** Une ligne `[twitch]` (ou `[rap, garder]`) donne ces étiquettes aux noms qui la suivent, jusqu'à la section suivante, à la place de `buy.names_tags`, qui ne vaut que pour les noms placés avant la première section. Chaque étiquette doit être dans `protection.tags`, sinon le script s'arrête : elle protège les cartes achetées.
 
 **Répartir les achats entre vos comptes.** Tous les comptes de `buy.accounts` achètent, et une même annonce n'est suivie que par l'un d'eux. Pour qu'ils ne fassent pas les mêmes recherches, `buy.by_account` remplace les mots-clés et les noms d'un compte : moins de recherches et de mises par compte, donc moins de vérifications anti-robot.
 
@@ -232,7 +268,9 @@ Le script n'utilise pas votre mot de passe. Il garde sa propre session et la ren
 
 Pourquoi une fenêtre privée ? Le script doit avoir une session à lui. S'il partageait celle de votre navigateur habituel, ils la renouvelleraient chacun de leur côté et le site finirait par les déconnecter tous les deux. Une déconnexion depuis le site peut aussi déconnecter le script : refaites alors `./wm login`.
 
-> ⚠️ Le dossier `comptes/` donne accès à vos comptes. Ne l'envoyez à personne. Ne collez jamais votre cookie dans un chat ou un message.
+**Reconnexion depuis Telegram.** Avec [Telegram](#notifications-telegram-facultatif) et `--loop`, un compte déconnecté ne s'arrête plus : il vous écrit « 🔑 … est déconnecté » et attend, sans rien faire sur le site. Copiez le cookie comme ci-dessus (étapes 1 à 5, sur n'importe quel ordinateur), collez-le dans la conversation avec votre bot et envoyez. Trop long pour un seul message, il est coupé en plusieurs : c'est normal, le script les recolle. Dans la minute, il vérifie le cookie auprès du site, l'enregistre, **efface vos messages du chat** et reprend (« ✅ … reconnecté »). Seul le compte du cookie le prend : envoyer celui d'un compte qui marche le remplace aussi. `login <compte>` envoyé au bot rappelle la marche à suivre.
+
+> ⚠️ Le dossier `comptes/` donne accès à vos comptes. Ne l'envoyez à personne. Ne collez votre cookie nulle part ailleurs que dans la conversation avec votre propre bot (le `chat_id` de `perso.yaml`) : le script ne lit qu'elle.
 
 ## Plusieurs comptes
 
@@ -250,6 +288,20 @@ Deux comptes peuvent tourner en même temps, dans deux terminaux. Ils solliciten
 **Chaque compte a sa limite et sa pause anti-robot.** Le site bloque les comptes séparément : le 17/10/2026, un compte bloqué sur un booster n'empêchait pas l'autre d'ouvrir des boosters et de miser quelques secondes après. Avec `safety.shared_market: true`, vos comptes lancés sur le même ordinateur partagent la limite de 10 actions par heure et la pause anti-robot (dans `comptes/marche_commun.json`) : quand l'un est bloqué, les autres s'arrêtent aussi. Relancer un compte lève alors la pause pour tous ; si le site la demande encore, la pause suivante dure plus longtemps.
 
 Pour qu'un seul d'entre eux achète, voir `buy.accounts` dans [Boosters et achats](#boosters-et-achats-aux-enchères). S'ils font tous les deux des achats, ils se partagent les annonces : le premier qui repère une enchère la suit, l'autre la laisse (« suivie par votre compte … »). Ils ne misent donc jamais l'un contre l'autre. Ce partage passe par `comptes/achats_en_cours.json` : les comptes doivent tourner sur le même ordinateur. Une simulation ne réserve rien.
+
+**Achat ou vente, à changer en route.** Un compte qui achète peut passer en vente, et l'inverse, sans relancer le script :
+
+- **Sur Telegram** : `vente moncompte` (plus aucune mise : les mises déjà posées vont jusqu'au bout, ses cartes à vendre sont mises en vente), `achat moncompte` (plus de mise en vente : celles en cours vont jusqu'au bout, il mise sur vos mots-clés et noms), `auto moncompte` (retour aux réglages). Le passage suivant a lieu aussitôt. Le choix est gardé dans `comptes/<nom>/mode.json`, même après un redémarrage.
+- **Selon le solde** (`auto_switch` dans `perso.yaml`) : sous `sell_below`, le compte passe en vente ; il revient aux achats dès `buy_above`. Le solde est celui que donne le site après chaque mise et chaque défausse (le dernier du journal au lancement) : un compte en vente qui ne défausse rien ne voit pas son solde remonter, `achat moncompte` le relance. Un choix fait sur Telegram l'emporte, jusqu'à `auto moncompte`.
+
+```yaml
+auto_switch:
+  accounts: ["moncompte"]   # comptes concernés (achats dans buy.accounts)
+  sell_below: 50
+  buy_above: 300
+```
+
+Une mise refusée pour **solde insuffisant** n'est plus suivie d'autres mises vouées au même refus : aucune mise de ce montant ou plus pendant 30 minutes (sauf si un solde suffisant est lu entre-temps), et un message Telegram.
 
 ## Envoyer des cartes à un autre compte
 
@@ -299,8 +351,33 @@ Le script vous écrit sur Telegram **seulement quand il faut agir** : aussitôt 
 
 **Répondez « ok » pour reprendre après une vérification anti-robot.** Une fois la vérification passée à la main sur le site, envoyez « ok » au bot (ou « /ok », « c'est bon »…) : le script le lit dans la minute, lève la pause et reprend ventes, achats et boosters sans attendre la fin de la pause (1 h, puis 2 h, 4 h…). Il vous le confirme par « ▶️ Reprise ». « ok » vaut pour tous vos comptes en pause ; « ok moncompte » pour celui-là seulement. Seuls les messages envoyés après le blocage comptent. Si le site redemande la vérification, vous êtes prévenu à nouveau et la pause suivante est plus longue.
 
-1. Créez un bot avec [@BotFather](https://t.me/BotFather) et notez son jeton. Obtenez votre identifiant avec [@userinfobot](https://t.me/userinfobot).
-2. Ajoutez dans `perso.yaml` :
+**Commandes.** Avec `--execute`, le script lit aussi vos messages au bot, chaque minute entre deux passages (à la fin du passage en cours sinon). Sans nom de compte, une commande vaut pour tous vos comptes lancés ; un nom peut être abrégé (`vente ludob`) tant qu'un seul compte commence ainsi.
+
+| Message | Effet |
+|---|---|
+| `aide` | la liste des commandes |
+| `etat` | mode (achat / vente), solde, ventes et achats en cours, pauses, session, bilan du jour |
+| `vente <compte>` / `achat <compte>` / `auto <compte>` | change le rôle du compte (voir [Plusieurs comptes](#plusieurs-comptes)) |
+| `pause` (ou `stop`) / `reprise` | plus aucune action sur le site / reprise tout de suite |
+| `ok` | reprise après une vérification anti-robot passée à la main |
+| `bilan` | bilan de la journée |
+| `login <compte>` | comment reconnecter un compte, puis collez son cookie (voir [Connexion](#connexion)) |
+| `ajoute <nom> <section>` | carte à acheter, ex. `ajoute Tiakola rap` : voir ci-dessous |
+| `retire <nom>` | la retire de la liste (`retire Jul` retire aussi `Jul (rappeur)`) |
+| `liste [section]` | le nombre de cartes à acheter par section, ou les noms d'une section (`liste rap`) |
+
+**Ajouter une carte à acheter depuis Telegram.** `ajoute <nom> <section>` met le nom dans `buy.names_file`, sous sa section (`[rap]`, `[trail]`… : le dernier mot du message). Le nom est d'abord vérifié sur Wikipédia, dont les cartes sont les articles, puisqu'il doit être écrit comme le titre de la carte :
+
+- majuscules et accents sont corrigés (`ajoute kilian jornet trail` ajoute `Kílian Jornet`), un pseudonyme qui renvoie à un autre article prend son titre (`Mister MV` → `Xavier Dang`) ;
+- un nom qui désigne plusieurs articles est refusé, avec les titres possibles (`Jul` → `Jul (rappeur)`, `Jul (auteur)`…) ;
+- sans article de ce nom, le script propose les titres les plus proches.
+
+Le nom est cherché dès la relecture suivante du marché, sans attendre son tour, par le compte qui achète (même si c'est l'autre compte qui a répondu). Une carte achetée reçoit l'étiquette de sa section, qui la protège. Pour protéger aussi les exemplaires venus d'ailleurs (boosters), ajoutez le nom aux listes `auto_tags` de `perso.yaml`. Une modification faite à la main dans le fichier est aussi prise en compte sans relancer.
+
+1. Créez un bot avec [@BotFather](https://t.me/BotFather) (`/newbot`) et notez son jeton. Chacun crée **son propre bot** : il ne parle qu'à vous.
+2. Ouvrez la conversation avec votre nouveau bot et envoyez `/start` : sans ça, il ne peut pas vous écrire.
+3. Obtenez votre identifiant (`chat_id`) avec [@userinfobot](https://t.me/userinfobot).
+4. Ajoutez dans `perso.yaml` :
 
    ```yaml
    telegram:
@@ -311,13 +388,15 @@ Le script vous écrit sur Telegram **seulement quand il faut agir** : aussitôt 
      every_pass: false          # true = un bilan à chaque passage, comme avant
    ```
 
+5. Relancez le script avec `--execute`, puis envoyez `aide` à votre bot : il répond avec la liste des commandes. Sans réponse dans la minute, vérifiez le jeton, le `chat_id` et l'étape 2.
+
 Le jeton ne va **jamais** dans `config.yaml` : le script refuse de démarrer s'il l'y trouve. Si votre jeton a fuité, régénérez-le avec `/revoke` dans BotFather.
 
 ## En cas de problème
 
 | Message | Que faire |
 |---|---|
-| `session révoquée` | Refaites `./wm login` pour ce compte. |
+| `session révoquée` | Refaites `./wm login` pour ce compte, ou envoyez son cookie à votre bot Telegram si le script tourne avec `--loop` (voir [Connexion](#connexion)). |
 | `erreur réseau` ou `renouvellement de session impossible` | Vérifiez la connexion, puis relancez la même commande **sans `--fresh`** : les prix déjà lus sont gardés et le passage reprend où il en était. Avec `--loop`, il reprend tout seul. |
 | `Plusieurs comptes enregistrés` | Ajoutez `--compte NOM` (voir `./wm comptes`). |
 | `Un autre passage --execute est actif` | Un autre terminal fait déjà tourner ce compte. Attendez qu'il finisse, ou arrêtez-le. |

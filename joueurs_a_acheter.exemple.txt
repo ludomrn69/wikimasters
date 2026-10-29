@@ -1,0 +1,26 @@
+# Cartes à acheter, cherchées sur le marché par leur nom (buy.names_file dans perso.yaml).
+# Copiez ce fichier sous le nom joueurs_a_acheter.txt (au même endroit), puis mettez vos noms sous la bonne section.
+#
+# - Un nom par ligne, écrit EXACTEMENT comme le titre de l'article Wikipédia (les cartes sont des articles) :
+#   « Jul (rappeur) » et pas « Jul », « Kílian Jornet » avec son accent. Le plus simple : envoyez
+#   « ajoute <nom> <section> » à votre bot Telegram, qui vérifie le titre sur Wikipédia et l'écrit ici.
+# - Une ligne [rap] donne l'étiquette « rap » aux cartes achetées des noms qui la suivent. Ajoutez-la aussi à
+#   protection.tags dans perso.yaml : c'est elle qui protège ces cartes (le script refuse de démarrer sinon).
+# - Le script retire un nom dès que sa carte est achetée ou arrive dans votre collection.
+# - Les lignes qui commencent par « # » sont des commentaires : retirez le « # » devant un nom pour le chercher.
+
+[rap]
+# Tiakola
+# Jul (rappeur)
+
+[twitch]
+# ZeratoR
+# Domingo (streamer)
+
+[youtube]
+# Squeezie
+# Cyprien Iov
+
+[trail]
+# Kílian Jornet
+# Ultra-Trail du Mont-Blanc
