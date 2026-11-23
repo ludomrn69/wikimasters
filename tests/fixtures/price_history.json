@@ -1,1 +1,1 @@
-{"wikipedia_title": "Nouvelle société", "summary": {"R": {"average": 6}}, "isPro": false}
+{"computed_at": "2026-11-23T13:40:00.146591+00:00", "by_rarity": {"R": {"weekly": [{"start": "2026-11-16", "avg": 8, "min": 2, "max": 20, "count": 3}, {"start": "2026-06-22", "avg": 385, "min": 100, "max": 670, "count": 2}, {"start": "2026-11-23", "avg": 5, "min": 3, "max": 7, "count": 1}], "monthly": [{"start": "2026-06-01", "avg": 385, "min": 100, "max": 670, "count": 2}, {"start": "2026-11-01", "avg": 7, "min": 2, "max": 20, "count": 4}]}}}

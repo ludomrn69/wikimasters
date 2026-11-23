@@ -930,13 +930,28 @@ def parse_collection_page(data, pending=None):
     return copies
 
 
-def value_from_sales(data, card):
-    """Prix moyen des ventes passées pour la rareté de la carte, ou None si aucune vente."""
-    entry = (data or {}).get("summary", {}).get(card.rarity) if isinstance(data, dict) else None
-    average = entry.get("average") if isinstance(entry, dict) else None
-    if _is_number(average) and math.isfinite(average) and average >= 0:
-        return float(average)
-    return None
+# Semaines de ventes dont la moyenne fait le prix d'une carte. Le site n'affiche que la dernière (« Prix moyen de la
+# semaine », ou « Dernier prix moyen connu ») : le lundi, elle ne repose souvent que sur 1 ou 2 ventes.
+PRICE_WEEKS = 2
+
+
+def value_from_history(data, card):
+    """Prix moyen des ventes passées pour la rareté de la carte, ou None si aucune vente.
+
+    data : /api/marketplace/cards/{id}/price-history, moyennes par rareté et par semaine (depuis le 20/11/2026).
+    Moyenne des PRICE_WEEKS dernières semaines où la carte s'est vendue, pondérée par leur nombre de ventes.
+    """
+    weekly = as_dict(as_dict(as_dict(data).get("by_rarity")).get(card.rarity)).get("weekly")
+    if not isinstance(weekly, list):
+        return None
+    weeks = sorted(
+        (w for w in weekly if isinstance(w, dict) and isinstance(w.get("start"), str) and _is_int(w.get("count"))
+         and w["count"] > 0 and _is_number(w.get("avg")) and math.isfinite(w["avg"]) and w["avg"] >= 0),
+        key=lambda w: w["start"],
+    )[-PRICE_WEEKS:]
+    if not weeks:
+        return None
+    return sum(w["avg"] * w["count"] for w in weeks) / sum(w["count"] for w in weeks)
 
 
 class PriceCache:
@@ -955,7 +970,9 @@ class PriceCache:
                 self.data = {}
 
     def _key(self, card):
-        return f"{card.card_id}:{card.rarity}"
+        # « h: » : prix lus dans l'historique des prix. Ceux d'avant (moyennes de /sales, et « jamais vendue » à tort
+        # depuis le 20/11/2026) sont ignorés, puis oubliés une fois périmés.
+        return f"h:{card.card_id}:{card.rarity}"
 
     def _alive(self, entry):
         return isinstance(entry, dict) and _is_number(entry.get("at")) and time.time() - entry["at"] <= self.ttl
@@ -1597,12 +1614,17 @@ class WikiMastersClient:
 
     def card_value(self, card):
         try:
-            data = self._api("GET", f"/api/marketplace/cards/{card.card_id}/sales", params={"scope": "summary"})
+            data = self._api("GET", f"/api/marketplace/cards/{card.card_id}/price-history")
         except ApiError as e:
             if e.status == 404:  # « Carte introuvable » : traitée comme jamais vendue.
                 return None
             raise
-        return value_from_sales(data, card)
+        if not (isinstance(data, dict) and isinstance(data.get("by_rarity"), dict)):
+            # Le 20/11/2026, /sales a perdu ses moyennes : lue comme « jamais vendue », sa nouvelle réponse a fait
+            # défausser plus de 3 000 cartes en 3 jours. Une réponse d'une forme inconnue arrête donc le passage.
+            raise ApiError("réponse inattendue sur l'historique des prix (le site a-t-il changé ?) : le passage "
+                           "s'arrête avant de traiter les cartes comme jamais vendues.", fatal=True)
+        return value_from_history(data, card)
 
     def auction_slots(self):
         """Places d'enchère libres, ou None si le site ne les donne pas.

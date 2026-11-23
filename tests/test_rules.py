@@ -38,6 +38,13 @@ def load(name):
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
+def price_history(rarity, value):
+    """Réponse de /price-history : une semaine de ventes à value pour cette rareté (aucune si value est None)."""
+    weeks = [] if value is None else [{"start": "2026-11-16", "avg": value, "min": value, "max": value, "count": 1}]
+    return {"computed_at": "2026-11-23T13:40:00+00:00",
+            "by_rarity": {rarity: {"weekly": weeks, "monthly": weeks}} if weeks else {}}
+
+
 def b64(data):
     return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
 
@@ -152,7 +159,7 @@ class FakeSite:
             items = [i for p in self.pages for i in p["collection"]]
             rarity = next(i["card"]["rarity"] for i in items if i["card_id"] == card_id)
             value = self.values.get(card_id)
-            return FakeResponse(200, {"summary": {} if value is None else {rarity: {"average": value}}})
+            return FakeResponse(200, price_history(rarity, value))
         if path == "/api/marketplace/mine":
             selling = self.selling.pop(0) if len(self.selling) > 1 else self.selling[0]
             return FakeResponse(200, {"sellingCount": selling, "maxConcurrentAuctions": 5})
@@ -245,10 +252,13 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(w.protection_reason(w.parse_collection_page(data)[0], self.cfg["protection"]),
                          "échange en cours")
 
-    def test_value_from_sales(self):
-        self.assertEqual(w.value_from_sales(load("sales.json"), self.card(rarity="R")), 6.0)
-        self.assertIsNone(w.value_from_sales(load("sales.json"), self.card(rarity="SR")))
-        self.assertIsNone(w.value_from_sales({"summary": {}}, self.card()))
+    def test_value_from_history(self):
+        # Les 2 dernières semaines avec des ventes (pas celle de juin), pondérées : (8 × 3 + 5 × 1) / 4.
+        self.assertEqual(w.value_from_history(load("price_history.json"), self.card(rarity="R")), 7.25)
+        self.assertIsNone(w.value_from_history(load("price_history.json"), self.card(rarity="SR")))
+        self.assertIsNone(w.value_from_history({"by_rarity": {}}, self.card()))
+        empty_week = {"by_rarity": {"C": {"weekly": [{"start": "2026-11-16", "avg": 0, "count": 0}]}}}
+        self.assertIsNone(w.value_from_history(empty_week, self.card(rarity="C")))
 
     def test_protection_reasons(self):
         prot = dict(self.cfg["protection"], name_contains=["Olympique"])
@@ -331,7 +341,7 @@ class RulesTest(unittest.TestCase):
         sell = dict(self.cfg["sell"], rounding="round", price_factor=0.25)
         self.assertEqual((w.start_price(10, sell), w.start_price(14, sell)), (3, 4))  # 2,5 → 3 ; 3,5 → 4
         for bad in (float("nan"), float("inf"), -3):
-            self.assertIsNone(w.value_from_sales({"summary": {"C": {"average": bad}}}, self.card()))
+            self.assertIsNone(w.value_from_history(price_history("C", bad), self.card(rarity="C")))
 
 
 class ConfigTest(unittest.TestCase):
@@ -706,7 +716,7 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         output, code = self.run_main(site, "analyser", execute=True, mutate=cfg)
         self.assertEqual(code, 0, output)
         self.assertIn("-> pose « OL »                Forest Hills (Queens) [R] valeur=?", output)
-        self.assertNotIn(FOREST, [u.split("/")[-2] for u in site.gets("/sales")])  # prix jamais lu
+        self.assertNotIn(FOREST, [u.split("/")[-2] for u in site.gets("/price-history")])  # prix jamais lu
         self.assertIn("-> pose « lyon »              Chacana [R] valeur=5", output)  # protégée plutôt que « defausse »
         self.assertNotIn("« defausse »", output.split("Chacana")[0][-80:])
 
@@ -864,7 +874,7 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.run_main(site, "vendre", execute=True)
         urls = [c[1] for c in site.calls]
         last_mine = max(i for i, u in enumerate(urls) if u.endswith("/mine"))
-        self.assertGreater(last_mine, max(i for i, u in enumerate(urls) if "/sales" in u))
+        self.assertGreater(last_mine, max(i for i, u in enumerate(urls) if "/price-history" in u))
         self.assertEqual(len(site.sells()), 1)  # 4 enchères en cours au moment de vendre : 1 place
 
     def test_unreadable_auction_slots_postpone_sales_only(self):
@@ -1048,7 +1058,7 @@ class EndToEndTest(MainHarness, unittest.TestCase):
     def test_sell_without_free_slot_reads_no_price(self):
         site = standard_site(selling=5, tags=SORTED)
         output, _ = self.run_main(site, "vendre", execute=True)
-        self.assertEqual((site.gets("/sales"), site.sells()), ([], []))
+        self.assertEqual((site.gets("/price-history"), site.sells()), ([], []))
         self.assertIn("aucune place d'enchère libre", output)
 
     def test_sell_random_order(self):
@@ -1146,7 +1156,7 @@ class EndToEndTest(MainHarness, unittest.TestCase):
             site.values[f"cheap-card-{n}"] = 2
         output, _ = self.run_main(site, "defausser", execute=True, mutate=lambda c: c["discard"].update(max_per_run=2))
         self.assertEqual(len(site.discards()), 2)
-        self.assertEqual(len(site.gets("/sales")), 2)  # pas les 6 prix : la suite attend le prochain passage
+        self.assertEqual(len(site.gets("/price-history")), 2)  # pas les 6 prix : la suite attend le prochain passage
         self.assertIn("4 autre(s) carte(s) à défausser", output)
         self.assertIn("4 action(s) reportée(s)", output)
 
@@ -1164,8 +1174,8 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.cheap_cards(site, w.DISCARD_BATCH + 2)
         output, code = self.run_main(site, "defausser", execute=True)
         self.assertEqual(code, 0)
-        kinds = ["prix" if "/sales" in u else "défausse" for m, u, *_ in site.calls
-                 if "/sales" in u or u.endswith("/discard")]
+        kinds = ["prix" if "/price-history" in u else "défausse" for m, u, *_ in site.calls
+                 if "/price-history" in u or u.endswith("/discard")]
         batch = w.DISCARD_BATCH
         self.assertEqual(kinds, ["prix"] * batch + ["défausse"] * batch + ["prix"] * 2 + ["défausse"] * 2)
         self.assertIn(f"{batch + 2} défausse(s)", output)
@@ -1178,7 +1188,7 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         output, code = self.run_main(site, "defausser", execute=True)
         self.assertEqual(code, 0)
         self.assertEqual(len(site.discards()), 1)
-        self.assertEqual(len(site.gets("/sales")), w.DISCARD_BATCH)  # le lot suivant n'est même pas relu
+        self.assertEqual(len(site.gets("/price-history")), w.DISCARD_BATCH)  # le lot suivant n'est même pas relu
         self.assertIn(f"{w.DISCARD_BATCH + 4} action(s) reportée(s)", output)
 
     def test_discard_max_per_run(self):
@@ -1246,7 +1256,7 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         output, code = self.run_main(site, "vendre", execute=True, mutate=lambda c: c["sell"].update(order="random"))
         self.assertEqual(code, 0, output)
         self.assertEqual(len(site.sells()), 2)  # 2 places libres
-        self.assertEqual(len(site.gets("/sales")), 2)  # pas les 12 prix
+        self.assertEqual(len(site.gets("/price-history")), 2)  # pas les 12 prix
         self.assertIn("12 carte(s) à vendre dont 0 relance(s), 2 place(s) d'enchère libre(s) → 2 vente(s)", output)
         self.assertIn("10 en attente d'une place d'enchère", output)
 
@@ -1884,7 +1894,7 @@ class EndToEndTest(MainHarness, unittest.TestCase):
                                      mutate=lambda c: c["price"].update(cache_hours=6))
         self.assertEqual((code, waits), (0, [900, 900]))
         self.assertEqual(output.count("=== ["), 2)
-        self.assertEqual(len(site.gets("/sales")), 4)  # 2e cycle : prix relus au 1er cycle réutilisés
+        self.assertEqual(len(site.gets("/price-history")), 4)  # 2e cycle : prix relus au 1er cycle réutilisés
         self.assertEqual(output.count("Option --fresh"), 1)
 
     def test_price_cache_merges_runs_and_forgets_expired_prices(self):
@@ -1895,7 +1905,14 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         a.save()
         b.set(w.Card(copy_id="2", card_id="c2", name="B", rarity="R"), None)
         b.save()  # un autre compte en parallèle : il n'efface pas le prix lu par le premier
-        self.assertEqual(sorted(json.loads(path.read_text())), ["c1:C", "c2:R"])
+        self.assertEqual(sorted(json.loads(path.read_text())), ["h:c1:C", "h:c2:R"])
+
+    def test_prices_read_before_the_price_history_are_ignored(self):
+        # Les « jamais vendue » lus à tort sur /sales depuis le 20/11/2026 ne doivent plus faire défausser.
+        path = self.dir / "prix.json"
+        path.write_text(json.dumps({"c1:C": {"value": None, "at": time.time()}}), encoding="utf-8")
+        card = w.Card(copy_id="1", card_id="c1", name="A", rarity="C")
+        self.assertIs(w.PriceCache(path, 6).get(card), w.PriceCache.MISSING)
 
     def token_posts(self, site):
         return [u for m, u, *_ in site.calls if m == "POST" and u.endswith("/auth/v1/token")]
@@ -2051,7 +2068,7 @@ class EndToEndTest(MainHarness, unittest.TestCase):
 
     def test_transient_read_error_is_retried(self):
         site = standard_site()
-        site.overrides[("GET", "/sales")] = [FakeResponse(500, {"error": "x"}), None]
+        site.overrides[("GET", "/price-history")] = [FakeResponse(500, {"error": "x"}), None]
         output, _ = self.run_main(site, "analyser")
         self.assertIn("defausse : 1, +10 : 2", output)
         self.assertNotIn("ÉCHEC", output)
@@ -2061,24 +2078,33 @@ class EndToEndTest(MainHarness, unittest.TestCase):
 
     def test_unknown_card_404_is_treated_as_never_sold(self):
         site = standard_site()
-        site.overrides[("GET", "/sales")] = FakeResponse(404, {"error": "Carte introuvable"})
+        site.overrides[("GET", "/price-history")] = FakeResponse(404, {"error": "Carte introuvable"})
         output, _ = self.run_main(site, "analyser")
         self.assertIn("jamais vendue : 4", output)
         self.assertNotIn("ÉCHEC", output)
+
+    def test_unexpected_price_response_stops_without_action(self):
+        # Le 20/11/2026, /sales a perdu ses moyennes : lue comme « jamais vendue », la réponse faisait tout défausser.
+        site = standard_site(tags={CHACANA: ["defausse"]})
+        site.overrides[("GET", "/price-history")] = FakeResponse(200, {"recent": []})
+        output, code = self.run_main(site, "tout", execute=True)
+        self.assertEqual((code, site.discards()), (1, []))
+        self.assertIn("réponse inattendue sur l'historique des prix", output)
+        self.assertNotIn("inconnu", output)
 
     def test_failed_lookup_is_read_once_per_card_id(self):
         data = load("collection.json")
         twin = dict(copy.deepcopy(data["collection"][1]), id="twin-copy")
         data["collection"].append(twin)
         site = FakeSite([data], {})
-        site.overrides[("GET", f"/cards/{twin['card_id']}/sales")] = FakeResponse(500, {"error": "Erreur serveur"})
+        site.overrides[("GET", f"/cards/{twin['card_id']}/price-history")] = FakeResponse(500, {"error": "Erreur serveur"})
         output, _ = self.run_main(site, "analyser")
-        self.assertEqual(len(site.gets(f"/cards/{twin['card_id']}/sales")), 1 + len(w.GET_RETRY_DELAYS))
+        self.assertEqual(len(site.gets(f"/cards/{twin['card_id']}/price-history")), 1 + len(w.GET_RETRY_DELAYS))
         self.assertIn("2 prix illisible(s)", output)
 
     def test_too_many_read_failures_stop_without_action(self):
         site = standard_site()
-        site.overrides[("GET", "/sales")] = FakeResponse(500, {"error": "x"})
+        site.overrides[("GET", "/price-history")] = FakeResponse(500, {"error": "x"})
         data = site.pages[0]
         data["collection"] += [dict(copy.deepcopy(data["collection"][1]), id=f"x{n}", card_id=f"k{n}",
                                     card=dict(data["collection"][1]["card"], id=f"k{n}")) for n in range(5)]
@@ -2090,10 +2116,10 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         site = standard_site(tags=SORTED)
         keep = lambda c: c["price"].update(cache_hours=6)  # noqa: E731
         self.run_main(site, "analyser", execute=True, mutate=keep)
-        first = len(site.gets("/sales"))
+        first = len(site.gets("/price-history"))
         self.run_main(site, "vendre", mutate=keep)
         self.assertGreater(first, 0)
-        self.assertEqual(len(site.gets("/sales")), first)
+        self.assertEqual(len(site.gets("/price-history")), first)
 
     # --- erreurs pendant l'exécution ---
 
@@ -2524,7 +2550,7 @@ class Market:
             card_id = path.split("/")[4]
             rarity = next(a["snapshot_rarity"] for a in self.auctions.values() if a["card_id"] == card_id)
             value = self.values.get(card_id)
-            return FakeResponse(200, {"summary": {} if value is None else {rarity: {"average": value}}})
+            return FakeResponse(200, price_history(rarity, value))
         m = re.fullmatch(r"/api/marketplace/(mk-[^/]+)(/bid)?", path)
         if m:
             auction = self.auctions[m.group(1)]
@@ -3043,7 +3069,7 @@ class MarketTest(MainHarness, unittest.TestCase):
         output, code = self.run_market("acheter", execute=True, buy={"price_factor": None})
         self.assertEqual(code, 0, output)
         self.assertEqual(sorted((aid, amount) for _, aid, amount in m.bids), [("mk-A", 12), ("mk-C", 12), ("mk-E", 2)])
-        self.assertEqual([u for _, u, *_ in m.site.calls if "/sales" in u], [])  # aucun prix lu
+        self.assertEqual([u for _, u, *_ in m.site.calls if "/price-history" in u], [])  # aucun prix lu
         self.assertIn("Lyon-Bron [R] valeur=? : fin à", output)
         self.assertIn("plafond aucun", output)
 
@@ -3471,7 +3497,7 @@ class MarketTest(MainHarness, unittest.TestCase):
         m = self.market
         m.add("mk-A", "Rue Émile-Zola (Lyon)", 40, current=10, value=20)
         down = FakeResponse(503, {"error": "Service Unavailable"})
-        m.site.overrides[("GET", "/sales")] = [None, down, down, down, down, None]  # 2e prix : 4 échecs
+        m.site.overrides[("GET", "/price-history")] = [None, down, down, down, down, None]  # 2e prix : 4 échecs
         end, start = w.parse_time(m.auctions["mk-A"]["end_at"]), self.clock.now
 
         def sleep(seconds):

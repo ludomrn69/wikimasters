@@ -41,7 +41,8 @@ protection:
   # Les cartes engagées dans un échange en cours sont toujours protégées.
 
 # ----------------------------------------------------------------------------
-# Prix : valeur d'une carte = prix moyen de ses ventes passées, pour sa rareté (donnée du site).
+# Prix : valeur d'une carte = prix moyen de ses ventes passées, pour sa rareté (historique des prix du site) :
+# celles des 2 dernières semaines où elle s'est vendue. Le site n'affiche que la dernière de ces semaines.
 # ----------------------------------------------------------------------------
 price:
   cache_hours: 24        # prix lus gardés 24 h : un passage interrompu reprend sans tout relire (0 = jamais)
