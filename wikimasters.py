@@ -3087,16 +3087,18 @@ def auction_minutes(value, sell, now=None):
 def sale_spacing(ctx, now=None):
     """Écart (secondes) entre deux mises en vente, ou 0.
 
-    Des enchères courtes (10 min, aux heures de pointe : sell.peak) ne gardent pas les 5 places occupées avec
-    safety.market_limit (10 par heure) : lancées toutes d'un coup, les 10 partent en un quart d'heure et les places
-    restent vides le reste de l'heure. Étalées (une toutes les 6 min), il y en a toujours une en cours.
+    Des enchères courtes (10 min : sell.duration_minutes, ou aux heures de pointe : sell.peak) ne gardent pas les 5
+    places occupées avec safety.market_limit (10 par heure) : lancées toutes d'un coup, les 10 partent en un quart
+    d'heure (ce qui déclenche la vérification anti-robot du site) et les places restent vides le reste de l'heure.
+    Étalées (une toutes les 6 min), il y en a toujours une en cours.
     """
     limit, sell = ctx.cfg["safety"].get("market_limit"), ctx.cfg["sell"]
-    peak = sell.get("peak")
-    if not limit or not (peak and at_night(time.time() if now is None else now, peak)):
-        return 0  # seulement aux heures de pointe
+    now = time.time() if now is None else now
+    peak, minutes = sell.get("peak"), auction_minutes(None, sell, now)
+    if not limit or not (peak and at_night(now, peak) or minutes < 30):
+        return 0  # seulement aux heures de pointe, ou avec des enchères de 10 min toute la journée
     allowed = max(1, market_count(ctx, limit, now) - market_reserve(ctx))
-    if auction_minutes(None, sell, now) * allowed >= limit["minutes"] * sell["max_auctions"]:
+    if minutes * allowed >= limit["minutes"] * sell["max_auctions"]:
         return 0  # assez longues : les places restent pleines sans étaler
     return limit["minutes"] * 60 / allowed
 
@@ -3511,8 +3513,10 @@ class Runner:
                 antibot_cleared(self.ctx, kind)  # acceptée à nouveau : la prochaine pause repart à 1 h
                 print(f"     {result}")
                 # Des mises en vente enchaînées en quelques secondes déclenchent la vérification anti-robot du site.
+                # Écart tiré au hasard (jamais sous le réglage) : toutes les 120,0 s pile, le rythme ferait robot.
                 safety = self.cfg["safety"]
-                self.client.pause(safety["auction_delay_seconds"] if kind == "auction" else safety["delay_seconds"])
+                delay = safety["auction_delay_seconds"]
+                self.client.pause(random.uniform(delay, delay * 1.5) if kind == "auction" else safety["delay_seconds"])
                 if self.ctx.top_up and kind in ("add_tag", "remove_tag"):  # des centaines d'étiquettes : 1 h parfois
                     self.ctx.top_up()
         return True

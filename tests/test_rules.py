@@ -654,6 +654,9 @@ class MainHarness:
             mock.patch("requests.Session.request", side_effect=site),
             mock.patch("time.sleep", side_effect=sleep),
             mock.patch.object(w, "keep_awake"),
+            # Pauses tirées au hasard (« un rythme trop régulier ferait robot ») : la plus courte, pour des tests
+            # reproductibles sur l'horloge simulée.
+            mock.patch.object(w.random, "uniform", side_effect=lambda low, high: low),
             redirect_stdout(out),
             redirect_stderr(io.StringIO()),  # invite « Cookie : » de login
         ]
@@ -978,6 +981,28 @@ class EndToEndTest(MainHarness, unittest.TestCase):
         self.assertAlmostEqual(pauses[0], 6 * 60 - 45, delta=60)  # revient pour la suivante, 6 min après la 1re
         self.assertIn("Ventes en attente, possibles vers", output)
 
+    def test_short_auctions_all_day_are_also_spread_out(self):
+        # sell.duration_minutes: 10 sans heures de pointe : même rythme, une mise en vente toutes les 6 min. Lancées
+        # d'un coup, 5 puis 5 autres 10 min plus tard, les 10 actions de l'heure partiraient en 20 min (anti-robot).
+        site, clock, pauses = standard_site(tags=SORTED), Clock(), []
+        day = time.localtime(clock.now)
+        clock.now = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 15, 0, 0, 0, 0, -1))
+
+        def sleep(seconds):
+            clock.now += seconds
+            if seconds >= 120:  # pause de --loop
+                pauses.append(seconds)
+                if len(pauses) == 2:
+                    raise KeyboardInterrupt
+
+        perso = {"safety": {"market_limit": {"count": 10, "minutes": 60}}, "sell": {"duration_minutes": 10}}
+        output, code = self.run_main(site, "vendre", execute=True, args=["--loop"], sleep=sleep, clock=clock,
+                                     perso=perso)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(site.sells(), [AMPHIBIA, FACE])  # une par passage
+        self.assertEqual([b["duration_minutes"] for b in site.sell_bodies()], [10, 10])
+        self.assertAlmostEqual(pauses[0], 6 * 60 - 45, delta=60)  # revient pour la suivante, 6 min après la 1re
+
     def test_a_slot_freed_during_the_discards_is_filled_at_once(self):
         # 200 défausses prennent 25 min (prix relu à chacune) : des enchères de 10 min auraient toutes fini avant.
         site = standard_site(selling=[5, 4], tags=dict(SORTED, **{FOREST: ["defausse"]}))
@@ -1034,6 +1059,9 @@ class EndToEndTest(MainHarness, unittest.TestCase):
                         journal=None, state=None)
         self.assertEqual(w.sale_spacing(ctx, at(19)), 360)
         self.assertEqual(w.sale_spacing(ctx, at(15)), 0)  # 30 min : les 5 places restent pleines sans étaler
+        # 10 min toute la journée (sans heures de pointe) : étalées aussi, sinon 10 mises en vente en 20 min.
+        cfg["sell"] = dict(load_cfg()["sell"], duration_minutes=10, peak=None)
+        self.assertEqual((w.auction_minutes(50, cfg["sell"], at(15)), w.sale_spacing(ctx, at(15))), (10, 360))
         bad = load_cfg()
         bad["sell"]["peak"] = {"start": "18:00", "end": "22:00", "duration_minutes": 15}
         with self.assertRaises(SystemExit) as raised:

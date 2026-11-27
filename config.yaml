@@ -112,7 +112,8 @@ sell:
   rounding: "floor"       # … arrondie à l'inférieur (floor), au plus proche (round) ou au supérieur (ceil)
   min_start_price: 1      # mise de départ minimale
   max_start_price: null   # mise de départ maximale (null = pas de plafond)
-  duration_minutes: 30    # durée : 10, 30, 60, 180, 360 ou 720 (10 min, 30 min, 1 h, 3 h, 6 h, 12 h)
+  duration_minutes: 30    # durée : 10, 30, 60, 180, 360 ou 720 (10 min, 30 min, 1 h, 3 h, 6 h, 12 h). Avec 10, les
+                          # mises en vente partent une par une, toutes les 6 min, comme aux heures de pointe (peak)
   long_duration: null     # ex. { from_value: 100, minutes: 30 } : enchères plus longues pour les cartes qui valent
                           # au moins from_value (null = toutes durent duration_minutes)
   max_auctions: 5         # enchères lancées au plus par passage (le site en autorise 5 en même temps)
